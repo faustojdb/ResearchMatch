@@ -50,9 +50,9 @@ OFC_WEIGHTS = {
 }
 
 # Semaphore thresholds
-GREEN_THRESHOLD = 40   # Both users contribute >40% complementary originality
-YELLOW_ASYMMETRY = 20  # Asymmetry >20 points
-RED_THRESHOLD = 25     # Both contribute <25% or overlap >75%
+GREEN_THRESHOLD = 30   # Both users contribute >30% complementary originality
+YELLOW_ASYMMETRY = 15  # Asymmetry >15 points
+RED_THRESHOLD = 15     # Both contribute <15% or overlap >75%
 
 
 # =============================================================================
@@ -452,13 +452,28 @@ class MatchingEngine:
         return min(100.0, score)
 
     def _calculate_gain(self, my_ot: float, my_ofc: float, their_ot: float, their_ofc: float) -> float:
-        """Calculate what I gain from the other person's strengths in my weaknesses."""
-        # If my OT is low and theirs is high, I gain theoretical insight
-        ot_gain = max(0, their_ot - my_ot) * 0.6
-        # If my OFC is low and theirs is high, I gain formal/computational power
-        ofc_gain = max(0, their_ofc - my_ofc) * 0.6
-        # Combined gain, capped at 100
-        return min(100.0, ot_gain + ofc_gain)
+        """Calculate what I gain from the other person's strengths in my weaknesses.
+        
+        Uses a model where gain is proportional to:
+        1. The absolute difference in each axis (complementarity)
+        2. How high the other person scores in that axis (quality of contribution)
+        3. How much room for improvement I have (my weakness = their opportunity)
+        """
+        # Complementarity: how much stronger they are where I'm weak
+        ot_diff = max(0, their_ot - my_ot)
+        ofc_diff = max(0, their_ofc - my_ofc)
+        
+        # Weight by the other's absolute strength (high score = more valuable contribution)
+        ot_gain = ot_diff * (their_ot / 100.0) * 1.5
+        ofc_gain = ofc_diff * (their_ofc / 100.0) * 1.5
+        
+        # Also factor in: even if they're not stronger than me, 
+        # a high score in an axis I'm weak in still has value
+        weakness_bonus_ot = max(0, (100 - my_ot) * (their_ot / 100.0) * 0.3)
+        weakness_bonus_ofc = max(0, (100 - my_ofc) * (their_ofc / 100.0) * 0.3)
+        
+        total = ot_gain + ofc_gain + weakness_bonus_ot + weakness_bonus_ofc
+        return min(100.0, total)
 
     def _calculate_semaphore(self, a_gains: float, b_gains: float) -> str:
         """Calculate the bilateral convenience semaphore."""
