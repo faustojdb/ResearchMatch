@@ -240,6 +240,11 @@ else:
         print(f"     Él/ella gana de ti:      {m['b_gains_from_a']:.1f}%")
         print(f"     Sus scores:              OT: {m['candidate_ot']:.1f}% / OFC: {m['candidate_ofc']:.1f}%")
         print(f"     Dominio:                 {m['candidate_domain']} / {m.get('candidate_subdomain', '')}")
+        print(f"  ")
+        print(f"     📋 POR QUÉ ESTE SEMÁFORO:")
+        print(f"        Para ti:    {m.get('semaphore_reason', 'N/A')}")
+        print(f"        Para ellos: {m.get('semaphore_reason_for_candidate', 'N/A')}")
+        print(f"        Resumen:    {m.get('semaphore_summary', 'N/A')}")
         print()
 
 # =============================================================================

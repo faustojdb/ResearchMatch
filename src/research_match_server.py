@@ -119,6 +119,9 @@ def init_database(db_path: str) -> sqlite3.Connection:
             base_similarity REAL NOT NULL,  -- 0-100
             complementarity_score REAL NOT NULL,  -- 0-100
             semaphore TEXT NOT NULL CHECK(semaphore IN ('green', 'yellow', 'red')),
+            semaphore_reason_a TEXT,  -- Why this color, from A's perspective
+            semaphore_reason_b TEXT,  -- Why this color, from B's perspective
+            semaphore_summary TEXT,   -- Neutral summary
             a_gains_from_b REAL,  -- What A gains from B (0-100)
             b_gains_from_a REAL,  -- What B gains from A (0-100)
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -421,7 +424,10 @@ class MatchingEngine:
             "candidate_user_id": candidate_commit["user_id"],
             "base_similarity": round(base_sim, 1),
             "complementarity_score": round(complementarity, 1),
-            "semaphore": semaphore,
+            "semaphore": semaphore["color"],
+            "semaphore_reason": semaphore["reason_for_a"],
+            "semaphore_reason_for_candidate": semaphore["reason_for_b"],
+            "semaphore_summary": semaphore["summary"],
             "a_gains_from_b": round(a_gains, 1),
             "b_gains_from_a": round(b_gains, 1),
             "candidate_ot": round(cand_ot, 1),
@@ -475,18 +481,66 @@ class MatchingEngine:
         total = ot_gain + ofc_gain + weakness_bonus_ot + weakness_bonus_ofc
         return min(100.0, total)
 
-    def _calculate_semaphore(self, a_gains: float, b_gains: float) -> str:
-        """Calculate the bilateral convenience semaphore."""
+    def _calculate_semaphore(self, a_gains: float, b_gains: float) -> Dict[str, str]:
+        """Calculate the bilateral convenience semaphore with reasoning.
+        
+        Returns dict with 'color', 'reason_for_a', and 'reason_for_b'
+        so each user understands the semaphore from their own perspective.
+        """
+        asymmetry = abs(a_gains - b_gains)
+        a_stronger = a_gains > b_gains
+
         if a_gains >= GREEN_THRESHOLD and b_gains >= GREEN_THRESHOLD:
-            return "green"
+            return {
+                "color": "green",
+                "reason_for_a": f"Alta conveniencia mutua. Ganás {a_gains:.0f}% y aportás {b_gains:.0f}%. Colaboración equilibrada.",
+                "reason_for_b": f"Alta conveniencia mutua. Ganás {b_gains:.0f}% y aportás {a_gains:.0f}%. Colaboración equilibrada.",
+                "summary": "Ambos se benefician significativamente. Match recomendado."
+            }
         elif a_gains < RED_THRESHOLD and b_gains < RED_THRESHOLD:
-            return "red"
-        elif abs(a_gains - b_gains) > YELLOW_ASYMMETRY:
-            return "yellow"
+            return {
+                "color": "red",
+                "reason_for_a": f"Baja conveniencia. Solo ganás {a_gains:.0f}% y aportás {b_gains:.0f}%. Perfiles demasiado similares o sin complementariedad.",
+                "reason_for_b": f"Baja conveniencia. Solo ganás {b_gains:.0f}% y aportás {a_gains:.0f}%. Perfiles demasiado similares o sin complementariedad.",
+                "summary": "Alta redundancia o bajo aporte mutuo. No se recomienda."
+            }
+        elif asymmetry > YELLOW_ASYMMETRY:
+            if a_stronger:
+                return {
+                    "color": "yellow",
+                    "reason_for_a": f"⚠️ Asimetría a tu favor. Ganás {a_gains:.0f}% pero solo aportás {b_gains:.0f}%. El otro usuario podría no aceptar sin negociación de términos.",
+                    "reason_for_b": f"⚠️ Asimetría en tu contra. Solo ganás {b_gains:.0f}% pero aportás {a_gains:.0f}%. Considerá negociar términos de licencia antes de aceptar.",
+                    "summary": f"Asimetría significativa ({asymmetry:.0f} puntos). El solicitante se beneficia más."
+                }
+            else:
+                return {
+                    "color": "yellow",
+                    "reason_for_a": f"⚠️ Asimetría en tu contra. Solo ganás {a_gains:.0f}% pero aportás {b_gains:.0f}%. Considerá negociar términos de licencia antes de aceptar.",
+                    "reason_for_b": f"⚠️ Asimetría a tu favor. Ganás {b_gains:.0f}% pero solo aportás {a_gains:.0f}%. El otro usuario podría no aceptar sin negociación de términos.",
+                    "summary": f"Asimetría significativa ({asymmetry:.0f} puntos). El receptor se beneficia más."
+                }
         elif a_gains >= GREEN_THRESHOLD or b_gains >= GREEN_THRESHOLD:
-            return "yellow"
+            if a_gains >= GREEN_THRESHOLD:
+                return {
+                    "color": "yellow",
+                    "reason_for_a": f"Conveniencia moderada. Ganás {a_gains:.0f}% pero el otro solo gana {b_gains:.0f}%. Podrías necesitar ofrecer incentivos adicionales.",
+                    "reason_for_b": f"Conveniencia moderada. Ganás {b_gains:.0f}% — el beneficio para vos es limitado. Evaluá si los términos compensan.",
+                    "summary": "Un lado se beneficia claramente más. Funcional con negociación."
+                }
+            else:
+                return {
+                    "color": "yellow",
+                    "reason_for_a": f"Conveniencia moderada. Ganás {a_gains:.0f}% — el beneficio para vos es limitado. Evaluá si los términos compensan.",
+                    "reason_for_b": f"Conveniencia moderada. Ganás {b_gains:.0f}% pero el otro solo gana {a_gains:.0f}%. Podrías necesitar ofrecer incentivos adicionales.",
+                    "summary": "Un lado se beneficia claramente más. Funcional con negociación."
+                }
         else:
-            return "red"
+            return {
+                "color": "red",
+                "reason_for_a": f"Baja conveniencia. Ganás {a_gains:.0f}% y aportás {b_gains:.0f}%. Insuficiente para justificar colaboración.",
+                "reason_for_b": f"Baja conveniencia. Ganás {b_gains:.0f}% y aportás {a_gains:.0f}%. Insuficiente para justificar colaboración.",
+                "summary": "Beneficio insuficiente para ambas partes."
+            }
 
 
 # =============================================================================
@@ -862,11 +916,15 @@ async def research_match_find_collaborators(params: FindCollaboratorsInput, ctx=
             db.execute("""
                 INSERT OR REPLACE INTO matches
                 (id, user_a_id, user_b_id, base_similarity, complementarity_score,
-                 semaphore, a_gains_from_b, b_gains_from_a)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 semaphore, semaphore_reason_a, semaphore_reason_b, semaphore_summary,
+                 a_gains_from_b, b_gains_from_a)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (match_id, user["id"], m["candidate_user_id"],
                   m["base_similarity"], m["complementarity_score"],
-                  m["semaphore"], m["a_gains_from_b"], m["b_gains_from_a"]))
+                  m["semaphore"], m.get("semaphore_reason", ""),
+                  m.get("semaphore_reason_for_candidate", ""),
+                  m.get("semaphore_summary", ""),
+                  m["a_gains_from_b"], m["b_gains_from_a"]))
         except sqlite3.IntegrityError:
             pass
     db.commit()
@@ -877,6 +935,8 @@ async def research_match_find_collaborators(params: FindCollaboratorsInput, ctx=
             "pseudonym": m["candidate_pseudonym"],
             "user_id": m["candidate_user_id"],
             "semaphore": f"{_semaphore_emoji(m['semaphore'])} {m['semaphore'].upper()}",
+            "semaphore_reason": m.get("semaphore_reason", ""),
+            "semaphore_summary": m.get("semaphore_summary", ""),
             "base_similarity": f"{m['base_similarity']}%",
             "complementarity": f"{m['complementarity_score']}%",
             "you_gain": f"{m['a_gains_from_b']}%",
@@ -950,7 +1010,8 @@ async def research_match_send_request(params: SendRequestInput, ctx=None) -> str
         "status": "sent",
         "request_id": request_id,
         "semaphore": f"{_semaphore_emoji(match['semaphore'])} {match['semaphore'].upper()}",
-        "message": f"Collaboration request sent! The recipient will see the match from their perspective. They will NOT see your content, only scores and the semaphore.",
+        "semaphore_reason": match.get("semaphore_reason_a", ""),
+        "message": f"Collaboration request sent! The recipient will see the match from their perspective with their own semaphore reasoning. They will NOT see your content, only scores and the semaphore.",
         "note": "If both parties accept, a gradual revelation process begins."
     }, indent=2)
 
@@ -979,6 +1040,7 @@ async def research_match_inbox(ctx=None) -> str:
 
     incoming = db.execute("""
         SELECT cr.*, m.semaphore, m.complementarity_score, m.a_gains_from_b, m.b_gains_from_a,
+               m.semaphore_reason_b, m.semaphore_summary,
                u.pseudonym as requester_pseudonym
         FROM collaboration_requests cr
         JOIN matches m ON cr.match_id = m.id
@@ -989,6 +1051,7 @@ async def research_match_inbox(ctx=None) -> str:
 
     outgoing = db.execute("""
         SELECT cr.*, m.semaphore, m.complementarity_score,
+               m.semaphore_reason_a, m.semaphore_summary,
                u.pseudonym as recipient_pseudonym
         FROM collaboration_requests cr
         JOIN matches m ON cr.match_id = m.id
@@ -1002,6 +1065,8 @@ async def research_match_inbox(ctx=None) -> str:
             "request_id": dict(r)["id"],
             "from": dict(r)["requester_pseudonym"],
             "semaphore": f"{_semaphore_emoji(dict(r)['semaphore'])} {dict(r)['semaphore'].upper()}",
+            "semaphore_reason": dict(r).get("semaphore_reason_b", ""),
+            "semaphore_summary": dict(r).get("semaphore_summary", ""),
             "complementarity": f"{dict(r)['complementarity_score']}%",
             "message": dict(r).get("message", ""),
             "status": dict(r)["status"],
@@ -1011,6 +1076,8 @@ async def research_match_inbox(ctx=None) -> str:
             "request_id": dict(r)["id"],
             "to": dict(r)["recipient_pseudonym"],
             "semaphore": f"{_semaphore_emoji(dict(r)['semaphore'])} {dict(r)['semaphore'].upper()}",
+            "semaphore_reason": dict(r).get("semaphore_reason_a", ""),
+            "semaphore_summary": dict(r).get("semaphore_summary", ""),
             "complementarity": f"{dict(r)['complementarity_score']}%",
             "status": dict(r)["status"],
             "date": dict(r)["created_at"],
