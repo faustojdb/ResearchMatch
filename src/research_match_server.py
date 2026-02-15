@@ -6,6 +6,7 @@ Allows researchers to submit work, get originality scores,
 find collaborators, rate collaborators, and manage collaboration requests.
 
 v2.0 — Added: Rating system, solidity levels, reputation engine.
+v2.2 — Added: Sentence-transformers semantic similarity, health endpoint, improved tool descriptions.
 
 Usage:
     python research_match_server.py              # stdio transport (local)
@@ -18,6 +19,7 @@ import hashlib
 import sqlite3
 import os
 import sys
+import threading
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
@@ -26,6 +28,7 @@ import urllib.request
 import urllib.parse
 import logging
 
+import numpy as np
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 
@@ -35,7 +38,7 @@ from pydantic import BaseModel, Field, ConfigDict, field_validator
 # =============================================================================
 
 DB_PATH = os.environ.get("RESEARCH_MATCH_DB", "research_match.db")
-SERVER_VERSION = "2.1.0-mvp"
+SERVER_VERSION = "2.2.0-mvp"
 
 # Scoring weights for Theoretical Originality (OT)
 OT_WEIGHTS = {
@@ -73,6 +76,88 @@ RED_THRESHOLD = 15     # Both contribute <15% or overlap >75%
 RATING_MIN = 1
 RATING_MAX = 5
 MIN_RATINGS_FOR_REPUTATION = 2  # Need at least 2 ratings to affect reputation
+
+# Embedding model
+EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"  # 384 dims, ~90MB, fast
+
+
+# =============================================================================
+# EMBEDDING ENGINE (Lazy-loaded Sentence Transformers)
+# =============================================================================
+
+class EmbeddingEngine:
+    """Provides semantic similarity via sentence-transformers.
+
+    The model is lazy-loaded on first use to avoid blocking server startup.
+    Thread-safe: uses a lock for model loading.
+    Falls back to Jaccard similarity if the model fails to load.
+    """
+
+    def __init__(self, model_name: str = EMBEDDING_MODEL_NAME):
+        self._model_name = model_name
+        self._model = None
+        self._lock = threading.Lock()
+        self._load_failed = False
+        self._logger = logging.getLogger("research_match.embeddings")
+
+    def _ensure_model(self) -> bool:
+        """Lazy-load the embedding model. Returns True if model is available."""
+        if self._model is not None:
+            return True
+        if self._load_failed:
+            return False
+
+        with self._lock:
+            if self._model is not None:
+                return True
+            if self._load_failed:
+                return False
+            try:
+                from sentence_transformers import SentenceTransformer
+                self._logger.info("Loading embedding model '%s'...", self._model_name)
+                self._model = SentenceTransformer(self._model_name)
+                self._logger.info("Embedding model loaded successfully.")
+                return True
+            except Exception as e:
+                self._logger.warning("Failed to load embedding model: %s. Using Jaccard fallback.", e)
+                self._load_failed = True
+                return False
+
+    def similarity(self, text_a: str, text_b: str) -> float:
+        """Compute semantic similarity between two texts (0.0 to 1.0).
+
+        Uses cosine similarity of sentence embeddings if model is available,
+        otherwise falls back to Jaccard word-overlap similarity.
+        """
+        if not text_a or not text_b:
+            return 0.0
+
+        if self._ensure_model():
+            return self._cosine_similarity(text_a, text_b)
+        return self._jaccard_similarity(text_a, text_b)
+
+    def _cosine_similarity(self, text_a: str, text_b: str) -> float:
+        """Cosine similarity using sentence embeddings."""
+        embeddings = self._model.encode([text_a, text_b], normalize_embeddings=True)
+        score = float(np.dot(embeddings[0], embeddings[1]))
+        return max(0.0, min(1.0, score))
+
+    @staticmethod
+    def _jaccard_similarity(text_a: str, text_b: str) -> float:
+        """Fallback: Jaccard word-overlap similarity."""
+        words_a = set(text_a.lower().split())
+        words_b = set(text_b.lower().split())
+        if not words_a or not words_b:
+            return 0.0
+        return len(words_a & words_b) / len(words_a | words_b)
+
+    @property
+    def is_loaded(self) -> bool:
+        return self._model is not None
+
+    @property
+    def method(self) -> str:
+        return "sentence-transformers" if self._model is not None else "jaccard-fallback"
 
 
 # =============================================================================
@@ -224,10 +309,13 @@ class OriginalityEvaluator:
     For MVP, it uses heuristic analysis against the local corpus.
     The architecture is designed so this module can be swapped for a
     real enclave-based evaluator without changing the interface.
+
+    v2.2: Uses sentence-transformers for semantic similarity (with Jaccard fallback).
     """
 
-    def __init__(self, db: sqlite3.Connection):
+    def __init__(self, db: sqlite3.Connection, embeddings: Optional[EmbeddingEngine] = None):
         self.db = db
+        self.embeddings = embeddings or EmbeddingEngine()
 
     def evaluate_commit(self, commit_data: Dict[str, Any], user_id: str) -> Dict[str, Any]:
         """Evaluate a Research Commit and return originality scores."""
@@ -435,21 +523,22 @@ class OriginalityEvaluator:
         }
 
     def _text_similarity(self, a: str, b: str) -> float:
-        """Simple word-overlap similarity. Production would use embeddings."""
-        words_a = set(a.split())
-        words_b = set(b.split())
-        if not words_a or not words_b:
-            return 0.0
-        intersection = words_a & words_b
-        union = words_a | words_b
-        return len(intersection) / len(union)
+        """Semantic similarity using sentence-transformers (with Jaccard fallback).
+
+        Returns a value between 0.0 and 1.0.
+        """
+        return self.embeddings.similarity(a, b)
 
     def _commit_similarity(self, a: Dict, b: Dict) -> float:
-        """Calculate overall similarity between two commits."""
+        """Calculate overall similarity between two commits using semantic embeddings.
+
+        Compares problem, hypothesis, and theoretical_framework fields.
+        Returns a value between 0 and 100.
+        """
         scores = []
         for field in ["problem", "hypothesis", "theoretical_framework"]:
-            va = (a.get(field) or "").lower()
-            vb = (b.get(field) or "").lower()
+            va = (a.get(field) or "")
+            vb = (b.get(field) or "")
             if va and vb:
                 scores.append(self._text_similarity(va, vb) * 100)
         return sum(scores) / max(len(scores), 1)
@@ -621,10 +710,14 @@ class ReputationEngine:
 # =============================================================================
 
 class MatchingEngine:
-    """Calculates matches and bilateral convenience semaphores."""
+    """Calculates matches and bilateral convenience semaphores.
 
-    def __init__(self, db: sqlite3.Connection):
+    v2.2: Uses sentence-transformers for semantic base similarity (with Jaccard fallback).
+    """
+
+    def __init__(self, db: sqlite3.Connection, embeddings: Optional[EmbeddingEngine] = None):
         self.db = db
+        self.embeddings = embeddings or EmbeddingEngine()
 
     def find_matches(self, user_id: str, limit: int = 10) -> List[Dict[str, Any]]:
         """Find potential collaborators for a user."""
@@ -711,22 +804,19 @@ class MatchingEngine:
         }
 
     def _base_similarity(self, a: Dict, b: Dict) -> float:
-        """Calculate how similar the theoretical base is."""
+        """Calculate how similar the theoretical base is using semantic similarity."""
         score = 0.0
         if a.get("domain") == b.get("domain"):
             score += 40.0
         if a.get("subdomain") and a.get("subdomain") == b.get("subdomain"):
             score += 30.0
 
-        # Problem similarity
-        prob_a = (a.get("problem") or "").lower()
-        prob_b = (b.get("problem") or "").lower()
+        # Problem similarity via embeddings (or Jaccard fallback)
+        prob_a = a.get("problem") or ""
+        prob_b = b.get("problem") or ""
         if prob_a and prob_b:
-            words_a = set(prob_a.split())
-            words_b = set(prob_b.split())
-            if words_a and words_b:
-                overlap = len(words_a & words_b) / len(words_a | words_b)
-                score += overlap * 30.0
+            sim = self.embeddings.similarity(prob_a, prob_b)
+            score += sim * 30.0
 
         return min(100.0, score)
 
@@ -927,18 +1017,83 @@ class ColdSearchInput(BaseModel):
 # LIFESPAN & SERVER INITIALIZATION
 # =============================================================================
 
+_server_start_time: Optional[str] = None
+
+
 @asynccontextmanager
 async def app_lifespan():
     """Initialize database and engines."""
+    global _server_start_time
+    _server_start_time = datetime.now(timezone.utc).isoformat()
     db = init_database(DB_PATH)
-    evaluator = OriginalityEvaluator(db)
-    matcher = MatchingEngine(db)
+    embeddings = EmbeddingEngine()
+    evaluator = OriginalityEvaluator(db, embeddings)
+    matcher = MatchingEngine(db, embeddings)
     reputation = ReputationEngine(db)
-    yield {"db": db, "evaluator": evaluator, "matcher": matcher, "reputation": reputation}
+    yield {
+        "db": db, "evaluator": evaluator, "matcher": matcher,
+        "reputation": reputation, "embeddings": embeddings,
+    }
     db.close()
 
 
 mcp = FastMCP("research_match_mcp", lifespan=app_lifespan)
+
+
+# =============================================================================
+# HEALTH ENDPOINT (HTTP only)
+# =============================================================================
+
+def _health_stats() -> Dict[str, Any]:
+    """Gather health statistics from the database."""
+    try:
+        db = sqlite3.connect(DB_PATH)
+        db.row_factory = sqlite3.Row
+        users = db.execute("SELECT COUNT(*) as c FROM users").fetchone()["c"]
+        commits = db.execute("SELECT COUNT(*) as c FROM research_commits").fetchone()["c"]
+        matches = db.execute("SELECT COUNT(*) as c FROM matches").fetchone()["c"]
+        teams = db.execute("SELECT COUNT(*) as c FROM teams").fetchone()["c"]
+        pending_requests = db.execute(
+            "SELECT COUNT(*) as c FROM collaboration_requests WHERE status = 'pending'"
+        ).fetchone()["c"]
+        ratings = db.execute("SELECT COUNT(*) as c FROM ratings").fetchone()["c"]
+        db.close()
+        # Check embedding engine status
+        try:
+            emb = EmbeddingEngine.__new__(EmbeddingEngine)
+            emb_status = "not_initialized"
+        except Exception:
+            emb_status = "unknown"
+
+        return {
+            "status": "ok",
+            "version": SERVER_VERSION,
+            "started_at": _server_start_time,
+            "database": DB_PATH,
+            "similarity_method": "sentence-transformers (lazy-load on first use)",
+            "embedding_model": EMBEDDING_MODEL_NAME,
+            "stats": {
+                "users": users,
+                "commits": commits,
+                "matches": matches,
+                "teams": teams,
+                "pending_requests": pending_requests,
+                "ratings": ratings,
+            },
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "version": SERVER_VERSION,
+            "error": str(e),
+        }
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health_endpoint(request):
+    """Health check endpoint for monitoring."""
+    from starlette.responses import JSONResponse
+    return JSONResponse(_health_stats())
 
 
 # =============================================================================
@@ -1013,6 +1168,13 @@ def _reputation_badge(score: float, total_ratings: int) -> str:
 
 @mcp.tool(
     name="research_match_register",
+    description=(
+        "STEP 1 OF THE RESEARCH MATCH FLOW — Call this tool FIRST before any other research_match tool. "
+        "Registers the user with a pseudonymous identity. The email is hashed with SHA-256 and NEVER stored in plain text. "
+        "If the user is already registered (same email), returns existing profile. "
+        "After registration, guide the user to submit a Research Commit using research_match_analyze_work or research_match_submit_commit. "
+        "Example flow: register → analyze_work → submit_commit → find_collaborators → send_request."
+    ),
     annotations={
         "title": "Register on Research Match",
         "readOnlyHint": False,
@@ -1023,15 +1185,15 @@ def _reputation_badge(score: float, total_ratings: int) -> str:
 )
 async def research_match_register(params: RegisterInput, ctx=None) -> str:
     """Register a new user on Research Match. Creates a pseudonymous profile.
-    Email is hashed and never stored in plain text.
+    Email is hashed and never stored in plain text. Idempotent: safe to call multiple times.
 
     Args:
         params (RegisterInput): Registration data containing:
-            - email (str): Email address for identity (hashed)
-            - pseudonym (Optional[str]): Preferred display name
+            - email (str): Email address for identity (will be SHA-256 hashed)
+            - pseudonym (Optional[str]): Preferred display name (auto-generated if omitted)
 
     Returns:
-        str: JSON with user ID and pseudonym
+        str: JSON with user_id, pseudonym, and welcome message
     """
     from mcp.server.fastmcp import Context
     db = _get_db(ctx)
@@ -1048,6 +1210,18 @@ async def research_match_register(params: RegisterInput, ctx=None) -> str:
 
 @mcp.tool(
     name="research_match_submit_commit",
+    description=(
+        "STEP 2 — Submit a structured Research Commit for AI originality evaluation. "
+        "IMPORTANT: Call research_match_analyze_work FIRST to get the template, then fill it with the user's work context. "
+        "The commit is evaluated on two independent axes: "
+        "Theoretical Originality (OT) — novelty of hypotheses, interdisciplinary connections, ad hoc content; "
+        "Formal-Computational Originality (OFC) — code quality, formal methods, validation power. "
+        "Solidity levels (proven/functional/speculative/adhoc/cherry_picked) affect score confidence via multipliers. "
+        "HONEST solidity declaration builds reputation — collaborators will rate honesty later. "
+        "Required fields: domain (e.g. 'machine learning'), problem (min 10 chars). "
+        "All other fields are optional but improve score accuracy. "
+        "Each submission creates a new version — previous versions are preserved."
+    ),
     annotations={
         "title": "Submit Research Commit",
         "readOnlyHint": False,
@@ -1057,24 +1231,21 @@ async def research_match_register(params: RegisterInput, ctx=None) -> str:
     }
 )
 async def research_match_submit_commit(params: SubmitCommitInput, ctx=None) -> str:
-    """Submit a Research Commit for AI evaluation. The commit is analyzed
-    across two axes: Theoretical Originality (OT) and Formal-Computational
-    Originality (OFC). Content is hashed for integrity verification.
-
-    NEW in v2: Solidity levels affect score confidence. Declaring honestly
-    builds reputation — dishonest declarations will be detected by
-    collaborators and penalized through the rating system.
+    """Submit a Research Commit for AI evaluation.
 
     Args:
         params (SubmitCommitInput): Structured research commit with:
-            - Theory Base fields
-            - Demonstrations fields
-            - Ad Hoc Content fields
-            - Cherry-Picking Declared
-            - Solidity levels (NEW): per-component or overall
+            - domain (str, required): Scientific/technical domain
+            - problem (str, required): Specific problem being addressed (min 10 chars)
+            - subdomain, hypothesis, theoretical_framework (optional): Theory base
+            - demonstrations_summary, demo_types, code_languages (optional): Formal work
+            - adhoc_summary, adhoc_connections (optional): Original content
+            - cherry_picking (optional): Declared external sources
+            - solidity_levels (optional): Per-component solidity declaration
+            - overall_solidity (optional, default 'speculative'): Overall maturity level
 
     Returns:
-        str: JSON with commit ID, scores, solidity impact, and breakdown
+        str: JSON with commit_id, version, OT/OFC scores, solidity impact, and breakdowns
     """
     db = _get_db(ctx)
     evaluator = _get_evaluator(ctx)
@@ -1162,6 +1333,14 @@ async def research_match_submit_commit(params: SubmitCommitInput, ctx=None) -> s
 
 @mcp.tool(
     name="research_match_my_profile",
+    description=(
+        "View the user's current Research Match profile. Shows: "
+        "pseudonym, reputation badge and score, latest commit with OT/OFC scores and solidity impact, "
+        "score breakdowns per factor, and team memberships. "
+        "Call this ANYTIME the user asks about their profile, scores, reputation, or status. "
+        "No parameters needed — automatically detects the current user. "
+        "If no commits submitted yet, suggests using research_match_submit_commit."
+    ),
     annotations={
         "title": "View My Originality Profile",
         "readOnlyHint": True,
@@ -1171,11 +1350,11 @@ async def research_match_submit_commit(params: SubmitCommitInput, ctx=None) -> s
     }
 )
 async def research_match_my_profile(ctx=None) -> str:
-    """View your current originality profile, scores, reputation, and commit history.
-    Shows OT/OFC scores, solidity levels, reputation from ratings, and teams.
+    """View current originality profile, scores, reputation, and commit history.
 
     Returns:
-        str: Formatted profile with scores, reputation, breakdowns, and history
+        str: JSON with pseudonym, reputation (badge/score/ratings), latest commit scores,
+             OT/OFC breakdowns, solidity impact, and team list
     """
     db = _get_db(ctx)
     reputation_engine = _get_reputation(ctx)
@@ -1242,6 +1421,17 @@ async def research_match_my_profile(ctx=None) -> str:
 
 @mcp.tool(
     name="research_match_find_collaborators",
+    description=(
+        "STEP 3 — Find researchers with COMPLEMENTARY skills in the same domain. "
+        "Requires at least one submitted commit (call research_match_submit_commit first). "
+        "Returns candidates ranked by complementarity score, each with: "
+        "bilateral semaphore (GREEN=high mutual benefit, YELLOW=asymmetric, RED=low benefit), "
+        "what YOU gain from them and what THEY gain from you (percentage), "
+        "their OT/OFC scores, reputation badge, and solidity level. "
+        "The semaphore reason explains WHY the match is convenient or not FROM EACH PERSPECTIVE. "
+        "Use min_semaphore='green' to filter only high-value matches, or leave empty to see all. "
+        "After finding candidates, use research_match_send_request to initiate collaboration."
+    ),
     annotations={
         "title": "Find Potential Collaborators",
         "readOnlyHint": True,
@@ -1252,16 +1442,16 @@ async def research_match_my_profile(ctx=None) -> str:
 )
 async def research_match_find_collaborators(params: FindCollaboratorsInput, ctx=None) -> str:
     """Find researchers with complementary skills and knowledge.
-    Uses AI-powered matching to identify candidates with high
-    complementarity. Shows semaphore, reputation badge, and solidity.
 
     Args:
         params (FindCollaboratorsInput): Search parameters:
-            - limit (int): Max candidates to return (1-20)
-            - min_semaphore (str): Filter by minimum semaphore level
+            - limit (int, default 5): Max candidates to return (1-20)
+            - min_semaphore (str, optional): Filter by minimum level: 'green', 'yellow', or 'red'
 
     Returns:
-        str: JSON array of candidates with scores, semaphores, and reputation
+        str: JSON with your_profile summary and candidates array, each containing:
+             pseudonym, user_id, semaphore (with emoji), reason, complementarity %,
+             you_gain %, they_gain %, their OT/OFC scores, domain, reputation badge, solidity
     """
     db = _get_db(ctx)
     matcher = _get_matcher(ctx)
@@ -1331,6 +1521,16 @@ async def research_match_find_collaborators(params: FindCollaboratorsInput, ctx=
 
 @mcp.tool(
     name="research_match_send_request",
+    description=(
+        "STEP 4 — Send a collaboration request to a matched researcher. "
+        "REQUIRES: You must have run research_match_find_collaborators first to generate a match record. "
+        "Pass the candidate_user_id from the find_collaborators results. "
+        "The recipient sees the semaphore and scores FROM THEIR OWN PERSPECTIVE — they never see your content. "
+        "Include a message describing what you're looking for in the collaboration. "
+        "Only one pending request per candidate is allowed. "
+        "After sending, the recipient can check their inbox with research_match_inbox and respond with research_match_respond_request. "
+        "If both parties accept, a team is created automatically with joint-equal licensing."
+    ),
     annotations={
         "title": "Send Collaboration Request",
         "readOnlyHint": False,
@@ -1341,16 +1541,14 @@ async def research_match_find_collaborators(params: FindCollaboratorsInput, ctx=
 )
 async def research_match_send_request(params: SendRequestInput, ctx=None) -> str:
     """Send a collaboration request to a matched researcher.
-    The recipient sees the semaphore and relative scores from their
-    perspective, but never your actual content.
 
     Args:
         params (SendRequestInput): Request data:
-            - candidate_user_id (str): Target user ID from find_collaborators
-            - message (str): Optional message about what you're looking for
+            - candidate_user_id (str, required): Target user ID from find_collaborators results
+            - message (str, optional): Describe what you're looking for (max 1000 chars)
 
     Returns:
-        str: JSON with request status and details
+        str: JSON with request_id, status, semaphore, reason, and next steps
     """
     db = _get_db(ctx)
     user = _get_current_user(db)
@@ -1397,6 +1595,13 @@ async def research_match_send_request(params: SendRequestInput, ctx=None) -> str
 
 @mcp.tool(
     name="research_match_inbox",
+    description=(
+        "View all collaboration requests — both incoming (others requesting you) and outgoing (you requesting others). "
+        "Each request shows: requester/recipient pseudonym, semaphore with reason FROM YOUR PERSPECTIVE, "
+        "complementarity score, message, status (pending/accepted/rejected/expired), and date. "
+        "Call this when the user asks about pending requests, collaboration status, or inbox. "
+        "For incoming pending requests, use research_match_respond_request to accept or reject."
+    ),
     annotations={
         "title": "View Collaboration Requests",
         "readOnlyHint": True,
@@ -1406,11 +1611,12 @@ async def research_match_send_request(params: SendRequestInput, ctx=None) -> str
     }
 )
 async def research_match_inbox(ctx=None) -> str:
-    """View incoming and outgoing collaboration requests.
-    Shows pending, accepted, and rejected requests with semaphore indicators.
+    """View incoming and outgoing collaboration requests with semaphore indicators.
 
     Returns:
-        str: JSON with incoming and outgoing requests
+        str: JSON with 'incoming' and 'outgoing' arrays, each entry containing:
+             request_id, from/to pseudonym, semaphore (emoji + level), reason,
+             complementarity %, message, status, and date
     """
     db = _get_db(ctx)
     user = _get_current_user(db)
@@ -1466,6 +1672,15 @@ async def research_match_inbox(ctx=None) -> str:
 
 @mcp.tool(
     name="research_match_respond_request",
+    description=(
+        "Accept or reject an incoming collaboration request. "
+        "Get the request_id from research_match_inbox (incoming requests). "
+        "If ACCEPTED: a team is automatically created with joint-equal licensing (50/50), "
+        "both users become co-leads, and the gradual revelation process begins. "
+        "After team formation, both members can rate each other using research_match_rate_user. "
+        "If REJECTED: the request is closed. The requester can see the rejection in their outbox. "
+        "Only pending requests can be responded to — already accepted/rejected requests cannot be changed."
+    ),
     annotations={
         "title": "Respond to Collaboration Request",
         "readOnlyHint": False,
@@ -1475,16 +1690,15 @@ async def research_match_inbox(ctx=None) -> str:
     }
 )
 async def research_match_respond_request(params: RespondRequestInput, ctx=None) -> str:
-    """Accept or reject a collaboration request. If both parties accept,
-    a team is created with a shared repository and joint license.
+    """Accept or reject a collaboration request.
 
     Args:
         params (RespondRequestInput): Response data:
-            - request_id (str): ID of the request to respond to
-            - accept (bool): True to accept, False to reject
+            - request_id (str, required): ID of the request (from research_match_inbox)
+            - accept (bool, required): true to accept, false to reject
 
     Returns:
-        str: JSON with response status and team details if accepted
+        str: JSON with status ('accepted'/'rejected'), and if accepted: team_id, team_name, license type
     """
     db = _get_db(ctx)
     user = _get_current_user(db)
@@ -1545,6 +1759,19 @@ async def research_match_respond_request(params: RespondRequestInput, ctx=None) 
 
 @mcp.tool(
     name="research_match_rate_user",
+    description=(
+        "Rate a collaborator after working together in a team. "
+        "ANTI-RETALIATION: Ratings are ANONYMOUS until BOTH team members have rated each other. "
+        "This means you can rate honestly without fear of revenge ratings. "
+        "Three dimensions — Honesty (1-5): did they declare solidity levels accurately? "
+        "Quality (1-5): was their work well-structured and valuable? "
+        "Effort (1-5): did they contribute meaningfully to the collaboration? "
+        "HONESTY HAS THE HIGHEST WEIGHT (50%) in reputation calculation. "
+        "Low honesty ratings severely penalize reputation. "
+        "The system detects abusive patterns (always 1-star, always 5-star, zero variance). "
+        "Ratings CANNOT be modified after submission to prevent gaming. "
+        "Once both members rate, ratings are revealed simultaneously and reputations update."
+    ),
     annotations={
         "title": "Rate a Collaborator",
         "readOnlyHint": False,
@@ -1556,28 +1783,18 @@ async def research_match_respond_request(params: RespondRequestInput, ctx=None) 
 async def research_match_rate_user(params: RateUserInput, ctx=None) -> str:
     """Rate a collaborator after working together in a team.
 
-    Ratings are ANONYMOUS until both team members have rated each other.
-    This prevents retaliation — you can rate honestly without fear.
-
-    Rating dimensions:
-    - Honesty (1-5): Did they accurately declare solidity levels?
-    - Quality (1-5): Was their work well-structured and valuable?
-    - Effort (1-5): Did they contribute meaningfully?
-
-    Low honesty ratings have the biggest impact on reputation.
-    The system also detects abusive rating patterns (always 1-star, etc.)
-
     Args:
         params (RateUserInput): Rating data:
-            - team_id: Team where you collaborated
-            - rated_user_id: User to rate
-            - honesty (1-5): Honesty/transparency rating
-            - quality (1-5): Work quality rating
-            - effort (1-5): Contribution effort rating
-            - comment: Optional private comment
+            - team_id (str, required): ID of the team where you collaborated
+            - rated_user_id (str, required): User ID of the person to rate
+            - honesty (int, required): 1-5, accuracy of solidity declarations
+            - quality (int, required): 1-5, work structure and value
+            - effort (int, required): 1-5, meaningful contribution level
+            - comment (str, optional): Private comment (visible after both rate, max 500 chars)
 
     Returns:
-        str: JSON with rating status and whether both have rated
+        str: JSON with rating_id, anonymous status, both_rated flag, and if both rated:
+             their rating of you and updated reputation scores
     """
     db = _get_db(ctx)
     reputation_engine = _get_reputation(ctx)
@@ -1670,6 +1887,15 @@ async def research_match_rate_user(params: RateUserInput, ctx=None) -> str:
 
 @mcp.tool(
     name="research_match_analyze_work",
+    description=(
+        "HELPER — Call this BEFORE research_match_submit_commit to get the Research Commit template. "
+        "Returns a structured template with all fields and instructions for filling each section. "
+        "After calling this, review the conversation context and help the user fill out each section "
+        "based on their current work. Then call research_match_submit_commit with the structured data. "
+        "Includes solidity guide: proven (x1.0), functional (x0.85), speculative (x0.60), "
+        "adhoc (x0.40), cherry_picked (x0.30). "
+        "IMPORTANT: Coach the user to be HONEST about solidity levels — their reputation depends on it."
+    ),
     annotations={
         "title": "Analyze Current Work for Research Commit",
         "readOnlyHint": True,
@@ -1679,13 +1905,11 @@ async def research_match_rate_user(params: RateUserInput, ctx=None) -> str:
     }
 )
 async def research_match_analyze_work(ctx=None) -> str:
-    """Returns the Research Commit template structure so Claude can help
-    the user fill it out based on their current work in the conversation.
-
-    v2: Now includes solidity level declaration for each component.
+    """Returns the Research Commit template for Claude to help fill out.
 
     Returns:
-        str: JSON template with instructions for each field
+        str: JSON with template structure (theory_base, demonstrations, adhoc_content,
+             cherry_picking, solidity_levels), solidity guide with multipliers, and instructions
     """
     return json.dumps({
         "message": "I'll help you create a Research Commit. Based on your work, I need to fill out these sections:",
@@ -1818,11 +2042,15 @@ def _cold_search_github(query: str, limit: int) -> List[Dict]:
 @mcp.tool(
     name="research_match_cold_search",
     description=(
-        "FREE cold search — no registration required. "
-        "Search for research topics, domains, or technologies across the "
-        "ResearchMatch internal database and GitHub public repositories. "
-        "Returns basic public info only (no scores, no private data). "
-        "Use this to explore what's out there before committing to the platform."
+        "FREE cold search — NO REGISTRATION REQUIRED. Anyone can use this tool. "
+        "Searches for research topics, domains, or technologies across TWO sources: "
+        "(1) ResearchMatch internal database — shows pseudonym, domain, problem, solidity of registered researchers; "
+        "(2) GitHub public repositories — shows repo name, description, language, stars, URL. "
+        "Returns basic public info ONLY — no scores, no private data, no contact info. "
+        "Use this to explore what's out there BEFORE registering. "
+        "Good queries: domain names ('machine learning'), specific topics ('protein folding'), "
+        "technologies ('rust compiler'), or broad fields ('quantum computing'). "
+        "If no results, try broader keywords. Internal DB grows as more researchers join."
     ),
 )
 async def research_match_cold_search(params: ColdSearchInput, ctx=None) -> str:
@@ -1871,6 +2099,7 @@ if __name__ == "__main__":
     if "--http" in sys.argv:
         port_idx = sys.argv.index("--http") + 1
         port = int(sys.argv[port_idx]) if port_idx < len(sys.argv) else 8000
-        mcp.run(transport="streamable_http", port=port)
+        mcp.settings.port = port
+        mcp.run(transport="streamable-http")
     else:
         mcp.run()
