@@ -25,3 +25,6 @@ Thumbs.db
 .env
 *.pem
 *.key
+
+# Reference repos (cloned for analysis, not part of project)
+research_refs/
