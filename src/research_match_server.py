@@ -3,7 +3,9 @@ Research Match MCP Server
 =========================
 MCP Server that integrates Research Match into Claude.
 Allows researchers to submit work, get originality scores,
-find collaborators, and manage collaboration requests.
+find collaborators, rate collaborators, and manage collaboration requests.
+
+v2.0 — Added: Rating system, solidity levels, reputation engine.
 
 Usage:
     python research_match_server.py              # stdio transport (local)
@@ -30,7 +32,7 @@ from pydantic import BaseModel, Field, ConfigDict, field_validator
 # =============================================================================
 
 DB_PATH = os.environ.get("RESEARCH_MATCH_DB", "research_match.db")
-SERVER_VERSION = "1.0.0-mvp"
+SERVER_VERSION = "2.0.0-mvp"
 
 # Scoring weights for Theoretical Originality (OT)
 OT_WEIGHTS = {
@@ -49,10 +51,25 @@ OFC_WEIGHTS = {
     "coverage": 0.15,
 }
 
+# Solidity level multipliers — affect how scores are weighted
+# Higher solidity = more confidence in the score
+SOLIDITY_MULTIPLIERS = {
+    "proven": 1.0,        # Fully demonstrated, peer-reviewed or formally verified
+    "functional": 0.85,   # Working code/data, reproducible but not formally proven
+    "speculative": 0.60,  # Theoretical reasoning without full validation
+    "adhoc": 0.40,        # Original intuition, preliminary ideas
+    "cherry_picked": 0.30, # Curated from other sources (declared honestly)
+}
+
 # Semaphore thresholds
 GREEN_THRESHOLD = 30   # Both users contribute >30% complementary originality
 YELLOW_ASYMMETRY = 15  # Asymmetry >15 points
 RED_THRESHOLD = 15     # Both contribute <15% or overlap >75%
+
+# Rating constants
+RATING_MIN = 1
+RATING_MAX = 5
+MIN_RATINGS_FOR_REPUTATION = 2  # Need at least 2 ratings to affect reputation
 
 
 # =============================================================================
@@ -72,7 +89,11 @@ def init_database(db_path: str) -> sqlite3.Connection:
             pseudonym TEXT UNIQUE NOT NULL,
             email_hash TEXT UNIQUE NOT NULL,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            reputation_score REAL DEFAULT 100.0
+            reputation_score REAL DEFAULT 100.0,
+            total_ratings_received INTEGER DEFAULT 0,
+            avg_honesty REAL DEFAULT 0.0,
+            avg_quality REAL DEFAULT 0.0,
+            avg_effort REAL DEFAULT 0.0
         );
 
         CREATE TABLE IF NOT EXISTS research_commits (
@@ -100,6 +121,10 @@ def init_database(db_path: str) -> sqlite3.Connection:
             -- Cherry-Picking Declared
             cherry_picking TEXT,  -- JSON array of declared sources
 
+            -- Solidity levels (JSON object mapping component to level)
+            solidity_levels TEXT,  -- {"theory": "speculative", "demos": "functional", ...}
+            overall_solidity TEXT DEFAULT 'speculative',
+
             -- Content hashes for integrity verification
             content_hash TEXT NOT NULL,
 
@@ -108,6 +133,7 @@ def init_database(db_path: str) -> sqlite3.Connection:
             ofc_score REAL,  -- Formal-Computational Originality (0-100)
             ot_breakdown TEXT,  -- JSON with per-factor scores
             ofc_breakdown TEXT,  -- JSON with per-factor scores
+            solidity_impact TEXT,  -- JSON showing how solidity affected scores
 
             UNIQUE(user_id, version)
         );
@@ -157,10 +183,26 @@ def init_database(db_path: str) -> sqlite3.Connection:
             PRIMARY KEY (team_id, user_id)
         );
 
+        CREATE TABLE IF NOT EXISTS ratings (
+            id TEXT PRIMARY KEY,
+            team_id TEXT NOT NULL REFERENCES teams(id),
+            rater_id TEXT NOT NULL REFERENCES users(id),
+            rated_id TEXT NOT NULL REFERENCES users(id),
+            honesty INTEGER NOT NULL CHECK(honesty BETWEEN 1 AND 5),
+            quality INTEGER NOT NULL CHECK(quality BETWEEN 1 AND 5),
+            effort INTEGER NOT NULL CHECK(effort BETWEEN 1 AND 5),
+            comment TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            is_revealed INTEGER DEFAULT 0,  -- 0 = anonymous until both rate
+            UNIQUE(team_id, rater_id, rated_id)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_commits_user ON research_commits(user_id);
         CREATE INDEX IF NOT EXISTS idx_commits_domain ON research_commits(domain, subdomain);
         CREATE INDEX IF NOT EXISTS idx_matches_users ON matches(user_a_id, user_b_id);
         CREATE INDEX IF NOT EXISTS idx_requests_recipient ON collaboration_requests(recipient_id, status);
+        CREATE INDEX IF NOT EXISTS idx_ratings_rated ON ratings(rated_id);
+        CREATE INDEX IF NOT EXISTS idx_ratings_team ON ratings(team_id);
     """)
 
     conn.commit()
@@ -204,11 +246,74 @@ class OriginalityEvaluator:
             for factor, score in ofc_breakdown.items()
         )
 
+        # Apply solidity multipliers
+        solidity_levels = commit_data.get("solidity_levels", {})
+        overall_solidity = commit_data.get("overall_solidity", "speculative")
+        solidity_impact = self._apply_solidity(
+            ot_score, ofc_score, solidity_levels, overall_solidity
+        )
+
         return {
-            "ot_score": round(ot_score, 1),
-            "ofc_score": round(ofc_score, 1),
+            "ot_score": round(solidity_impact["adjusted_ot"], 1),
+            "ofc_score": round(solidity_impact["adjusted_ofc"], 1),
             "ot_breakdown": ot_breakdown,
             "ofc_breakdown": ofc_breakdown,
+            "ot_raw": round(ot_score, 1),
+            "ofc_raw": round(ofc_score, 1),
+            "solidity_impact": solidity_impact,
+        }
+
+    def _apply_solidity(
+        self, ot_raw: float, ofc_raw: float,
+        solidity_levels: Dict[str, str], overall_solidity: str
+    ) -> Dict[str, Any]:
+        """Apply solidity level multipliers to raw scores.
+
+        Solidity affects confidence in the score:
+        - 'proven' content keeps its full score
+        - 'speculative' content is discounted
+        - Mixed solidity uses weighted average of components
+        """
+        # If detailed solidity levels provided, use component-level adjustment
+        if solidity_levels:
+            theory_mult = SOLIDITY_MULTIPLIERS.get(
+                solidity_levels.get("theory", overall_solidity), 0.6
+            )
+            demos_mult = SOLIDITY_MULTIPLIERS.get(
+                solidity_levels.get("demos", overall_solidity), 0.6
+            )
+            adhoc_mult = SOLIDITY_MULTIPLIERS.get(
+                solidity_levels.get("adhoc", overall_solidity), 0.6
+            )
+            cherry_mult = SOLIDITY_MULTIPLIERS.get(
+                solidity_levels.get("cherry_picking", "cherry_picked"), 0.3
+            )
+
+            # OT is more affected by theory and adhoc solidity
+            ot_mult = (theory_mult * 0.5 + adhoc_mult * 0.35 + cherry_mult * 0.15)
+            # OFC is more affected by demos solidity
+            ofc_mult = (demos_mult * 0.7 + theory_mult * 0.2 + cherry_mult * 0.1)
+        else:
+            # Use overall solidity for both
+            mult = SOLIDITY_MULTIPLIERS.get(overall_solidity, 0.6)
+            ot_mult = mult
+            ofc_mult = mult
+
+        adjusted_ot = ot_raw * ot_mult
+        adjusted_ofc = ofc_raw * ofc_mult
+
+        return {
+            "adjusted_ot": adjusted_ot,
+            "adjusted_ofc": adjusted_ofc,
+            "ot_multiplier": round(ot_mult, 2),
+            "ofc_multiplier": round(ofc_mult, 2),
+            "overall_solidity": overall_solidity,
+            "component_levels": solidity_levels,
+            "explanation": (
+                f"Solidity '{overall_solidity}' applied. "
+                f"OT adjusted by x{ot_mult:.2f} ({ot_raw:.1f} -> {adjusted_ot:.1f}), "
+                f"OFC adjusted by x{ofc_mult:.2f} ({ofc_raw:.1f} -> {adjusted_ofc:.1f})."
+            )
         }
 
     def _get_corpus(self, domain: str, subdomain: Optional[str], exclude_user: str) -> List[Dict]:
@@ -348,6 +453,167 @@ class OriginalityEvaluator:
 
 
 # =============================================================================
+# REPUTATION ENGINE
+# =============================================================================
+
+class ReputationEngine:
+    """Calculates and manages user reputation based on ratings.
+
+    Reputation is a composite score that reflects:
+    - Honesty: Does the user declare solidity levels accurately?
+    - Quality: Is their work well-structured and valuable?
+    - Effort: Do they contribute meaningfully to collaborations?
+
+    Anti-retaliation: Ratings are anonymous until BOTH team members
+    have rated each other. This prevents strategic rating.
+    """
+
+    def __init__(self, db: sqlite3.Connection):
+        self.db = db
+
+    def calculate_reputation(self, user_id: str) -> Dict[str, Any]:
+        """Calculate composite reputation for a user."""
+        ratings = self.db.execute(
+            "SELECT * FROM ratings WHERE rated_id = ? ORDER BY created_at DESC",
+            (user_id,)
+        ).fetchall()
+
+        if len(ratings) < MIN_RATINGS_FOR_REPUTATION:
+            return {
+                "reputation_score": 100.0,  # Default for new users
+                "total_ratings": len(ratings),
+                "avg_honesty": 0.0,
+                "avg_quality": 0.0,
+                "avg_effort": 0.0,
+                "status": "insufficient_data",
+                "message": f"Need at least {MIN_RATINGS_FOR_REPUTATION} ratings to calculate reputation."
+            }
+
+        # Temporal weighting: recent ratings count more
+        total_weight = 0.0
+        weighted_honesty = 0.0
+        weighted_quality = 0.0
+        weighted_effort = 0.0
+
+        for i, r in enumerate(ratings):
+            r = dict(r)
+            # More recent = higher weight (exponential decay)
+            weight = 0.9 ** i  # Most recent = 1.0, then 0.9, 0.81, etc.
+            total_weight += weight
+            weighted_honesty += r["honesty"] * weight
+            weighted_quality += r["quality"] * weight
+            weighted_effort += r["effort"] * weight
+
+        avg_honesty = weighted_honesty / total_weight
+        avg_quality = weighted_quality / total_weight
+        avg_effort = weighted_effort / total_weight
+
+        # Composite reputation (0-100 scale)
+        # Honesty weighs most heavily — a dishonest user poisons the ecosystem
+        reputation = (
+            (avg_honesty / 5.0) * 50.0 +   # 50% weight on honesty
+            (avg_quality / 5.0) * 30.0 +     # 30% weight on quality
+            (avg_effort / 5.0) * 20.0        # 20% weight on effort
+        )
+
+        # Penalty for very low honesty (busca/dishonest users)
+        if avg_honesty < 2.0:
+            reputation *= 0.5  # Harsh penalty for dishonesty
+
+        # Bonus for consistent high ratings
+        if len(ratings) >= 5 and avg_honesty >= 4.0 and avg_quality >= 3.5:
+            reputation = min(100.0, reputation * 1.1)
+
+        return {
+            "reputation_score": round(reputation, 1),
+            "total_ratings": len(ratings),
+            "avg_honesty": round(avg_honesty, 2),
+            "avg_quality": round(avg_quality, 2),
+            "avg_effort": round(avg_effort, 2),
+            "status": "calculated",
+        }
+
+    def update_user_reputation(self, user_id: str) -> None:
+        """Recalculate and store reputation for a user."""
+        rep = self.calculate_reputation(user_id)
+        self.db.execute("""
+            UPDATE users SET
+                reputation_score = ?,
+                total_ratings_received = ?,
+                avg_honesty = ?,
+                avg_quality = ?,
+                avg_effort = ?
+            WHERE id = ?
+        """, (
+            rep["reputation_score"],
+            rep["total_ratings"],
+            rep["avg_honesty"],
+            rep["avg_quality"],
+            rep["avg_effort"],
+            user_id
+        ))
+        self.db.commit()
+
+    def check_both_rated(self, team_id: str, user_a_id: str, user_b_id: str) -> bool:
+        """Check if both team members have rated each other."""
+        a_rated_b = self.db.execute(
+            "SELECT id FROM ratings WHERE team_id = ? AND rater_id = ? AND rated_id = ?",
+            (team_id, user_a_id, user_b_id)
+        ).fetchone()
+        b_rated_a = self.db.execute(
+            "SELECT id FROM ratings WHERE team_id = ? AND rater_id = ? AND rated_id = ?",
+            (team_id, user_b_id, user_a_id)
+        ).fetchone()
+        return bool(a_rated_b and b_rated_a)
+
+    def reveal_ratings(self, team_id: str) -> None:
+        """Mark all ratings in a team as revealed (both have rated)."""
+        self.db.execute(
+            "UPDATE ratings SET is_revealed = 1 WHERE team_id = ?",
+            (team_id,)
+        )
+        self.db.commit()
+
+    def detect_abuse_patterns(self, rater_id: str) -> Dict[str, Any]:
+        """Detect if a rater shows patterns of abusive rating behavior.
+
+        Flags:
+        - Always gives 1-star (vindictive)
+        - Always gives 5-star (inflating)
+        - Rates too quickly after team formation (didn't actually collaborate)
+        """
+        ratings_given = self.db.execute(
+            "SELECT * FROM ratings WHERE rater_id = ? ORDER BY created_at DESC",
+            (rater_id,)
+        ).fetchall()
+
+        if len(ratings_given) < 3:
+            return {"abuse_detected": False, "flags": []}
+
+        flags = []
+        honesty_vals = [dict(r)["honesty"] for r in ratings_given]
+        quality_vals = [dict(r)["quality"] for r in ratings_given]
+
+        # All 1s pattern
+        if all(h <= 1 for h in honesty_vals[-5:]):
+            flags.append("vindictive_pattern")
+
+        # All 5s pattern
+        if all(h >= 5 for h in honesty_vals[-5:]) and all(q >= 5 for q in quality_vals[-5:]):
+            flags.append("inflation_pattern")
+
+        # Low variance (always same score)
+        if len(set(honesty_vals[-5:])) == 1 and len(ratings_given) >= 5:
+            flags.append("zero_variance_pattern")
+
+        return {
+            "abuse_detected": len(flags) > 0,
+            "flags": flags,
+            "total_ratings_given": len(ratings_given),
+        }
+
+
+# =============================================================================
 # MATCHING ENGINE
 # =============================================================================
 
@@ -372,7 +638,8 @@ class MatchingEngine:
 
         # Find commits in same/similar domain
         candidates = self.db.execute("""
-            SELECT rc.*, u.pseudonym, u.reputation_score
+            SELECT rc.*, u.pseudonym, u.reputation_score,
+                   u.total_ratings_received, u.avg_honesty, u.avg_quality, u.avg_effort
             FROM research_commits rc
             JOIN users u ON rc.user_id = u.id
             WHERE rc.user_id != ?
@@ -435,6 +702,9 @@ class MatchingEngine:
             "candidate_domain": candidate_commit["domain"],
             "candidate_subdomain": candidate_commit.get("subdomain", ""),
             "candidate_reputation": candidate_commit.get("reputation_score", 100),
+            "candidate_total_ratings": candidate_commit.get("total_ratings_received", 0),
+            "candidate_avg_honesty": candidate_commit.get("avg_honesty", 0),
+            "candidate_solidity": candidate_commit.get("overall_solidity", "unknown"),
         }
 
     def _base_similarity(self, a: Dict, b: Dict) -> float:
@@ -458,35 +728,21 @@ class MatchingEngine:
         return min(100.0, score)
 
     def _calculate_gain(self, my_ot: float, my_ofc: float, their_ot: float, their_ofc: float) -> float:
-        """Calculate what I gain from the other person's strengths in my weaknesses.
-        
-        Uses a model where gain is proportional to:
-        1. The absolute difference in each axis (complementarity)
-        2. How high the other person scores in that axis (quality of contribution)
-        3. How much room for improvement I have (my weakness = their opportunity)
-        """
-        # Complementarity: how much stronger they are where I'm weak
+        """Calculate what I gain from the other person's strengths in my weaknesses."""
         ot_diff = max(0, their_ot - my_ot)
         ofc_diff = max(0, their_ofc - my_ofc)
-        
-        # Weight by the other's absolute strength (high score = more valuable contribution)
+
         ot_gain = ot_diff * (their_ot / 100.0) * 1.5
         ofc_gain = ofc_diff * (their_ofc / 100.0) * 1.5
-        
-        # Also factor in: even if they're not stronger than me, 
-        # a high score in an axis I'm weak in still has value
+
         weakness_bonus_ot = max(0, (100 - my_ot) * (their_ot / 100.0) * 0.3)
         weakness_bonus_ofc = max(0, (100 - my_ofc) * (their_ofc / 100.0) * 0.3)
-        
+
         total = ot_gain + ofc_gain + weakness_bonus_ot + weakness_bonus_ofc
         return min(100.0, total)
 
     def _calculate_semaphore(self, a_gains: float, b_gains: float) -> Dict[str, str]:
-        """Calculate the bilateral convenience semaphore with reasoning.
-        
-        Returns dict with 'color', 'reason_for_a', and 'reason_for_b'
-        so each user understands the semaphore from their own perspective.
-        """
+        """Calculate the bilateral convenience semaphore with reasoning."""
         asymmetry = abs(a_gains - b_gains)
         a_stronger = a_gains > b_gains
 
@@ -508,15 +764,15 @@ class MatchingEngine:
             if a_stronger:
                 return {
                     "color": "yellow",
-                    "reason_for_a": f"⚠️ Asimetría a tu favor. Ganás {a_gains:.0f}% pero solo aportás {b_gains:.0f}%. El otro usuario podría no aceptar sin negociación de términos.",
-                    "reason_for_b": f"⚠️ Asimetría en tu contra. Solo ganás {b_gains:.0f}% pero aportás {a_gains:.0f}%. Considerá negociar términos de licencia antes de aceptar.",
+                    "reason_for_a": f"Asimetría a tu favor. Ganás {a_gains:.0f}% pero solo aportás {b_gains:.0f}%. El otro usuario podría no aceptar sin negociación de términos.",
+                    "reason_for_b": f"Asimetría en tu contra. Solo ganás {b_gains:.0f}% pero aportás {a_gains:.0f}%. Considerá negociar términos de licencia antes de aceptar.",
                     "summary": f"Asimetría significativa ({asymmetry:.0f} puntos). El solicitante se beneficia más."
                 }
             else:
                 return {
                     "color": "yellow",
-                    "reason_for_a": f"⚠️ Asimetría en tu contra. Solo ganás {a_gains:.0f}% pero aportás {b_gains:.0f}%. Considerá negociar términos de licencia antes de aceptar.",
-                    "reason_for_b": f"⚠️ Asimetría a tu favor. Ganás {b_gains:.0f}% pero solo aportás {a_gains:.0f}%. El otro usuario podría no aceptar sin negociación de términos.",
+                    "reason_for_a": f"Asimetría en tu contra. Solo ganás {a_gains:.0f}% pero aportás {b_gains:.0f}%. Considerá negociar términos de licencia antes de aceptar.",
+                    "reason_for_b": f"Asimetría a tu favor. Ganás {b_gains:.0f}% pero solo aportás {a_gains:.0f}%. El otro usuario podría no aceptar sin negociación de términos.",
                     "summary": f"Asimetría significativa ({asymmetry:.0f} puntos). El receptor se beneficia más."
                 }
         elif a_gains >= GREEN_THRESHOLD or b_gains >= GREEN_THRESHOLD:
@@ -547,6 +803,37 @@ class MatchingEngine:
 # PYDANTIC INPUT MODELS
 # =============================================================================
 
+class SolidityLevel(str, Enum):
+    """Maturity/solidity levels for research components."""
+    PROVEN = "proven"           # Formally verified, peer-reviewed, reproducible
+    FUNCTIONAL = "functional"   # Working implementation, reproducible results
+    SPECULATIVE = "speculative" # Theoretical reasoning, not fully validated
+    ADHOC = "adhoc"             # Original intuition, preliminary ideas
+    CHERRY_PICKED = "cherry_picked"  # Curated from external sources (declared)
+
+
+class SolidityLevels(BaseModel):
+    """Per-component solidity declaration."""
+    model_config = ConfigDict(extra="forbid")
+
+    theory: Optional[SolidityLevel] = Field(
+        default=SolidityLevel.SPECULATIVE,
+        description="Solidity of the theoretical framework"
+    )
+    demos: Optional[SolidityLevel] = Field(
+        default=SolidityLevel.SPECULATIVE,
+        description="Solidity of demonstrations/code/proofs"
+    )
+    adhoc: Optional[SolidityLevel] = Field(
+        default=SolidityLevel.ADHOC,
+        description="Solidity of ad hoc original content"
+    )
+    cherry_picking: Optional[SolidityLevel] = Field(
+        default=SolidityLevel.CHERRY_PICKED,
+        description="Solidity of cherry-picked content (always cherry_picked)"
+    )
+
+
 class SubmitCommitInput(BaseModel):
     """Input for submitting a Research Commit."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
@@ -565,10 +852,20 @@ class SubmitCommitInput(BaseModel):
 
     # Ad Hoc Content
     adhoc_summary: Optional[str] = Field(None, description="Original content not from established theory base", max_length=5000)
-    adhoc_connections: Optional[List[str]] = Field(default_factory=list, description="Interdisciplinary connections made (e.g., 'applied topology concepts from algebraic geometry to protein structure')")
+    adhoc_connections: Optional[List[str]] = Field(default_factory=list, description="Interdisciplinary connections made")
 
     # Cherry-Picking Declared
-    cherry_picking: Optional[List[str]] = Field(default_factory=list, description="Declared sources and what was taken from each (e.g., 'Levinthal 1969 - energy landscape framework, adapted for disordered proteins')")
+    cherry_picking: Optional[List[str]] = Field(default_factory=list, description="Declared sources and what was taken from each")
+
+    # Solidity Levels (NEW in v2)
+    solidity_levels: Optional[SolidityLevels] = Field(
+        default=None,
+        description="Per-component solidity declaration. Honest declaration builds reputation."
+    )
+    overall_solidity: Optional[SolidityLevel] = Field(
+        default=SolidityLevel.SPECULATIVE,
+        description="Overall solidity if not specifying per-component: proven, functional, speculative, adhoc, cherry_picked"
+    )
 
 
 class FindCollaboratorsInput(BaseModel):
@@ -603,6 +900,18 @@ class RegisterInput(BaseModel):
     pseudonym: Optional[str] = Field(None, description="Preferred pseudonym (auto-generated if not provided)", max_length=50)
 
 
+class RateUserInput(BaseModel):
+    """Input for rating a collaborator after working together."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    team_id: str = Field(..., description="ID of the team where you collaborated")
+    rated_user_id: str = Field(..., description="User ID of the person you're rating")
+    honesty: int = Field(..., description="Honesty rating 1-5: Did they accurately declare their solidity levels? Were they transparent about cherry-picking?", ge=1, le=5)
+    quality: int = Field(..., description="Quality rating 1-5: Was their work well-structured, original, and valuable?", ge=1, le=5)
+    effort: int = Field(..., description="Effort rating 1-5: Did they contribute meaningfully to the collaboration?", ge=1, le=5)
+    comment: Optional[str] = Field(None, description="Optional private comment (only visible after both parties rate)", max_length=500)
+
+
 # =============================================================================
 # LIFESPAN & SERVER INITIALIZATION
 # =============================================================================
@@ -613,7 +922,8 @@ async def app_lifespan():
     db = init_database(DB_PATH)
     evaluator = OriginalityEvaluator(db)
     matcher = MatchingEngine(db)
-    yield {"db": db, "evaluator": evaluator, "matcher": matcher}
+    reputation = ReputationEngine(db)
+    yield {"db": db, "evaluator": evaluator, "matcher": matcher, "reputation": reputation}
     db.close()
 
 
@@ -632,6 +942,9 @@ def _get_evaluator(ctx) -> OriginalityEvaluator:
 
 def _get_matcher(ctx) -> MatchingEngine:
     return ctx.request_context.lifespan_state["matcher"]
+
+def _get_reputation(ctx) -> ReputationEngine:
+    return ctx.request_context.lifespan_state["reputation"]
 
 def _get_or_create_user(db: sqlite3.Connection, email: str, pseudonym: Optional[str] = None) -> str:
     """Get existing user or create new one by email hash."""
@@ -668,6 +981,19 @@ def _semaphore_emoji(s: str) -> str:
 def _format_score_bar(score: float, width: int = 20) -> str:
     filled = int(score / 100 * width)
     return f"[{'█' * filled}{'░' * (width - filled)}] {score:.1f}%"
+
+def _reputation_badge(score: float, total_ratings: int) -> str:
+    """Generate a reputation badge string."""
+    if total_ratings < MIN_RATINGS_FOR_REPUTATION:
+        return "🆕 New (no ratings yet)"
+    elif score >= 85:
+        return f"⭐ Excellent ({score:.0f}/100, {total_ratings} ratings)"
+    elif score >= 65:
+        return f '�a Good ({score:.0f}/100, {total_ratings} ratings)"
+    elif score >= 40:
+        return f"⚠️ Mixed ({score:.0f}/100, {total_ratings} ratings)"
+    else:
+        return f"🚩 Low ({score:.0f}/100, {total_ratings} ratings)"
 
 
 # =============================================================================
@@ -724,18 +1050,20 @@ async def research_match_submit_commit(params: SubmitCommitInput, ctx=None) -> s
     across two axes: Theoretical Originality (OT) and Formal-Computational
     Originality (OFC). Content is hashed for integrity verification.
 
-    This is the core action — submit your work to get scored and become
-    discoverable for matching with complementary researchers.
+    NEW in v2: Solidity levels affect score confidence. Declaring honestly
+    builds reputation — dishonest declarations will be detected by
+    collaborators and penalized through the rating system.
 
     Args:
-        params (SubmitCommitInput): Structured research commit containing:
-            - domain, subdomain, problem, hypothesis, theoretical_framework (Theory Base)
-            - demonstrations_summary, demo_types, code_languages (Demonstrations)
-            - adhoc_summary, adhoc_connections (Ad Hoc Content)
-            - cherry_picking (Cherry-Picking Declared)
+        params (SubmitCommitInput): Structured research commit with:
+            - Theory Base fields
+            - Demonstrations fields
+            - Ad Hoc Content fields
+            - Cherry-Picking Declared
+            - Solidity levels (NEW): per-component or overall
 
     Returns:
-        str: JSON with commit ID, originality scores, and detailed breakdown
+        str: JSON with commit ID, scores, solidity impact, and breakdown
     """
     db = _get_db(ctx)
     evaluator = _get_evaluator(ctx)
@@ -755,6 +1083,16 @@ async def research_match_submit_commit(params: SubmitCommitInput, ctx=None) -> s
 
     # Prepare commit data
     commit_data = params.model_dump()
+
+    # Handle solidity levels serialization
+    solidity_dict = {}
+    if params.solidity_levels:
+        solidity_dict = {k: v.value if v else "speculative" for k, v in params.solidity_levels.model_dump().items()}
+    overall_sol = params.overall_solidity.value if params.overall_solidity else "speculative"
+
+    commit_data["solidity_levels"] = solidity_dict
+    commit_data["overall_solidity"] = overall_sol
+
     content_hash = _hash_content(commit_data)
 
     # AI Evaluation (in production: runs inside TEE enclave)
@@ -767,17 +1105,22 @@ async def research_match_submit_commit(params: SubmitCommitInput, ctx=None) -> s
         (id, user_id, version, domain, subdomain, problem, hypothesis,
          theoretical_framework, demonstrations_summary, demo_types,
          code_languages, adhoc_summary, adhoc_connections, cherry_picking,
-         content_hash, ot_score, ofc_score, ot_breakdown, ofc_breakdown)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         solidity_levels, overall_solidity,
+         content_hash, ot_score, ofc_score, ot_breakdown, ofc_breakdown,
+         solidity_impact)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         commit_id, user_id, version,
         params.domain, params.subdomain, params.problem, params.hypothesis,
         params.theoretical_framework, params.demonstrations_summary,
         json.dumps(params.demo_types), json.dumps(params.code_languages),
         params.adhoc_summary, json.dumps(params.adhoc_connections),
-        json.dumps(params.cherry_picking), content_hash,
+        json.dumps(params.cherry_picking),
+        json.dumps(solidity_dict), overall_sol,
+        content_hash,
         scores["ot_score"], scores["ofc_score"],
         json.dumps(scores["ot_breakdown"]), json.dumps(scores["ofc_breakdown"]),
+        json.dumps(scores["solidity_impact"]),
     ))
     db.commit()
 
@@ -789,11 +1132,20 @@ async def research_match_submit_commit(params: SubmitCommitInput, ctx=None) -> s
         "scores": {
             "theoretical_originality": scores["ot_score"],
             "formal_computational_originality": scores["ofc_score"],
+            "ot_raw": scores["ot_raw"],
+            "ofc_raw": scores["ofc_raw"],
             "ot_breakdown": scores["ot_breakdown"],
             "ofc_breakdown": scores["ofc_breakdown"],
         },
-        "profile_summary": f"OT: {scores['ot_score']}% / OFC: {scores['ofc_score']}%",
-        "message": "Your Research Commit has been evaluated. You are now discoverable for matching."
+        "solidity": {
+            "overall": overall_sol,
+            "components": solidity_dict,
+            "impact": scores["solidity_impact"]["explanation"],
+            "ot_multiplier": scores["solidity_impact"]["ot_multiplier"],
+            "ofc_multiplier": scores["solidity_impact"]["ofc_multiplier"],
+        },
+        "profile_summary": f"OT: {scores['ot_score']}% / OFC: {scores['ofc_score']}% (solidity: {overall_sol})",
+        "message": "Your Research Commit has been evaluated. Solidity levels affect score confidence. Honest declaration builds your reputation over time."
     }, indent=2)
 
 
@@ -808,14 +1160,14 @@ async def research_match_submit_commit(params: SubmitCommitInput, ctx=None) -> s
     }
 )
 async def research_match_my_profile(ctx=None) -> str:
-    """View your current originality profile, scores, and commit history.
-    Shows your Theoretical Originality (OT) and Formal-Computational
-    Originality (OFC) scores with detailed breakdowns.
+    """View your current originality profile, scores, reputation, and commit history.
+    Shows OT/OFC scores, solidity levels, reputation from ratings, and teams.
 
     Returns:
-        str: Formatted profile with scores, breakdowns, and history
+        str: Formatted profile with scores, reputation, breakdowns, and history
     """
     db = _get_db(ctx)
+    reputation_engine = _get_reputation(ctx)
     user = _get_current_user(db)
     if not user:
         return json.dumps({"error": "No registered user found. Please register first."})
@@ -834,6 +1186,7 @@ async def research_match_my_profile(ctx=None) -> str:
     latest = dict(commits[0])
     ot_breakdown = json.loads(latest.get("ot_breakdown") or "{}")
     ofc_breakdown = json.loads(latest.get("ofc_breakdown") or "{}")
+    solidity_impact = json.loads(latest.get("solidity_impact") or "{}")
 
     teams = db.execute("""
         SELECT t.* FROM teams t
@@ -841,9 +1194,19 @@ async def research_match_my_profile(ctx=None) -> str:
         WHERE tm.user_id = ?
     """, (user["id"],)).fetchall()
 
+    # Get reputation details
+    rep = reputation_engine.calculate_reputation(user["id"])
+
     return json.dumps({
         "pseudonym": user["pseudonym"],
-        "reputation": user["reputation_score"],
+        "reputation": {
+            "badge": _reputation_badge(rep["reputation_score"], rep["total_ratings"]),
+            "score": rep["reputation_score"],
+            "total_ratings": rep["total_ratings"],
+            "avg_honesty": rep["avg_honesty"],
+            "avg_quality": rep["avg_quality"],
+            "avg_effort": rep["avg_effort"],
+        },
         "total_commits": len(commits),
         "latest_commit": {
             "version": latest["version"],
@@ -853,6 +1216,11 @@ async def research_match_my_profile(ctx=None) -> str:
             "scores": {
                 "theoretical_originality": latest["ot_score"],
                 "formal_computational_originality": latest["ofc_score"],
+            },
+            "solidity": {
+                "overall": latest.get("overall_solidity", "unknown"),
+                "components": json.loads(latest.get("solidity_levels") or "{}"),
+                "impact": solidity_impact,
             },
             "ot_breakdown": ot_breakdown,
             "ofc_breakdown": ofc_breakdown,
@@ -874,11 +1242,7 @@ async def research_match_my_profile(ctx=None) -> str:
 async def research_match_find_collaborators(params: FindCollaboratorsInput, ctx=None) -> str:
     """Find researchers with complementary skills and knowledge.
     Uses AI-powered matching to identify candidates with high
-    complementarity and shows the bilateral convenience semaphore.
-
-    🟢 Green = High mutual benefit
-    🟡 Yellow = Asymmetric benefit (negotiation needed)
-    🔴 Red = Low mutual benefit
+    complementarity. Shows semaphore, reputation badge, and solidity.
 
     Args:
         params (FindCollaboratorsInput): Search parameters:
@@ -886,7 +1250,7 @@ async def research_match_find_collaborators(params: FindCollaboratorsInput, ctx=
             - min_semaphore (str): Filter by minimum semaphore level
 
     Returns:
-        str: JSON array of candidates with scores and semaphores
+        str: JSON array of candidates with scores, semaphores, and reputation
     """
     db = _get_db(ctx)
     matcher = _get_matcher(ctx)
@@ -921,7 +1285,7 @@ async def research_match_find_collaborators(params: FindCollaboratorsInput, ctx=
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (match_id, user["id"], m["candidate_user_id"],
                   m["base_similarity"], m["complementarity_score"],
-                  m["semaphore"], m.get("semaphore_reason", ""),
+               m["semaphore"], m.get("semaphore_reason", ""),
                   m.get("semaphore_reason_for_candidate", ""),
                   m.get("semaphore_summary", ""),
                   m["a_gains_from_b"], m["b_gains_from_a"]))
@@ -944,7 +1308,11 @@ async def research_match_find_collaborators(params: FindCollaboratorsInput, ctx=
             "their_scores": f"OT: {m['candidate_ot']}% / OFC: {m['candidate_ofc']}%",
             "domain": m["candidate_domain"],
             "subdomain": m.get("candidate_subdomain", ""),
-            "reputation": m["candidate_reputation"],
+            "reputation": _reputation_badge(
+                m.get("candidate_reputation", 100),
+                m.get("candidate_total_ratings", 0)
+            ),
+            "solidity": m.get("candidate_solidity", "unknown"),
         } for m in matches],
         "total_found": len(matches),
     }, indent=2)
@@ -1155,11 +1523,136 @@ async def research_match_respond_request(params: RespondRequestInput, ctx=None) 
             "team_id": team_id,
             "team_name": team_name,
             "license": "joint-equal",
-            "message": "Team created! Gradual revelation process begins. AI-generated summaries will be shared first, then identities, then full repository access."
+            "message": "Team created! Gradual revelation process begins. You can now rate each other after collaborating using research_match_rate_user."
         }
     else:
         db.commit()
         result["message"] = "Request rejected."
+
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool(
+    name="research_match_rate_user",
+    annotations={
+        "title": "Rate a Collaborator",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+async def research_match_rate_user(params: RateUserInput, ctx=None) -> str:
+    """Rate a collaborator after working together in a team.
+
+    Ratings are ANONYMOUS until both team members have rated each other.
+    This prevents retaliation — you can rate honestly without fear.
+
+    Rating dimensions:
+    - Honesty (1-5): Did they accurately declare solidity levels?
+    - Quality (1-5): Was their work well-structured and valuable?
+    - Effort (1-5): Did they contribute meaningfully?
+
+    Low honesty ratings have the biggest impact on reputation.
+    The system also detects abusive rating patterns (always 1-star, etc.)
+
+    Args:
+        params (RateUserInput): Rating data:
+            - team_id: Team where you collaborated
+            - rated_user_id: User to rate
+            - honesty (1-5): Honesty/transparency rating
+            - quality (1-5): Work quality rating
+            - effort (1-5): Contribution effort rating
+            - comment: Optional private comment
+
+    Returns:
+        str: JSON with rating status and whether both have rated
+    """
+    db = _get_db(ctx)
+    reputation_engine = _get_reputation(ctx)
+    user = _get_current_user(db)
+    if not user:
+        return json.dumps({"error": "No registered user found."})
+
+    # Verify the rater is a member of the team
+    membership = db.execute(
+        "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
+        (params.team_id, user["id"])
+    ).fetchone()
+    if not membership:
+        return json.dumps({"error": "You are not a member of this team."})
+
+    # Verify the rated user is also a member
+    rated_membership = db.execute(
+        "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
+        (params.team_id, params.rated_user_id)
+    ).fetchone()
+    if not rated_membership:
+        return json.dumps({"error": "The rated user is not a member of this team."})
+
+    # Can't rate yourself
+    if user["id"] == params.rated_user_id:
+        return json.dumps({"error": "You cannot rate yourself."})
+
+    # Check if already rated
+    existing = db.execute(
+        "SELECT id FROM ratings WHERE team_id = ? AND rater_id = ? AND rated_id = ?",
+        (params.team_id, user["id"], params.rated_user_id)
+    ).fetchone()
+    if existing:
+        return json.dumps({"error": "You have already rated this user for this team. Ratings cannot be modified to prevent gaming."})
+
+    # Check for abuse patterns
+    abuse = reputation_engine.detect_abuse_patterns(user["id"])
+    abuse_warning = ""
+    if abuse["abuse_detected"]:
+        abuse_warning = f" Warning: Your rating patterns show {', '.join(abuse['flags'])}. Continued abuse may affect your own reputation."
+
+    # Submit rating
+    rating_id = str(uuid.uuid4())
+    db.execute("""
+        INSERT INTO ratings (id, team_id, rater_id, rated_id, honesty, quality, effort, comment)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (rating_id, params.team_id, user["id"], params.rated_user_id,
+          params.honesty, params.quality, params.effort, params.comment))
+    db.commit()
+
+    # Check if both have rated each other
+    both_rated = reputation_engine.check_both_rated(
+        params.team_id, user["id"], params.rated_user_id
+    )
+
+    result = {
+        "status": "submitted",
+        "rating_id": rating_id,
+        "anonymous": not both_rated,
+        "both_rated": both_rated,
+    }
+
+    if both_rated:
+        # Reveal ratings and update reputations
+        reputation_engine.reveal_ratings(params.team_id)
+        reputation_engine.update_user_reputation(params.rated_user_id)
+        reputation_engine.update_user_reputation(user["id"])
+
+        # Get the other person's rating of you
+        their_rating = db.execute(
+            "SELECT * FROM ratings WHERE team_id = ? AND rater_id = ? AND rated_id = ?",
+            (params.team_id, params.rated_user_id, user["id"])
+        ).fetchone()
+
+        if their_rating:
+            their_rating = dict(their_rating)
+            result["their_rating_of_you"] = {
+                "honesty": their_rating["honesty"],
+                "quality": their_rating["quality"],
+                "effort": their_rating["effort"],
+                "comment": their_rating.get("comment", ""),
+            }
+
+        result["message"] = "Both team members have rated. Ratings are now revealed and reputations updated."
+    else:
+        result["message"] = f"Rating submitted anonymously. It will be revealed when the other team member also rates.{abuse_warning}"
 
     return json.dumps(result, indent=2)
 
@@ -1178,9 +1671,7 @@ async def research_match_analyze_work(ctx=None) -> str:
     """Returns the Research Commit template structure so Claude can help
     the user fill it out based on their current work in the conversation.
 
-    Use this when a researcher says something like 'analyze my work',
-    'help me create a commit', or 'I want to find collaborators for what
-    I'm working on'.
+    v2: Now includes solidity level declaration for each component.
 
     Returns:
         str: JSON template with instructions for each field
@@ -1207,8 +1698,25 @@ async def research_match_analyze_work(ctx=None) -> str:
             "cherry_picking": {
                 "declared_sources": "What you took from other works and why",
             },
+            "solidity_levels": {
+                "overall_solidity": "Overall: proven | functional | speculative | adhoc | cherry_picked",
+                "per_component": {
+                    "theory": "How solid is your theoretical framework?",
+                    "demos": "How solid are your demonstrations/code/proofs?",
+                    "adhoc": "How solid is your original content?",
+                    "cherry_picking": "Always 'cherry_picked' for curated content",
+                },
+                "note": "Be HONEST. Your reputation depends on accurate self-assessment. Collaborators will rate your honesty."
+            },
         },
-        "instruction": "Review the conversation context and help the user fill each section. Then call research_match_submit_commit with the structured data."
+        "solidity_guide": {
+            "proven": "Formally verified, peer-reviewed, or independently reproducible. Score multiplier: x1.0",
+            "functional": "Working code, reproducible results, but not formally proven. Score multiplier: x0.85",
+            "speculative": "Theoretical reasoning without full validation. Score multiplier: x0.60",
+            "adhoc": "Original intuition, preliminary ideas. Score multiplier: x0.40",
+            "cherry_picked": "Curated from external sources. Score multiplier: x0.30",
+        },
+        "instruction": "Review the conversation context and help the user fill each section, including honest solidity assessment. Then call research_match_submit_commit with the structured data."
     }, indent=2)
 
 
