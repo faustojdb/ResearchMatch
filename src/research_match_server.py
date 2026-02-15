@@ -22,6 +22,9 @@ from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
 from enum import Enum
+import urllib.request
+import urllib.parse
+import logging
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field, ConfigDict, field_validator
@@ -32,7 +35,7 @@ from pydantic import BaseModel, Field, ConfigDict, field_validator
 # =============================================================================
 
 DB_PATH = os.environ.get("RESEARCH_MATCH_DB", "research_match.db")
-SERVER_VERSION = "2.0.0-mvp"
+SERVER_VERSION = "2.1.0-mvp"
 
 # Scoring weights for Theoretical Originality (OT)
 OT_WEIGHTS = {
@@ -912,6 +915,14 @@ class RateUserInput(BaseModel):
     comment: Optional[str] = Field(None, description="Optional private comment (only visible after both parties rate)", max_length=500)
 
 
+class ColdSearchInput(BaseModel):
+    """Input for FREE cold search — no registration required."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    query: str = Field(..., description="Search keywords (domain, topic, or technology)", min_length=2, max_length=200)
+    max_results: int = Field(10, description="Maximum results to return", ge=1, le=25)
+
+
 # =============================================================================
 # LIFESPAN & SERVER INITIALIZATION
 # =============================================================================
@@ -989,7 +1000,7 @@ def _reputation_badge(score: float, total_ratings: int) -> str:
     elif score >= 85:
         return f"⭐ Excellent ({score:.0f}/100, {total_ratings} ratings)"
     elif score >= 65:
-        return f '�a Good ({score:.0f}/100, {total_ratings} ratings)"
+        return f"✅ Good ({score:.0f}/100, {total_ratings} ratings)"
     elif score >= 40:
         return f"⚠️ Mixed ({score:.0f}/100, {total_ratings} ratings)"
     else:
@@ -1717,6 +1728,138 @@ async def research_match_analyze_work(ctx=None) -> str:
             "cherry_picked": "Curated from external sources. Score multiplier: x0.30",
         },
         "instruction": "Review the conversation context and help the user fill each section, including honest solidity assessment. Then call research_match_submit_commit with the structured data."
+    }, indent=2)
+
+
+# =============================================================================
+# COLD SEARCH — FREE, NO REGISTRATION REQUIRED
+# =============================================================================
+
+logger = logging.getLogger("research_match")
+
+
+def _cold_search_internal(db: sqlite3.Connection, query: str, limit: int) -> List[Dict]:
+    """Search the internal database for public research commits matching a query.
+    Returns basic info only: domain, subdomain, problem, hypothesis, solidity."""
+    keywords = query.lower().split()
+    if not keywords:
+        return []
+
+    # Build a LIKE filter across multiple columns
+    conditions = []
+    params = []
+    for kw in keywords[:5]:  # Limit to 5 keywords
+        pattern = f"%{kw}%"
+        conditions.append(
+            "(LOWER(domain) LIKE ? OR LOWER(subdomain) LIKE ? "
+            "OR LOWER(problem) LIKE ? OR LOWER(hypothesis) LIKE ?)"
+        )
+        params.extend([pattern, pattern, pattern, pattern])
+
+    where_clause = " AND ".join(conditions)
+
+    rows = db.execute(f"""
+        SELECT rc.domain, rc.subdomain, rc.problem, rc.hypothesis,
+               rc.overall_solidity, rc.created_at,
+               u.pseudonym
+        FROM research_commits rc
+        JOIN users u ON rc.user_id = u.id
+        WHERE {where_clause}
+        ORDER BY rc.created_at DESC
+        LIMIT ?
+    """, params + [limit]).fetchall()
+
+    results = []
+    for row in rows:
+        row = dict(row)
+        results.append({
+            "source": "internal",
+            "pseudonym": row["pseudonym"],
+            "domain": row["domain"],
+            "subdomain": row.get("subdomain", ""),
+            "problem": row.get("problem", ""),
+            "hypothesis": row.get("hypothesis", ""),
+            "solidity": row.get("overall_solidity", "unknown"),
+            "date": row.get("created_at", ""),
+        })
+    return results
+
+
+def _cold_search_github(query: str, limit: int) -> List[Dict]:
+    """Search GitHub public repositories as a fallback/complement.
+    Returns basic info only: name, description, URL, language."""
+    try:
+        encoded_query = urllib.parse.quote(query)
+        url = f"https://api.github.com/search/repositories?q={encoded_query}&sort=updated&per_page={limit}"
+        req = urllib.request.Request(url, headers={
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "ResearchMatch-MCP/2.1",
+        })
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+
+        results = []
+        for item in data.get("items", [])[:limit]:
+            results.append({
+                "source": "github",
+                "name": item.get("full_name", ""),
+                "description": (item.get("description") or "")[:200],
+                "url": item.get("html_url", ""),
+                "language": item.get("language", "unknown"),
+                "stars": item.get("stargazers_count", 0),
+                "updated": item.get("updated_at", ""),
+            })
+        return results
+    except Exception as e:
+        logger.warning("GitHub cold search failed: %s", e)
+        return []
+
+
+@mcp.tool(
+    name="research_match_cold_search",
+    description=(
+        "FREE cold search — no registration required. "
+        "Search for research topics, domains, or technologies across the "
+        "ResearchMatch internal database and GitHub public repositories. "
+        "Returns basic public info only (no scores, no private data). "
+        "Use this to explore what's out there before committing to the platform."
+    ),
+)
+async def research_match_cold_search(params: ColdSearchInput, ctx=None) -> str:
+    """Execute a cold search across internal DB and GitHub."""
+    query = params.query
+    limit = params.max_results
+
+    # Split limit between sources
+    internal_limit = max(1, limit // 2)
+    github_limit = max(1, limit - internal_limit)
+
+    # Search internal DB
+    db = _get_db(ctx)
+    internal_results = _cold_search_internal(db, query, internal_limit)
+
+    # If few internal results, give more slots to GitHub
+    if len(internal_results) < internal_limit:
+        github_limit += (internal_limit - len(internal_results))
+
+    # Search GitHub
+    github_results = _cold_search_github(query, github_limit)
+
+    total = len(internal_results) + len(github_results)
+    if total == 0:
+        return json.dumps({
+            "status": "no_results",
+            "message": f"No results found for '{query}'. Try broader keywords.",
+            "tip": "Cold search is FREE. Try terms like: 'machine learning', 'graph theory', 'rust compiler'.",
+        }, indent=2)
+
+    return json.dumps({
+        "status": "ok",
+        "query": query,
+        "total_results": total,
+        "note": "Cold search is FREE — no registration needed. Register to submit your own work and find collaborators.",
+        "internal_results": internal_results,
+        "github_results": github_results,
     }, indent=2)
 
 
