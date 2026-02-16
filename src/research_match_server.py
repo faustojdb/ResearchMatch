@@ -20,6 +20,8 @@ import sqlite3
 import os
 import sys
 import threading
+import time
+import functools
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
@@ -34,11 +36,90 @@ from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 
 # =============================================================================
+# LOGGING SETUP
+# =============================================================================
+
+_LOG_FORMAT = os.environ.get("RESEARCH_MATCH_LOG_FORMAT", "text")  # "json" or "text"
+_LOG_LEVEL = os.environ.get("RESEARCH_MATCH_LOG_LEVEL", "INFO").upper()
+
+
+class _JsonFormatter(logging.Formatter):
+    """Structured JSON log formatter."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        log_entry = {
+            "timestamp": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if hasattr(record, "tool_name"):
+            log_entry["tool"] = record.tool_name
+        if hasattr(record, "duration_ms"):
+            log_entry["duration_ms"] = record.duration_ms
+        if hasattr(record, "extra_data"):
+            log_entry["data"] = record.extra_data
+        if record.exc_info and record.exc_info[0] is not None:
+            log_entry["exception"] = self.formatException(record.exc_info)
+        return json.dumps(log_entry)
+
+
+def _setup_logging() -> logging.Logger:
+    """Configure structured logging based on environment variables."""
+    logger = logging.getLogger("research_match")
+    if logger.handlers:
+        return logger  # Already configured
+
+    handler = logging.StreamHandler()
+
+    if _LOG_FORMAT == "json":
+        handler.setFormatter(_JsonFormatter())
+    else:
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)-8s [%(name)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
+        ))
+
+    logger.addHandler(handler)
+    logger.setLevel(getattr(logging, _LOG_LEVEL, logging.INFO))
+    return logger
+
+
+_logger = _setup_logging()
+
+
+def _log_tool_call(func):
+    """Decorator that logs MCP tool calls with timing."""
+
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        tool_name = func.__name__
+        _logger.info("Tool call started: %s", tool_name,
+                      extra={"tool_name": tool_name} if _LOG_FORMAT == "json" else {})
+        start = time.monotonic()
+        try:
+            result = await func(*args, **kwargs)
+            elapsed = (time.monotonic() - start) * 1000
+            _logger.info("Tool call completed: %s (%.1fms)", tool_name, elapsed,
+                          extra={"tool_name": tool_name, "duration_ms": round(elapsed, 1)}
+                          if _LOG_FORMAT == "json" else {})
+            return result
+        except Exception as e:
+            elapsed = (time.monotonic() - start) * 1000
+            _logger.error("Tool call failed: %s (%.1fms) — %s", tool_name, elapsed, e,
+                           extra={"tool_name": tool_name, "duration_ms": round(elapsed, 1)}
+                           if _LOG_FORMAT == "json" else {})
+            raise
+
+    return wrapper
+
+
+# =============================================================================
 # CONSTANTS
 # =============================================================================
 
 DB_PATH = os.environ.get("RESEARCH_MATCH_DB", "research_match.db")
-SERVER_VERSION = "2.2.0-mvp"
+SERVER_VERSION = "2.3.0-mvp"
 
 # Scoring weights for Theoretical Originality (OT)
 OT_WEIGHTS = {
@@ -67,15 +148,32 @@ SOLIDITY_MULTIPLIERS = {
     "cherry_picked": 0.30, # Curated from other sources (declared honestly)
 }
 
-# Semaphore thresholds
-GREEN_THRESHOLD = 30   # Both users contribute >30% complementary originality
-YELLOW_ASYMMETRY = 15  # Asymmetry >15 points
-RED_THRESHOLD = 15     # Both contribute <15% or overlap >75%
+# Semaphore thresholds (v2.3 calibrated)
+GREEN_MUTUAL_THRESHOLD = 20      # Both >= 20 → GREEN fuerte
+GREEN_MAX_GAIN_THRESHOLD = 40    # Max >= 40 para GREEN por complementariedad
+GREEN_AVG_GAIN_THRESHOLD = 20    # Avg >= 20 para GREEN por complementariedad
+GREEN_MIN_GAIN_FLOOR = 4         # Min >= 4 para GREEN (el debil gana algo real)
+YELLOW_MAX_GAIN_THRESHOLD = 25   # Max >= 25 para YELLOW
+YELLOW_MIN_GAIN_MODERATE = 5     # Min >= 5 para YELLOW moderado
+YELLOW_AVG_THRESHOLD = 12        # Avg >= 12 para YELLOW moderado
+WEAKNESS_BONUS_COEFFICIENT = 0.15
 
 # Rating constants
 RATING_MIN = 1
 RATING_MAX = 5
 MIN_RATINGS_FOR_REPUTATION = 2  # Need at least 2 ratings to affect reputation
+
+# Reputation engine constants
+REPUTATION_ALPHA = 0.2           # Exponential smoothing factor (higher = more weight on recent)
+REPUTATION_WEIGHT_HONESTY = 0.50  # 50% weight on honesty
+REPUTATION_WEIGHT_QUALITY = 0.30  # 30% weight on quality
+REPUTATION_WEIGHT_EFFORT = 0.20   # 20% weight on effort
+REPUTATION_LOW_HONESTY_THRESHOLD = 2.0   # Below this, harsh penalty applied
+REPUTATION_LOW_HONESTY_PENALTY = 0.5     # Multiplier for dishonest users
+REPUTATION_BONUS_MIN_RATINGS = 5         # Min ratings for consistency bonus
+REPUTATION_BONUS_HONESTY_FLOOR = 4.0     # Min avg honesty for bonus
+REPUTATION_BONUS_QUALITY_FLOOR = 3.5     # Min avg quality for bonus
+REPUTATION_BONUS_MULTIPLIER = 1.1        # Bonus multiplier for consistent users
 
 # Embedding model
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"  # 384 dims, ~90MB, fast
@@ -294,6 +392,15 @@ def init_database(db_path: str) -> sqlite3.Connection:
     """)
 
     conn.commit()
+
+    # Migration: add running average columns for exponential smoothing
+    for col in ("running_honesty", "running_quality", "running_effort"):
+        try:
+            conn.execute(f"ALTER TABLE users ADD COLUMN {col} REAL DEFAULT NULL")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+    conn.commit()
+
     return conn
 
 
@@ -319,9 +426,12 @@ class OriginalityEvaluator:
 
     def evaluate_commit(self, commit_data: Dict[str, Any], user_id: str) -> Dict[str, Any]:
         """Evaluate a Research Commit and return originality scores."""
+        eval_logger = logging.getLogger("research_match.evaluator")
 
         # Get existing commits in the same domain for comparison
         corpus = self._get_corpus(commit_data["domain"], commit_data.get("subdomain"), user_id)
+        eval_logger.debug("Evaluating commit in %s/%s, corpus size: %d",
+                          commit_data["domain"], commit_data.get("subdomain", ""), len(corpus))
 
         # Calculate Theoretical Originality (OT)
         ot_breakdown = self._evaluate_theoretical(commit_data, corpus)
@@ -343,6 +453,10 @@ class OriginalityEvaluator:
         solidity_impact = self._apply_solidity(
             ot_score, ofc_score, solidity_levels, overall_solidity
         )
+
+        eval_logger.info("Commit evaluated: OT=%.1f%% OFC=%.1f%% (raw: OT=%.1f%% OFC=%.1f%%, solidity=%s)",
+                         solidity_impact["adjusted_ot"], solidity_impact["adjusted_ofc"],
+                         ot_score, ofc_score, overall_solidity)
 
         return {
             "ot_score": round(solidity_impact["adjusted_ot"], 1),
@@ -556,6 +670,7 @@ class ReputationEngine:
     - Quality: Is their work well-structured and valuable?
     - Effort: Do they contribute meaningfully to collaborations?
 
+    v2.3: Uses exponential smoothing (O(1) per update) with batch fallback.
     Anti-retaliation: Ratings are anonymous until BOTH team members
     have rated each other. This prevents strategic rating.
     """
@@ -563,17 +678,50 @@ class ReputationEngine:
     def __init__(self, db: sqlite3.Connection):
         self.db = db
 
-    def calculate_reputation(self, user_id: str) -> Dict[str, Any]:
-        """Calculate composite reputation for a user."""
-        ratings = self.db.execute(
-            "SELECT * FROM ratings WHERE rated_id = ? ORDER BY created_at DESC",
-            (user_id,)
-        ).fetchall()
+    def _compute_reputation_score(self, avg_honesty: float, avg_quality: float,
+                                   avg_effort: float, total_ratings: int) -> float:
+        """Compute composite reputation from averages (0-100 scale)."""
+        rep_logger = logging.getLogger("research_match.reputation")
 
-        if len(ratings) < MIN_RATINGS_FOR_REPUTATION:
+        reputation = (
+            (avg_honesty / 5.0) * (REPUTATION_WEIGHT_HONESTY * 100) +
+            (avg_quality / 5.0) * (REPUTATION_WEIGHT_QUALITY * 100) +
+            (avg_effort / 5.0) * (REPUTATION_WEIGHT_EFFORT * 100)
+        )
+
+        if avg_honesty < REPUTATION_LOW_HONESTY_THRESHOLD:
+            reputation *= REPUTATION_LOW_HONESTY_PENALTY
+            rep_logger.info("Low honesty penalty applied (avg_honesty=%.2f)", avg_honesty)
+
+        if (total_ratings >= REPUTATION_BONUS_MIN_RATINGS
+                and avg_honesty >= REPUTATION_BONUS_HONESTY_FLOOR
+                and avg_quality >= REPUTATION_BONUS_QUALITY_FLOOR):
+            reputation = min(100.0, reputation * REPUTATION_BONUS_MULTIPLIER)
+            rep_logger.info("Consistency bonus applied (ratings=%d)", total_ratings)
+
+        rep_logger.debug("Reputation computed: %.1f (h=%.2f q=%.2f e=%.2f, n=%d)",
+                         reputation, avg_honesty, avg_quality, avg_effort, total_ratings)
+
+        return round(reputation, 1)
+
+    def calculate_reputation(self, user_id: str) -> Dict[str, Any]:
+        """Calculate composite reputation for a user.
+
+        Uses running averages if available (O(1)), falls back to batch recalculation.
+        """
+        user = self.db.execute(
+            "SELECT running_honesty, running_quality, running_effort, total_ratings_received FROM users WHERE id = ?",
+            (user_id,)
+        ).fetchone()
+
+        total_ratings = self.db.execute(
+            "SELECT COUNT(*) as c FROM ratings WHERE rated_id = ?", (user_id,)
+        ).fetchone()["c"]
+
+        if total_ratings < MIN_RATINGS_FOR_REPUTATION:
             return {
-                "reputation_score": 100.0,  # Default for new users
-                "total_ratings": len(ratings),
+                "reputation_score": 100.0,
+                "total_ratings": total_ratings,
                 "avg_honesty": 0.0,
                 "avg_quality": 0.0,
                 "avg_effort": 0.0,
@@ -581,7 +729,72 @@ class ReputationEngine:
                 "message": f"Need at least {MIN_RATINGS_FOR_REPUTATION} ratings to calculate reputation."
             }
 
-        # Temporal weighting: recent ratings count more
+        # Try running averages first
+        if user and user["running_honesty"] is not None:
+            avg_honesty = user["running_honesty"]
+            avg_quality = user["running_quality"]
+            avg_effort = user["running_effort"]
+        else:
+            # Fallback: batch recalculate
+            avgs = self._batch_recalculate(user_id)
+            avg_honesty = avgs["avg_honesty"]
+            avg_quality = avgs["avg_quality"]
+            avg_effort = avgs["avg_effort"]
+
+        reputation = self._compute_reputation_score(avg_honesty, avg_quality, avg_effort, total_ratings)
+
+        return {
+            "reputation_score": reputation,
+            "total_ratings": total_ratings,
+            "avg_honesty": round(avg_honesty, 2),
+            "avg_quality": round(avg_quality, 2),
+            "avg_effort": round(avg_effort, 2),
+            "status": "calculated",
+        }
+
+    def apply_new_rating(self, user_id: str, honesty: int, quality: int, effort: int) -> None:
+        """Apply a single new rating using exponential smoothing O(1).
+
+        Formula: new_avg = alpha * new_value + (1 - alpha) * old_avg
+        """
+        user = self.db.execute(
+            "SELECT running_honesty, running_quality, running_effort FROM users WHERE id = ?",
+            (user_id,)
+        ).fetchone()
+
+        alpha = REPUTATION_ALPHA
+
+        if user and user["running_honesty"] is not None:
+            new_honesty = alpha * honesty + (1 - alpha) * user["running_honesty"]
+            new_quality = alpha * quality + (1 - alpha) * user["running_quality"]
+            new_effort = alpha * effort + (1 - alpha) * user["running_effort"]
+        else:
+            # First rating or migration: initialize from batch
+            avgs = self._batch_recalculate(user_id)
+            new_honesty = avgs["avg_honesty"]
+            new_quality = avgs["avg_quality"]
+            new_effort = avgs["avg_effort"]
+
+        self.db.execute("""
+            UPDATE users SET running_honesty = ?, running_quality = ?, running_effort = ?
+            WHERE id = ?
+        """, (new_honesty, new_quality, new_effort, user_id))
+        self.db.commit()
+
+    def _batch_recalculate(self, user_id: str) -> Dict[str, float]:
+        """Recalculate running averages from all ratings (migration/fallback).
+
+        Uses temporal weighting: recent ratings count more.
+        Also stores the result as running averages for future O(1) updates.
+        """
+        ratings = self.db.execute(
+            "SELECT * FROM ratings WHERE rated_id = ? ORDER BY created_at DESC",
+            (user_id,)
+        ).fetchall()
+
+        if not ratings:
+            return {"avg_honesty": 0.0, "avg_quality": 0.0, "avg_effort": 0.0}
+
         total_weight = 0.0
         weighted_honesty = 0.0
         weighted_quality = 0.0
@@ -589,8 +802,7 @@ class ReputationEngine:
 
         for i, r in enumerate(ratings):
             r = dict(r)
-            # More recent = higher weight (exponential decay)
-            weight = 0.9 ** i  # Most recent = 1.0, then 0.9, 0.81, etc.
+            weight = (1 - REPUTATION_ALPHA) ** i
             total_weight += weight
             weighted_honesty += r["honesty"] * weight
             weighted_quality += r["quality"] * weight
@@ -600,33 +812,24 @@ class ReputationEngine:
         avg_quality = weighted_quality / total_weight
         avg_effort = weighted_effort / total_weight
 
-        # Composite reputation (0-100 scale)
-        # Honesty weighs most heavily — a dishonest user poisons the ecosystem
-        reputation = (
-            (avg_honesty / 5.0) * 50.0 +   # 50% weight on honesty
-            (avg_quality / 5.0) * 30.0 +     # 30% weight on quality
-            (avg_effort / 5.0) * 20.0        # 20% weight on effort
-        )
-
-        # Penalty for very low honesty (busca/dishonest users)
-        if avg_honesty < 2.0:
-            reputation *= 0.5  # Harsh penalty for dishonesty
-
-        # Bonus for consistent high ratings
-        if len(ratings) >= 5 and avg_honesty >= 4.0 and avg_quality >= 3.5:
-            reputation = min(100.0, reputation * 1.1)
+        # Store as running averages
+        self.db.execute("""
+            UPDATE users SET running_honesty = ?, running_quality = ?, running_effort = ?
+            WHERE id = ?
+        """, (avg_honesty, avg_quality, avg_effort, user_id))
+        self.db.commit()
 
         return {
-            "reputation_score": round(reputation, 1),
-            "total_ratings": len(ratings),
-            "avg_honesty": round(avg_honesty, 2),
-            "avg_quality": round(avg_quality, 2),
-            "avg_effort": round(avg_effort, 2),
-            "status": "calculated",
+            "avg_honesty": avg_honesty,
+            "avg_quality": avg_quality,
+            "avg_effort": avg_effort,
         }
 
     def update_user_reputation(self, user_id: str) -> None:
-        """Recalculate and store reputation for a user."""
+        """Recalculate and store reputation for a user.
+
+        Uses apply_new_rating for incremental path when possible.
+        """
         rep = self.calculate_reputation(user_id)
         self.db.execute("""
             UPDATE users SET
@@ -721,6 +924,8 @@ class MatchingEngine:
 
     def find_matches(self, user_id: str, limit: int = 10) -> List[Dict[str, Any]]:
         """Find potential collaborators for a user."""
+        match_logger = logging.getLogger("research_match.matcher")
+
         # Get user's latest commit
         user_commit = self.db.execute(
             "SELECT * FROM research_commits WHERE user_id = ? ORDER BY version DESC LIMIT 1",
@@ -758,7 +963,15 @@ class MatchingEngine:
 
         # Sort by complementarity score descending
         matches.sort(key=lambda m: m["complementarity_score"], reverse=True)
-        return matches[:limit]
+        result = matches[:limit]
+
+        match_logger.info("find_matches for user %s: %d candidates, %d matches returned",
+                          user_id[:8], len(candidates), len(result))
+        for m in result:
+            match_logger.info("  %s: %s (a_gains=%.1f, b_gains=%.1f, complementarity=%.1f)",
+                              m["semaphore"].upper(), m["candidate_pseudonym"],
+                              m["a_gains_from_b"], m["b_gains_from_a"], m["complementarity_score"])
+        return result
 
     def _calculate_match(self, user_commit: Dict, candidate_commit: Dict) -> Optional[Dict]:
         """Calculate match quality between two commits."""
@@ -828,68 +1041,82 @@ class MatchingEngine:
         ot_gain = ot_diff * (their_ot / 100.0) * 1.5
         ofc_gain = ofc_diff * (their_ofc / 100.0) * 1.5
 
-        weakness_bonus_ot = max(0, (100 - my_ot) * (their_ot / 100.0) * 0.3)
-        weakness_bonus_ofc = max(0, (100 - my_ofc) * (their_ofc / 100.0) * 0.3)
+        weakness_bonus_ot = max(0, (100 - my_ot) * (their_ot / 100.0) * WEAKNESS_BONUS_COEFFICIENT)
+        weakness_bonus_ofc = max(0, (100 - my_ofc) * (their_ofc / 100.0) * WEAKNESS_BONUS_COEFFICIENT)
 
         total = ot_gain + ofc_gain + weakness_bonus_ot + weakness_bonus_ofc
         return min(100.0, total)
 
     def _calculate_semaphore(self, a_gains: float, b_gains: float) -> Dict[str, str]:
-        """Calculate the bilateral convenience semaphore with reasoning."""
-        asymmetry = abs(a_gains - b_gains)
-        a_stronger = a_gains > b_gains
+        """Calculate the bilateral convenience semaphore with reasoning.
 
-        if a_gains >= GREEN_THRESHOLD and b_gains >= GREEN_THRESHOLD:
+        Rules (evaluated in order):
+        1. GREEN fuerte: min_gain >= 20 (ambos ganan mucho)
+        2. GREEN complementario: max >= 40, avg >= 20, min >= 3
+        3. YELLOW: max >= 25 (al menos uno gana bien, sub-niveles por min_gain)
+        4. YELLOW moderado: avg >= 12, min >= 3 (ganancia moderada bilateral)
+        5. RED: todo lo demas
+        """
+        min_gain = min(a_gains, b_gains)
+        max_gain = max(a_gains, b_gains)
+        avg_gain = (a_gains + b_gains) / 2
+
+        # Rule 1: GREEN fuerte — ambos ganan mucho
+        if min_gain >= GREEN_MUTUAL_THRESHOLD:
             return {
                 "color": "green",
                 "reason_for_a": f"Alta conveniencia mutua. Ganás {a_gains:.0f}% y aportás {b_gains:.0f}%. Colaboración equilibrada.",
                 "reason_for_b": f"Alta conveniencia mutua. Ganás {b_gains:.0f}% y aportás {a_gains:.0f}%. Colaboración equilibrada.",
                 "summary": "Ambos se benefician significativamente. Match recomendado."
             }
-        elif a_gains < RED_THRESHOLD and b_gains < RED_THRESHOLD:
+
+        # Rule 2: GREEN complementario — uno gana mucho, total alto, el otro gana algo
+        if max_gain >= GREEN_MAX_GAIN_THRESHOLD and avg_gain >= GREEN_AVG_GAIN_THRESHOLD and min_gain >= GREEN_MIN_GAIN_FLOOR:
+            weak_side = "a" if a_gains < b_gains else "b"
             return {
-                "color": "red",
-                "reason_for_a": f"Baja conveniencia. Solo ganás {a_gains:.0f}% y aportás {b_gains:.0f}%. Perfiles demasiado similares o sin complementariedad.",
-                "reason_for_b": f"Baja conveniencia. Solo ganás {b_gains:.0f}% y aportás {a_gains:.0f}%. Perfiles demasiado similares o sin complementariedad.",
-                "summary": "Alta redundancia o bajo aporte mutuo. No se recomienda."
+                "color": "green",
+                "reason_for_a": (
+                    f"Alta complementariedad. Ganás {a_gains:.0f}% y aportás {b_gains:.0f}%. "
+                    f"{'Tu aporte compensa con tu especialización única.' if weak_side == 'a' else 'Gran beneficio de la complementariedad del otro.'}"
+                ),
+                "reason_for_b": (
+                    f"Alta complementariedad. Ganás {b_gains:.0f}% y aportás {a_gains:.0f}%. "
+                    f"{'Tu aporte compensa con tu especialización única.' if weak_side == 'b' else 'Gran beneficio de la complementariedad del otro.'}"
+                ),
+                "summary": f"Complementariedad fuerte (max {max_gain:.0f}%, avg {avg_gain:.0f}%). Match recomendado."
             }
-        elif asymmetry > YELLOW_ASYMMETRY:
-            if a_stronger:
-                return {
-                    "color": "yellow",
-                    "reason_for_a": f"Asimetría a tu favor. Ganás {a_gains:.0f}% pero solo aportás {b_gains:.0f}%. El otro usuario podría no aceptar sin negociación de términos.",
-                    "reason_for_b": f"Asimetría en tu contra. Solo ganás {b_gains:.0f}% pero aportás {a_gains:.0f}%. Considerá negociar términos de licencia antes de aceptar.",
-                    "summary": f"Asimetría significativa ({asymmetry:.0f} puntos). El solicitante se beneficia más."
-                }
+
+        # Rule 3: YELLOW — al menos uno gana bien
+        if max_gain >= YELLOW_MAX_GAIN_THRESHOLD:
+            if min_gain >= YELLOW_MIN_GAIN_MODERATE:
+                sub = "moderado"
+                detail = "Ambos obtienen beneficio, aunque asimétrico."
             else:
-                return {
-                    "color": "yellow",
-                    "reason_for_a": f"Asimetría en tu contra. Solo ganás {a_gains:.0f}% pero aportás {b_gains:.0f}%. Considerá negociar términos de licencia antes de aceptar.",
-                    "reason_for_b": f"Asimetría a tu favor. Ganás {b_gains:.0f}% pero solo aportás {a_gains:.0f}%. El otro usuario podría no aceptar sin negociación de términos.",
-                    "summary": f"Asimetría significativa ({asymmetry:.0f} puntos). El receptor se beneficia más."
-                }
-        elif a_gains >= GREEN_THRESHOLD or b_gains >= GREEN_THRESHOLD:
-            if a_gains >= GREEN_THRESHOLD:
-                return {
-                    "color": "yellow",
-                    "reason_for_a": f"Conveniencia moderada. Ganás {a_gains:.0f}% pero el otro solo gana {b_gains:.0f}%. Podrías necesitar ofrecer incentivos adicionales.",
-                    "reason_for_b": f"Conveniencia moderada. Ganás {b_gains:.0f}% — el beneficio para vos es limitado. Evaluá si los términos compensan.",
-                    "summary": "Un lado se beneficia claramente más. Funcional con negociación."
-                }
-            else:
-                return {
-                    "color": "yellow",
-                    "reason_for_a": f"Conveniencia moderada. Ganás {a_gains:.0f}% — el beneficio para vos es limitado. Evaluá si los términos compensan.",
-                    "reason_for_b": f"Conveniencia moderada. Ganás {b_gains:.0f}% pero el otro solo gana {a_gains:.0f}%. Podrías necesitar ofrecer incentivos adicionales.",
-                    "summary": "Un lado se beneficia claramente más. Funcional con negociación."
-                }
-        else:
+                sub = "asimétrico"
+                detail = "Un lado se beneficia mucho más. Considerar negociación de términos."
             return {
-                "color": "red",
-                "reason_for_a": f"Baja conveniencia. Ganás {a_gains:.0f}% y aportás {b_gains:.0f}%. Insuficiente para justificar colaboración.",
-                "reason_for_b": f"Baja conveniencia. Ganás {b_gains:.0f}% y aportás {a_gains:.0f}%. Insuficiente para justificar colaboración.",
-                "summary": "Beneficio insuficiente para ambas partes."
+                "color": "yellow",
+                "reason_for_a": f"Match {sub}. Ganás {a_gains:.0f}% y aportás {b_gains:.0f}%. {detail}",
+                "reason_for_b": f"Match {sub}. Ganás {b_gains:.0f}% y aportás {a_gains:.0f}%. {detail}",
+                "summary": f"Match {sub} (max {max_gain:.0f}%, min {min_gain:.0f}%). Funcional con negociación."
             }
+
+        # Rule 4: YELLOW moderado — ganancia moderada bilateral
+        if avg_gain >= YELLOW_AVG_THRESHOLD and min_gain >= GREEN_MIN_GAIN_FLOOR:
+            return {
+                "color": "yellow",
+                "reason_for_a": f"Conveniencia moderada. Ganás {a_gains:.0f}% y aportás {b_gains:.0f}%. Beneficio modesto pero bilateral.",
+                "reason_for_b": f"Conveniencia moderada. Ganás {b_gains:.0f}% y aportás {a_gains:.0f}%. Beneficio modesto pero bilateral.",
+                "summary": f"Ganancia moderada bilateral (avg {avg_gain:.0f}%). Viable con interés mutuo."
+            }
+
+        # Rule 5: RED — beneficio insuficiente
+        return {
+            "color": "red",
+            "reason_for_a": f"Baja conveniencia. Ganás {a_gains:.0f}% y aportás {b_gains:.0f}%. Insuficiente para justificar colaboración.",
+            "reason_for_b": f"Baja conveniencia. Ganás {b_gains:.0f}% y aportás {a_gains:.0f}%. Insuficiente para justificar colaboración.",
+            "summary": "Beneficio insuficiente para ambas partes."
+        }
 
 
 # =============================================================================
@@ -1183,6 +1410,7 @@ def _reputation_badge(score: float, total_ratings: int) -> str:
         "openWorldHint": False,
     }
 )
+@_log_tool_call
 async def research_match_register(params: RegisterInput, ctx=None) -> str:
     """Register a new user on Research Match. Creates a pseudonymous profile.
     Email is hashed and never stored in plain text. Idempotent: safe to call multiple times.
@@ -1230,6 +1458,7 @@ async def research_match_register(params: RegisterInput, ctx=None) -> str:
         "openWorldHint": False,
     }
 )
+@_log_tool_call
 async def research_match_submit_commit(params: SubmitCommitInput, ctx=None) -> str:
     """Submit a Research Commit for AI evaluation.
 
@@ -1349,6 +1578,7 @@ async def research_match_submit_commit(params: SubmitCommitInput, ctx=None) -> s
         "openWorldHint": False,
     }
 )
+@_log_tool_call
 async def research_match_my_profile(ctx=None) -> str:
     """View current originality profile, scores, reputation, and commit history.
 
@@ -1440,6 +1670,7 @@ async def research_match_my_profile(ctx=None) -> str:
         "openWorldHint": False,
     }
 )
+@_log_tool_call
 async def research_match_find_collaborators(params: FindCollaboratorsInput, ctx=None) -> str:
     """Find researchers with complementary skills and knowledge.
 
@@ -1539,6 +1770,7 @@ async def research_match_find_collaborators(params: FindCollaboratorsInput, ctx=
         "openWorldHint": False,
     }
 )
+@_log_tool_call
 async def research_match_send_request(params: SendRequestInput, ctx=None) -> str:
     """Send a collaboration request to a matched researcher.
 
@@ -1610,6 +1842,7 @@ async def research_match_send_request(params: SendRequestInput, ctx=None) -> str
         "openWorldHint": False,
     }
 )
+@_log_tool_call
 async def research_match_inbox(ctx=None) -> str:
     """View incoming and outgoing collaboration requests with semaphore indicators.
 
@@ -1689,6 +1922,7 @@ async def research_match_inbox(ctx=None) -> str:
         "openWorldHint": False,
     }
 )
+@_log_tool_call
 async def research_match_respond_request(params: RespondRequestInput, ctx=None) -> str:
     """Accept or reject a collaboration request.
 
@@ -1780,6 +2014,7 @@ async def research_match_respond_request(params: RespondRequestInput, ctx=None) 
         "openWorldHint": False,
     }
 )
+@_log_tool_call
 async def research_match_rate_user(params: RateUserInput, ctx=None) -> str:
     """Rate a collaborator after working together in a team.
 
@@ -1904,6 +2139,7 @@ async def research_match_rate_user(params: RateUserInput, ctx=None) -> str:
         "openWorldHint": False,
     }
 )
+@_log_tool_call
 async def research_match_analyze_work(ctx=None) -> str:
     """Returns the Research Commit template for Claude to help fill out.
 
@@ -2053,6 +2289,7 @@ def _cold_search_github(query: str, limit: int) -> List[Dict]:
         "If no results, try broader keywords. Internal DB grows as more researchers join."
     ),
 )
+@_log_tool_call
 async def research_match_cold_search(params: ColdSearchInput, ctx=None) -> str:
     """Execute a cold search across internal DB and GitHub."""
     query = params.query
