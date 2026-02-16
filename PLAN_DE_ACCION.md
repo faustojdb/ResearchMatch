@@ -1,242 +1,269 @@
-# Research Match — Plan de Acción
-## Sesión del 15 de Febrero de 2026
+# Research Match — Plan de Accion
+## Sesion Inicial: 15 de Febrero de 2026 | Actualizado: 16 de Febrero de 2026
 
 ---
 
-## 1. Resumen de la Sesión
+## 1. Resumen de la Sesion Inicial (15-Feb)
 
 ### 1.1 Objetivo
 Evaluar el estado del servidor MCP de Research Match, testearlo end-to-end, y usar la cold search para descubrir repositorios de referencia que puedan aportar al proyecto.
 
-### 1.2 Lo que se logró
+### 1.2 Lo que se logro
 
-#### A. Corrección del Entry Point del Servidor
-- **Bug encontrado:** El transport string en `research_match_server.py` usaba `"streamable_http"` (underscore) pero la API de FastMCP espera `"streamable-http"` (guión).
-- **Bug encontrado:** Se pasaba `port=` como parámetro a `mcp.run()`, pero la firma solo acepta `transport` y `mount_path`.
-- **Fix aplicado:** Se cambió a `mcp.settings.port = port` + `mcp.run(transport="streamable-http")`.
-- **Archivo:** `src/research_match_server.py`, líneas 1870-1877.
+#### A. Correccion del Entry Point del Servidor
+- **Bug encontrado:** El transport string usaba `"streamable_http"` (underscore) pero FastMCP espera `"streamable-http"` (guion).
+- **Bug encontrado:** Se pasaba `port=` como parametro a `mcp.run()`, pero la firma solo acepta `transport` y `mount_path`.
+- **Fix aplicado:** `mcp.settings.port = port` + `mcp.run(transport="streamable-http")`.
 
-#### B. Ejecución de Simulación Completa (test_simulation.py)
-Se ejecutó el flujo completo con 4 investigadores simulados en biología molecular / protein folding:
+#### B. Ejecucion de Simulacion Completa
+Flujo completo con 4 investigadores en molecular biology / protein folding. Todos los matches dieron YELLOW — necesitaba calibracion.
 
-| Investigador | Pseudónimo | OT Score | OFC Score | Solidez |
-|---|---|---|---|---|
-| Tú | ProteinTheorist_AR | 35.3% | 48.3% | speculative |
-| María | CompBio_Maria | 53.8% | 74.6% | functional |
-| Kenji | MathBio_Kenji | 57.1% | 64.1% | proven |
-| Alex | BioGeneral_Alex | 19.2% | 19.6% | cherry_picked |
-
-**Resultados de matching (desde perspectiva de ProteinTheorist_AR):**
-
-| Candidato | Semáforo | Complementariedad | Tú ganás | Ellos ganan |
-|---|---|---|---|---|
-| CompBio_Maria | 🟡 YELLOW | 37.5% | 66.4% | 8.6% |
-| MathBio_Kenji | 🟡 YELLOW | 32.3% | 54.9% | 9.7% |
-| BioGeneral_Alex | 🟡 YELLOW | 28.1% | 6.8% | 49.5% |
-
-**Observación importante:** Todos los matches dieron YELLOW con alta asimetría. Ningún match GREEN. Esto sugiere que los thresholds del semáforo o la fórmula de ganancia podrían necesitar calibración (ver sección 4).
-
-**Flujo completo verificado:** registro → commit → evaluación → matching → solicitud → equipo → rating → reputación → detección de abuso. Todo funcional.
-
-#### C. Servidor HTTP Levantado y Verificado
-- El servidor arrancó correctamente en `localhost:8000`.
-- Respondió con protocolo MCP (406 Not Acceptable para GET sin SSE headers = comportamiento correcto).
-- Se verificó que el endpoint `/mcp` funciona.
-
-#### D. Cold Search Ejecutada
-Se probaron 10 queries diferentes contra la DB interna y GitHub.
-
-**Resultados internos:** Funcionan correctamente para queries del dominio (protein folding, molecular biology). 4 de 4 investigadores encontrados.
-
-**Resultados de GitHub — Repos seleccionados para análisis:**
-
-| Repo | Tema | Tamaño | Archivos |
-|---|---|---|---|
-| `vjacynycz/MastersThesis` | Blockchain reputation for peer review | 47MB | 187 |
-| `pixelsquirrel/fhe-ml` | Homomorphic encryption for ML | 1.5MB | 9 |
-| `Vankill08/claude-skills-mcp` | MCP server reference implementation | 13MB | 56 |
-| `Kishore7075/Researcher-Tool-AI` | AI plagiarism/originality detection | 124KB | 16 |
-
-#### E. Análisis Profundo de los 4 Repos
-
-Se clonaron en `/mnt/d/ResearchMatch_repo/research_refs/` y se analizaron en profundidad.
-
-##### E.1 MastersThesis (Blockchain Reputation)
-- Tesis UCM 2018, contratos Solidity (Ethereum) + IPFS
-- **Reputación con exponential smoothing** (alpha=0.2): fórmula probada que previene cold-start
-- **Ratings multi-stakeholder**: autores, editores, pares pueden calificar
-- **Penalidades por deadline**: reputación baja si no cumplís plazos
-- **Análisis de privacy tradeoffs**: blind vs open vs double-blind review
-- **Limitaciones:** Solidity 0.4.x (viejo), no production-ready, sin frontend
-
-##### E.2 fhe-ml (Homomorphic Encryption)
-- Implementación completa con TenSEAL (CKKS scheme), 128-bit security
-- **0% pérdida de accuracy** (86.13% plain = 86.13% encrypted)
-- **200x slowdown** vs plaintext — prohibitivo para tiempo real
-- Solo viable para modelos shallow (max ~6 multiplicaciones)
-- Ciphertext expansion: 428KB por vector (de 38MB CSV a ~940MB encrypted)
-- Sigmoid approximation con polinomio cúbico: `-0.004x³ + 0.197x + 0.5`
-- **Conclusión:** FHE es viable para scoring pero necesita optimización seria
-
-##### E.3 claude-skills-mcp (MCP Reference)
-- Implementación de grado producción, la más madura
-- **Two-package architecture:** frontend ligero (stdio, <5s startup) + backend pesado (HTTP)
-- **Tool descriptions ultra-detalladas** con ejemplos y guías de uso para el LLM
-- **Search semántico** con sentence-transformers (all-MiniLM-L6-v2, local, sin API keys)
-- **Health endpoint** (`/health`) con status detallado
-- **Background loading** con status messages al usuario
-- **Auto-update** con rate limit awareness (GitHub API)
-- **Thread-safe** state management con locks
-- **15+ archivos de tests** con integration tests
-- **Lazy document loading** y multi-level caching
-
-##### E.4 Researcher-Tool-AI (AI Plagiarism)
-- Frontend React/TypeScript que delega todo a Google Gemini API
-- **NO tiene algoritmos propios** de originalidad/plagiarism
-- Sin embeddings, sin similarity scoring, sin fingerprinting
-- Útil solo por: visualización de scores (barras 0-100), parallel Promise.all, JSON schema enforcement
-- **Conclusión:** No aporta al core de Research Match
+#### C. Cold Search y Analisis de 4 Repos de Referencia
+- `MastersThesis` — exponential smoothing reputation, blockchain audit trail
+- `fhe-ml` — TenSEAL CKKS homomorphic encryption, 200x slowdown
+- `claude-skills-mcp` — MCP patterns, tool descriptions, health endpoint
+- `Researcher-Tool-AI` — low value, solo UI patterns
 
 ---
 
-## 2. Estado Actual del Proyecto
+## 2. Estado Actual del Proyecto (v2.8.0-contracts)
 
-### 2.1 Lo que funciona (v2.1.0-mvp)
-- ✅ 9 MCP tools implementadas y funcionales
-- ✅ Registro pseudonímico con email hasheado (SHA-256)
-- ✅ Research Commit con evaluación OT/OFC
-- ✅ Niveles de solidez por componente con multiplicadores
-- ✅ Matching por complementariedad con semáforo bilateral
-- ✅ Sistema de rating anti-retaliación (anónimo hasta que ambos califican)
-- ✅ Reputación ponderada temporalmente
-- ✅ Detección de patrones de abuso en ratings
-- ✅ Cold search (DB interna + GitHub)
-- ✅ Transporte stdio y streamable-http
-- ✅ Simulación de flujo completo (test_simulation.py)
+### 2.1 Lo que funciona
+- 24 MCP tools implementadas y funcionales
+- Registro pseudonimico con email hasheado (SHA-256)
+- Research Commit con evaluacion OT/OFC + solidity multipliers
+- Matching por complementariedad con semaforo bilateral calibrado (5 reglas)
+- Sistema de rating anti-retaliacion (anonimo hasta que ambos califican)
+- ReputationEngine con exponential smoothing O(1) + anti-abuso
+- Cold search (DB interna + GitHub)
+- Deep search (clona + analiza repos GitHub, 4 capas)
+- Prepare commit (proforma universal: extract/validate/submit)
+- Collaboration layer: tickets, reveals, file sharing, audit log
+- Licencias automaticas: joint-equal, joint-weighted, advisory-only, time-limited
+- **Contratos git-verificables con confirmacion bilateral**
+- Transporte stdio y streamable-http
+- Health endpoint (`/health`) con stats completos
+- Logging estructurado (JSON/text, configurable)
+- 198 tests unitarios (pytest)
+- Simulacion E2E (test_simulation.py) ejercitando 19/22 tools
 
-### 2.2 Lo que necesita mejora
-- ⚠️ `OriginalityEvaluator` usa heurísticas simples (word overlap / Jaccard)
-- ⚠️ Tool descriptions genéricas — el LLM no sabe cuándo/cómo usarlas óptimamente
-- ⚠️ Sin health endpoint para monitoreo
-- ⚠️ Sin tests unitarios (solo simulación end-to-end)
-- ⚠️ Sin logging estructurado
-- ⚠️ Fórmula de ganancia puede necesitar calibración (todo sale YELLOW)
-- ⚠️ Sin caching
-- ⚠️ Sin manejo de errores robusto en tools
-
----
-
-## 3. Plan de Acción Priorizado
-
-### P0 — Implementar Ya (Esta Sesión)
-**Fuente principal: claude-skills-mcp**
-
-#### P0.1 — Mejorar Tool Descriptions
-Reescribir las descriptions de las 9 tools con:
-- Instrucciones explícitas de cuándo usar cada tool
-- Ejemplos en las descriptions
-- Guía de flujo (qué tool llamar primero, cuál después)
-- Parameter descriptions con rango y defaults claros
-
-#### P0.2 — Agregar Health Endpoint
-Implementar endpoint `/health` que reporte:
-- Versión del servidor
-- Cantidad de usuarios registrados
-- Cantidad de commits
-- Cantidad de matches activos
-- Estado de la DB
-- Uptime
-
-#### P0.3 — Integrar Sentence-Transformers para Similarity
-Reemplazar el `_text_similarity()` basado en Jaccard por cosine similarity con embeddings:
-- Usar `sentence-transformers` (all-MiniLM-L6-v2, 384 dims, ~90MB)
-- Lazy-load del modelo (no bloquear startup)
-- Aplicar en: `_text_similarity()`, `_commit_similarity()`, `_base_similarity()`
-- Mantener Jaccard como fallback si el modelo no cargó
-
-### P1 — Corto Plazo (Próximas sesiones)
-**Fuente principal: MastersThesis**
-
-#### P1.1 — Mejorar ReputationEngine
-- Implementar exponential smoothing (alpha configurable)
-- Agregar penalidades por inactividad/plazos
-- Expandir quién puede calificar (no solo miembros del equipo)
-
-#### P1.2 — Calibrar Semáforo y Fórmula de Ganancia
-- Revisar thresholds: GREEN_THRESHOLD=30, YELLOW_ASYMMETRY=15, RED_THRESHOLD=15
-- Ajustar `_calculate_gain()` para que no sea tan asimétrica
-- Agregar tests con escenarios edge-case
-
-#### P1.3 — Agregar Tests Unitarios
-- Tests para OriginalityEvaluator
-- Tests para MatchingEngine
-- Tests para ReputationEngine
-- Tests para cada MCP tool
-- Usar pytest + fixtures
-
-#### P1.4 — Logging Estructurado
-- Configurar logging con niveles (DEBUG, INFO, WARNING, ERROR)
-- Log de cada tool call con timing
-- Log de evaluaciones y matches
-
-### P2 — Medio Plazo
-**Fuente principal: fhe-ml**
-
-#### P2.1 — Evaluar Viabilidad de FHE para Scoring
-- Benchmark del OriginalityEvaluator con TenSEAL
-- Medir: tiempo de cifrado, tiempo de evaluación, accuracy loss
-- Definir qué operaciones corren cifradas y cuáles no
-- Documentar limitaciones (multiplicative depth budget)
-
-#### P2.2 — Considerar Alternativas a FHE Puro
-- Differential privacy (ruido calibrado, más rápido)
-- TEE sin FHE (Intel SGX / ARM TrustZone, procesamiento en enclave)
-- Hybrid: TEE para evaluación + FHE solo para almacenamiento
-
-### P3 — Referencia Continua
-
-#### P3.1 — Patrones de UI/UX (de Researcher-Tool-AI)
-- Visualización de scores con barras y colores
-- Parallel processing de análisis
-- Progressive disclosure (tabs por tipo de análisis)
-
-#### P3.2 — Blockchain Auditing (de MastersThesis)
-- Solo si se decide implementar audit trail inmutable
-- Contratos modulares como referencia arquitectónica
-- IPFS para almacenamiento distribuido de commits cifrados
+### 2.2 Pendientes
+- `OriginalityEvaluator` usa heuristicas (Jaccard fallback para tests, sentence-transformers para produccion)
+- Claude Desktop integration bloqueada (requiere DXT extension)
+- FHE para scoring no evaluado aun (P2)
 
 ---
 
-## 4. Observaciones Técnicas Pendientes
+## 3. Historial de Implementacion
 
-### 4.1 Calibración del Semáforo
-En la simulación, todos los matches salieron YELLOW a pesar de tener complementariedad clara. Esto se debe a la fórmula de `_calculate_gain()` que penaliza fuerte cuando uno de los dos tiene scores más altos en ambos ejes. **Necesita revisión** — un teórico puro (OT alto, OFC bajo) debería dar GREEN con un computacional puro (OT bajo, OFC alto).
+### Sesion 01 (15-Feb) — Discovery + Fix
+- Fix entry point (transport string + port)
+- Simulacion completa, cold search, analisis de 4 repos de referencia
+- Creacion de PLAN_DE_ACCION.md
 
-### 4.2 Reputación con 1 solo rating
-El `MIN_RATINGS_FOR_REPUTATION = 2` hace que con 1 rating la reputación quede en default (100). La simulación mostró "New (no ratings yet)" incluso después de recibir ratings porque solo tenían 1 cada uno. **Funciona correctamente** — es un threshold de confianza.
+### Sesion 02-04 (15-Feb) — P0: Foundation
+- Tool descriptions reescritas (400-800 chars con flujo + ejemplos)
+- Health endpoint `/health`
+- EmbeddingEngine con sentence-transformers (lazy-load, thread-safe, Jaccard fallback)
 
-### 4.3 Cold Search — Calidad de resultados
-La búsqueda en GitHub devuelve repos por relevancia del query string, no por calidad. Queries como "research collaboration originality scoring" devolvieron 0 resultados. **La cold search es útil para exploración general pero no para descubrimiento preciso.** Considerar agregar más fuentes (arXiv, Semantic Scholar API).
+### Sesion 05-06 (15-Feb) — P1: Calibration + Tests
+- Semaforo calibrado: 5 reglas, weakness_bonus 0.3→0.15, GREEN_MIN_GAIN_FLOOR=4
+- ReputationEngine: exponential smoothing (alpha=0.2), running averages
+- 67 unit tests (pytest), conftest.py con JaccardOnlyEmbeddingEngine
+- Logging estructurado: JSON/text, env vars
+
+### Sesion 07 (16-Feb) — v2.4.0: Collaboration Layer Step 1
+- 4 tablas SQL: team_tickets, reveal_consents, shared_files, audit_log
+- 3 tools: needs_create, needs_list, needs_resolve
+- _write_audit_log helper, reputation effort boost
+- 17 tests nuevos (total: 84)
+
+### Sesion 08 (16-Feb) — NEED-02: Level 3 Reveal System
+- 3 tools: reveal_request, reveal_respond, reveal_status
+- Bilateral consent para contenido de commits
+- reveal_status incluye contenido completo + reveal_matrix
+- 17 tests nuevos (total: 84 → ya incluidos)
+
+### Sesion 09 (16-Feb) — NEED-03: Automatic Licensing
+- `_compute_license()`: 5 reglas (joint-equal, advisory-only, joint-weighted, time-limited)
+- `research_match_team_license` tool
+- Hooks en reveal_respond + needs_resolve
+- 12 tests nuevos (total: 96)
+
+### Sesion 10 (16-Feb) — NEED-04/05: File Sharing + Audit
+- 2 tools: share_file, shared_files (metadata registry, bilateral L3 gate)
+- 1 tool: audit_log (read-only viewer)
+- MAD re-sharing detection (hash-based, tanks honesty)
+- 34 tests nuevos (total: 130)
+
+### Sesion 11 (16-Feb) — NEED-06: Deep Repository Analysis
+- 1 tool: deep_search (stateless, clona + 4-layer analysis)
+- analyze_repo.py (1217 lineas): git metadata, file tree, MCP extraction, gap analysis, OT/OFC scoring
+- 18 tests nuevos (total: 148)
+
+### Sesion 12 (16-Feb) — NEED-07: Universal Project Proforma
+- 1 tool: prepare_commit (3 modos: extract/validate/submit)
+- Extraccion automatica de proyecto + prompt universal + validacion + submission
+- 25 tests nuevos (total: 173)
+
+### Sesion 12b (16-Feb) — E2E Simulation v2
+- test_simulation.py actualizado: 2 usuarios, 19/22 tools ejercitados
+- Flujo completo: register → commit → match → request → team → tickets → reveals → files → ratings → audit
+
+### Sesion 13 (16-Feb) — NEED-08: Git-Verifiable Collaboration Contracts
+- 2 tools: export_contract, confirm_contract
+- Tabla `collaboration_contracts` con slots bilaterales (A/B)
+- `_generate_contract_content()`: markdown con parties, scores, license, verification
+- `SubmitCommitInput` + migration: git_repo_url, git_commit_hash
+- 4 tools actualizados: submit_commit, respond_request, team_license, health
+- 25 tests nuevos (total: 198)
 
 ---
 
-## 5. Archivos Modificados en Esta Sesión
+## 4. NEED-08 — Git-Verifiable Collaboration Contracts (Detalle)
 
-| Archivo | Cambio | Líneas |
+### 4.1 Problema
+Las licencias automaticas (NEED-03) funcionan dentro de Research Match pero no tienen enforcement externo. Si el servidor desaparece, no hay evidencia de los acuerdos.
+
+### 4.2 Solucion
+**Git como blockchain para codigo.** El contrato se genera como markdown legible, ambas partes lo commitean a sus repos, y:
+- Si lo borran, la eliminacion queda en `git log`
+- Disputas se resuelven leyendo commit-by-commit
+- No necesita terceros ni blockchain real — git ya es inmutable
+
+### 4.3 Componentes Implementados
+
+| Componente | Cantidad | Detalle |
 |---|---|---|
-| `src/research_match_server.py` | Fix entry point: transport string + port setting | 1870-1877 |
+| Constantes | 5 | CONTRACT_VERSION, CONTRACT_DIR_NAME, CONTRACT_FILE_PREFIX, GIT_COMMIT_HASH_PATTERN, MAX_CONTRACT_CONFIRMATIONS_PER_TEAM |
+| Tabla SQL | 1 | `collaboration_contracts` (18 columnas, bilateral confirmation slots) |
+| Migration | 2 cols | `research_commits.git_repo_url`, `research_commits.git_commit_hash` |
+| Pydantic models | 2 nuevos | ExportContractInput, ConfirmContractInput (con SHA-1 validator) |
+| Pydantic update | 1 | SubmitCommitInput + git_repo_url + git_commit_hash |
+| Helper | 1 | `_generate_contract_content()` → markdown string |
+| MCP tools nuevos | 2 | export_contract, confirm_contract |
+| MCP tools actualizados | 4 | submit_commit, respond_request, team_license, health |
+| Tests | 25 | 6 clases: Generation, Confirmation, Content, GitRef, Pydantic, Schema |
+| Index | 1 | `idx_contracts_team(team_id, status)` |
 
-## 6. Archivos Nuevos Creados
+### 4.4 Flujo del Contrato
 
-| Archivo | Propósito |
-|---|---|
-| `research_refs/MastersThesis/` | Repo clonado — blockchain reputation |
-| `research_refs/fhe-ml/` | Repo clonado — homomorphic encryption |
-| `research_refs/claude-skills-mcp/` | Repo clonado — MCP reference |
-| `research_refs/Researcher-Tool-AI/` | Repo clonado — AI plagiarism tool |
-| `test_research_match.db` | DB de test generada por simulación |
-| `PLAN_DE_ACCION.md` | Este documento |
+```
+1. export_contract(team_id)
+   → Computa licencia actual
+   → Genera markdown con parties, scores, terms, verification
+   → SHA-256 del contenido
+   → INSERT con status='pending'
+   → Retorna: contract_id, contenido, suggested_path, instrucciones
+
+2. Cada parte guarda el archivo:
+   mkdir -p .research-match/
+   cp contract.md .research-match/CONTRACT_team-abc123.md
+   git add . && git commit -m "Add collaboration contract"
+
+3. confirm_contract(team_id, contract_id, git_commit_hash)
+   → Primera parte: status='partial'
+   → Segunda parte: status='confirmed'
+   → Idempotente por usuario (mismo slot)
+```
+
+### 4.5 Status Flow del Contrato
+
+```
+pending → partial → confirmed
+    ↓
+superseded (si se genera nueva version)
+```
+
+### 4.6 Contenido del Contrato (markdown)
+
+```markdown
+# Research Match Collaboration Contract
+
+**Contract ID:** `team_id-v1`
+**Team / Generated / Version / License Type**
+
+## Parties
+  - Pseudonym, Role, Contribution%, Reputation
+  - Latest Commit: domain, hash, OT/OFC, solidity, git refs
+
+## License Terms
+  - Type, Rationale, 4 terms
+
+## Contribution Split
+  - Porcentaje por miembro
+
+## Collaboration State
+  - Reveal state, Tickets resolved
+
+## Verification
+  - Valid when committed to BOTH repos
+  - Deletion tracked by git history
+  - Generated by Research Match vX.Y.Z
+```
+
+### 4.7 Decisiones de Diseno
+
+1. **Audit action reutilizada** — `license_generated` con `details.trigger` (contract_generated / contract_confirmed). Evita migrar CHECK constraint.
+2. **On-demand, no automatico** — El contrato se genera cuando el usuario lo pide, no al crear team.
+3. **Versioning con supersede** — Cada export invalida contratos pending/partial anteriores.
+4. **Bilateral confirmation** — Dos slots (A, B) en la misma row, idempotente por usuario.
+5. **git_ref opcional** — Backward compatible, commits existentes sin git refs siguen funcionando.
+6. **Markdown human-readable** — Renderiza en GitHub, legible sin herramientas especiales.
 
 ---
 
-*Próximo paso: Implementar P0 (tool descriptions, health endpoint, sentence-transformers)*
+## 5. Plan de Accion Futuro
+
+### Completado
+- ~~P0.1 — Tool Descriptions~~ (sesion 02)
+- ~~P0.2 — Health Endpoint~~ (sesion 03)
+- ~~P0.3 — Sentence-Transformers~~ (sesion 04)
+- ~~P1.1 — ReputationEngine exponential smoothing~~ (sesion 05)
+- ~~P1.2 — Calibrar Semaforo~~ (sesion 05)
+- ~~P1.3 — Tests Unitarios~~ (sesion 05, 198 tests)
+- ~~P1.4 — Logging Estructurado~~ (sesion 06)
+- ~~NEED-02 — Level 3 Reveal System~~ (sesion 08)
+- ~~NEED-03 — Automatic Licensing~~ (sesion 09)
+- ~~NEED-04 — File Sharing~~ (sesion 10)
+- ~~NEED-05 — Audit Log + MAD Re-sharing~~ (sesion 10)
+- ~~NEED-06 — Deep Repository Analysis~~ (sesion 11)
+- ~~NEED-07 — Universal Project Proforma~~ (sesion 12)
+- ~~NEED-08 — Git-Verifiable Contracts~~ (sesion 13)
+
+### Pendiente
+
+#### P2 — Medio Plazo (Privacy/Crypto)
+- P2.1 — Evaluar viabilidad de FHE para scoring (TenSEAL benchmark)
+- P2.2 — Alternativas: differential privacy, TEE, hybrid
+
+#### P3 — Distribucion
+- P3.1 — DXT extension para Claude Desktop marketplace
+- P3.2 — Publicar en npm/pypi como paquete instalable
+
+#### NEED-09+ — Features Potenciales
+- Multi-party contracts (3+ members)
+- Contract amendment flow (modify without supersede)
+- Dispute resolution tool (reads git history)
+- arXiv/Semantic Scholar integration en cold_search
+- WebSocket notifications para eventos de team
+- Dashboard web con visualizacion de scores
+
+---
+
+## 6. Metricas del Proyecto
+
+| Metrica | v2.1.0 (15-Feb) | v2.8.0 (16-Feb) |
+|---|---|---|
+| MCP tools | 9 | 24 |
+| SQL tables | 7 | 11 |
+| Unit tests | 0 | 198 |
+| Server lines | ~1400 | ~5600 |
+| Test lines | 0 | ~2800 |
+| Pydantic models | 6 | 18 |
+| Helpers | ~10 | ~30 |
+| Session docs | 1 | 13 |
+
+---
+
+*Proximo paso sugerido: P3.1 (DXT extension) o NEED-09 (multi-party contracts)*
