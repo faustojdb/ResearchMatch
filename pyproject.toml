@@ -1,6 +1,6 @@
 [project]
 name = "research-match"
-version = "2.3.0"
+version = "2.8.0"
 description = "MCP server that connects isolated researchers via AI originality scoring and bilateral matching."
 authors = [
     { name = "faustojdb", email = "faustojdb@users.noreply.github.com" }

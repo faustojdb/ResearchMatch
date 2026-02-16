@@ -1,9 +1,9 @@
 {
-  "dxt_version": "0.1",
+  "manifest_version": "0.3",
   "name": "research-match",
-  "version": "2.3.0",
-  "description": "MCP server that connects isolated researchers via AI originality scoring and bilateral matching.",
-  "long_description": "Research Match is an MCP server that helps researchers find complementary collaborators while protecting intellectual property. It uses AI-powered originality scoring on two independent axes (Theoretical Originality and Formal-Computational Originality) and bilateral matching with a semaphore system (GREEN/YELLOW/RED) that shows each researcher what they gain from a potential collaboration.\n\n**KEY FEATURES**\n- **AI Originality Scoring**: Dual-axis evaluation (OT/OFC) with solidity multipliers (proven, functional, speculative, adhoc, cherry_picked)\n- **Bilateral Matching**: Complementarity-based matching with perspective-aware reasoning — each side sees gains from their own viewpoint\n- **Privacy by Design**: Emails are SHA-256 hashed, pseudonymous identities, no raw content shared until collaboration is accepted\n- **Reputation System**: Anti-retaliation ratings (anonymous until both rate), exponential smoothing, honesty-weighted\n- **Cold Search**: Free search across internal DB and GitHub — no registration required\n- **Semantic Similarity**: sentence-transformers embeddings with Jaccard fallback\n\n**MINIMUM REQUIREMENTS**\n- Python 3.12 or higher\n- UV Package Manager\nThis MCP server requires UV, a fast Python package manager.\nInstallation:\n`curl -LsSf https://astral.sh/uv/install.sh | sh`\nFor detailed installation instructions, [see the UV documentation](https://github.com/astral-sh/uv)",
+  "version": "2.8.0",
+  "description": "MCP server with 24 tools that connects isolated researchers via AI originality scoring, bilateral matching, collaboration contracts, and privacy-first knowledge sharing.",
+  "long_description": "Research Match is an MCP server that helps researchers find complementary collaborators while protecting intellectual property. It uses AI-powered originality scoring on two independent axes (Theoretical Originality and Formal-Computational Originality) and bilateral matching with a semaphore system (GREEN/YELLOW/RED) that shows each researcher what they gain from a potential collaboration.\n\n**KEY FEATURES (v2.8.0)**\n- **AI Originality Scoring**: Dual-axis evaluation (OT/OFC) with solidity multipliers (proven, functional, speculative, adhoc, cherry_picked)\n- **Bilateral Matching**: Complementarity-based matching with perspective-aware reasoning — each side sees gains from their own viewpoint\n- **Privacy by Design**: Emails are SHA-256 hashed, pseudonymous identities, no raw content shared until collaboration is accepted\n- **Reputation System**: Anti-retaliation ratings (anonymous until both rate), exponential smoothing, honesty-weighted\n- **Cold Search**: Free search across internal DB and GitHub — no registration required\n- **Deep Repository Analysis**: Clone and analyze any GitHub repo for originality scoring (stateless)\n- **Universal Project Proforma**: 3-mode workflow (extract/validate/submit) for structured research commits\n- **Collaboration Tickets**: Structured need_help/question/bug/suggestion tickets replacing free chat\n- **Bilateral Reveal System**: Consent-based progressive disclosure of research commit content\n- **Automatic Licensing**: 5-rule system (joint-equal, advisory-only, joint-weighted, time-limited)\n- **File Sharing Registry**: Metadata-only file sharing with MAD re-sharing detection\n- **Immutable Audit Log**: Full audit trail with viewer tool\n- **Git-Verifiable Contracts**: Bilateral confirmation with git commit hash verification\n- **Semantic Similarity**: sentence-transformers embeddings with Jaccard fallback\n\n**MINIMUM REQUIREMENTS**\n- Python 3.12 or higher\n- UV Package Manager\nThis MCP server requires UV, a fast Python package manager.\nInstallation:\n`curl -LsSf https://astral.sh/uv/install.sh | sh`\nFor detailed installation instructions, [see the UV documentation](https://github.com/astral-sh/uv)",
   "author": {
     "name": "faustojdb",
     "url": "https://github.com/faustojdb"
@@ -80,15 +80,74 @@
     {
       "name": "research_match_cold_search",
       "description": "FREE cold search — no registration required. Searches internal DB and GitHub for research topics."
+    },
+    {
+      "name": "research_match_deep_search",
+      "description": "Stateless deep analysis — clone and analyze any public GitHub repo for originality scoring, MCP gaps, and comparison with Research Match."
+    },
+    {
+      "name": "research_match_prepare_commit",
+      "description": "Universal proforma — 3-mode workflow (extract/validate/submit) that analyzes a local repo and guides structured Research Commit submission."
+    },
+    {
+      "name": "research_match_needs_create",
+      "description": "Create a structured collaboration ticket (need_help, question, bug, suggestion) within a team. Replaces free-form chat."
+    },
+    {
+      "name": "research_match_needs_list",
+      "description": "List collaboration tickets for a team, optionally filtered by status (open/resolved) or type."
+    },
+    {
+      "name": "research_match_needs_resolve",
+      "description": "Resolve a collaboration ticket. Resolver gets reputation effort boost if resolving another member's ticket."
+    },
+    {
+      "name": "research_match_reveal_request",
+      "description": "Request consent to view a teammate's full Research Commit content. Part of the bilateral reveal system (Level 3)."
+    },
+    {
+      "name": "research_match_reveal_respond",
+      "description": "Approve or deny a reveal request. Approval triggers license recalculation."
+    },
+    {
+      "name": "research_match_reveal_status",
+      "description": "View reveal consent matrix and approved commit content for a team. Includes shared files count."
+    },
+    {
+      "name": "research_match_team_license",
+      "description": "View or recalculate the automatic license for a team. 5-rule system: joint-equal, advisory-only, joint-weighted, time-limited."
+    },
+    {
+      "name": "research_match_share_file",
+      "description": "Share a file metadata entry with a team. Requires bilateral Level 3 reveals. MAD re-sharing detection protects against violations."
+    },
+    {
+      "name": "research_match_shared_files",
+      "description": "List all shared file metadata entries for a team. Shows file paths, descriptions, and sharing history."
+    },
+    {
+      "name": "research_match_audit_log",
+      "description": "Read-only viewer for the immutable audit trail. Filter by team and action type."
+    },
+    {
+      "name": "research_match_export_contract",
+      "description": "Export a git-verifiable collaboration contract for a team. Includes parties, scores, license terms, and verification instructions."
+    },
+    {
+      "name": "research_match_confirm_contract",
+      "description": "Confirm a collaboration contract with a git commit hash. Bilateral confirmation required (both members must confirm)."
     }
   ],
+  "tools_generated": true,
   "keywords": [
     "research",
     "collaboration",
     "matching",
     "originality",
     "mcp",
-    "ai"
+    "ai",
+    "contracts",
+    "licensing"
   ],
   "compatibility": {
     "platforms": ["win32", "linux", "darwin"],
