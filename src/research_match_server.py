@@ -119,7 +119,7 @@ def _log_tool_call(func):
 # =============================================================================
 
 DB_PATH = os.environ.get("RESEARCH_MATCH_DB", "research_match.db")
-SERVER_VERSION = "2.3.0-mvp"
+SERVER_VERSION = "2.4.0-collab-step1"
 
 # Scoring weights for Theoretical Originality (OT)
 OT_WEIGHTS = {
@@ -174,6 +174,13 @@ REPUTATION_BONUS_MIN_RATINGS = 5         # Min ratings for consistency bonus
 REPUTATION_BONUS_HONESTY_FLOOR = 4.0     # Min avg honesty for bonus
 REPUTATION_BONUS_QUALITY_FLOOR = 3.5     # Min avg quality for bonus
 REPUTATION_BONUS_MULTIPLIER = 1.1        # Bonus multiplier for consistent users
+
+# Collaboration layer constants
+MAX_OPEN_TICKETS_PER_USER_PER_TEAM = 5
+TICKET_EFFORT_BONUS = 0.5
+MAX_TICKET_TITLE_LENGTH = 200
+MAX_TICKET_DESCRIPTION_LENGTH = 2000
+MAX_PENDING_REVEALS_PER_TEAM = 10
 
 # Embedding model
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"  # 384 dims, ~90MB, fast
@@ -383,12 +390,86 @@ def init_database(db_path: str) -> sqlite3.Connection:
             UNIQUE(team_id, rater_id, rated_id)
         );
 
+        -- =============================================================
+        -- COLLABORATION LAYER (v2.4)
+        -- =============================================================
+
+        CREATE TABLE IF NOT EXISTS team_tickets (
+            id TEXT PRIMARY KEY,
+            team_id TEXT NOT NULL REFERENCES teams(id),
+            author_id TEXT NOT NULL REFERENCES users(id),
+            type TEXT NOT NULL CHECK(type IN ('need_help', 'can_offer', 'warning', 'question')),
+            area TEXT NOT NULL CHECK(area IN ('theory', 'code', 'data', 'review', 'infrastructure')),
+            title TEXT NOT NULL,
+            description TEXT NOT NULL,
+            priority TEXT NOT NULL DEFAULT 'important'
+                CHECK(priority IN ('critical', 'important', 'nice_to_have')),
+            status TEXT NOT NULL DEFAULT 'open'
+                CHECK(status IN ('open', 'in_progress', 'resolved', 'wont_fix')),
+            assigned_to TEXT REFERENCES users(id),
+            resolved_by TEXT REFERENCES users(id),
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            resolved_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS reveal_consents (
+            id TEXT PRIMARY KEY,
+            team_id TEXT NOT NULL REFERENCES teams(id),
+            level INTEGER NOT NULL CHECK(level IN (3, 4)),
+            requester_id TEXT NOT NULL REFERENCES users(id),
+            approver_id TEXT NOT NULL REFERENCES users(id),
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK(status IN ('pending', 'approved', 'denied')),
+            resource_type TEXT,
+            resource_ref TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            resolved_at TEXT,
+            UNIQUE(team_id, level, requester_id, resource_ref)
+        );
+
+        CREATE TABLE IF NOT EXISTS shared_files (
+            id TEXT PRIMARY KEY,
+            team_id TEXT NOT NULL REFERENCES teams(id),
+            consent_id TEXT REFERENCES reveal_consents(id),
+            shared_by TEXT NOT NULL REFERENCES users(id),
+            file_path TEXT NOT NULL,
+            file_hash TEXT,
+            origin_user_id TEXT NOT NULL REFERENCES users(id),
+            shared_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id TEXT PRIMARY KEY,
+            team_id TEXT NOT NULL REFERENCES teams(id),
+            actor_id TEXT NOT NULL REFERENCES users(id),
+            action TEXT NOT NULL CHECK(action IN (
+                'reveal_requested', 'reveal_approved', 'reveal_denied',
+                'file_shared', 'file_accessed',
+                'ticket_created', 'ticket_updated', 'ticket_resolved',
+                'license_generated', 'violation_detected'
+            )),
+            resource_ref TEXT,
+            details TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        -- Original indexes
         CREATE INDEX IF NOT EXISTS idx_commits_user ON research_commits(user_id);
         CREATE INDEX IF NOT EXISTS idx_commits_domain ON research_commits(domain, subdomain);
         CREATE INDEX IF NOT EXISTS idx_matches_users ON matches(user_a_id, user_b_id);
         CREATE INDEX IF NOT EXISTS idx_requests_recipient ON collaboration_requests(recipient_id, status);
         CREATE INDEX IF NOT EXISTS idx_ratings_rated ON ratings(rated_id);
         CREATE INDEX IF NOT EXISTS idx_ratings_team ON ratings(team_id);
+
+        -- Collaboration layer indexes (v2.4)
+        CREATE INDEX IF NOT EXISTS idx_tickets_team_status ON team_tickets(team_id, status);
+        CREATE INDEX IF NOT EXISTS idx_tickets_author ON team_tickets(author_id);
+        CREATE INDEX IF NOT EXISTS idx_reveal_team_level ON reveal_consents(team_id, level);
+        CREATE INDEX IF NOT EXISTS idx_shared_files_team ON shared_files(team_id);
+        CREATE INDEX IF NOT EXISTS idx_shared_files_origin ON shared_files(origin_user_id);
+        CREATE INDEX IF NOT EXISTS idx_audit_team ON audit_log(team_id);
+        CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log(actor_id);
     """)
 
     conn.commit()
@@ -1240,6 +1321,94 @@ class ColdSearchInput(BaseModel):
     max_results: int = Field(10, description="Maximum results to return", ge=1, le=25)
 
 
+# --- Collaboration Layer Models (v2.4) ---
+
+class NeedsCreateInput(BaseModel):
+    """Input for creating a team ticket (structured need/offer/question)."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    team_id: str = Field(..., description="ID of the team where you want to create a ticket")
+    type: str = Field(..., description="Ticket type: need_help, can_offer, warning, question")
+    area: str = Field(..., description="Work area: theory, code, data, review, infrastructure")
+    title: str = Field(..., description="Short descriptive title for the ticket", min_length=5, max_length=MAX_TICKET_TITLE_LENGTH)
+    description: str = Field(..., description="Detailed description of the need or offer", min_length=10, max_length=MAX_TICKET_DESCRIPTION_LENGTH)
+    priority: str = Field("important", description="Priority level: critical, important, nice_to_have")
+
+    @field_validator("type")
+    @classmethod
+    def validate_type(cls, v: str) -> str:
+        allowed = ("need_help", "can_offer", "warning", "question")
+        if v not in allowed:
+            raise ValueError(f"type must be one of {allowed}, got '{v}'")
+        return v
+
+    @field_validator("area")
+    @classmethod
+    def validate_area(cls, v: str) -> str:
+        allowed = ("theory", "code", "data", "review", "infrastructure")
+        if v not in allowed:
+            raise ValueError(f"area must be one of {allowed}, got '{v}'")
+        return v
+
+    @field_validator("priority")
+    @classmethod
+    def validate_priority(cls, v: str) -> str:
+        allowed = ("critical", "important", "nice_to_have")
+        if v not in allowed:
+            raise ValueError(f"priority must be one of {allowed}, got '{v}'")
+        return v
+
+
+class NeedsListInput(BaseModel):
+    """Input for listing team tickets with optional filters."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    team_id: str = Field(..., description="ID of the team whose tickets to list")
+    status: Optional[str] = Field(None, description="Filter by status: open, in_progress, resolved, wont_fix")
+    area: Optional[str] = Field(None, description="Filter by area: theory, code, data, review, infrastructure")
+    type: Optional[str] = Field(None, description="Filter by type: need_help, can_offer, warning, question")
+
+
+class NeedsResolveInput(BaseModel):
+    """Input for resolving (closing) a team ticket."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    ticket_id: str = Field(..., description="ID of the ticket to resolve")
+    resolution: str = Field(..., description="Resolution type: resolved or wont_fix")
+    resolution_note: Optional[str] = Field(None, description="Optional note explaining the resolution", max_length=1000)
+
+    @field_validator("resolution")
+    @classmethod
+    def validate_resolution(cls, v: str) -> str:
+        allowed = ("resolved", "wont_fix")
+        if v not in allowed:
+            raise ValueError(f"resolution must be one of {allowed}, got '{v}'")
+        return v
+
+
+class RevealRequestInput(BaseModel):
+    """Input for requesting Level 3 reveal of a teammate's Research Commit."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    team_id: str = Field(..., description="Team where both users are members")
+    target_user_id: str = Field(..., description="User whose commit you want to see")
+
+
+class RevealRespondInput(BaseModel):
+    """Input for approving or denying a reveal consent request."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    consent_id: str = Field(..., description="ID of the consent to respond to")
+    approve: bool = Field(..., description="True to approve, False to deny")
+
+
+class RevealStatusInput(BaseModel):
+    """Input for checking reveal status and viewing revealed content."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    team_id: str = Field(..., description="Team to check reveal status for")
+
+
 # =============================================================================
 # LIFESPAN & SERVER INITIALIZATION
 # =============================================================================
@@ -1284,6 +1453,8 @@ def _health_stats() -> Dict[str, Any]:
             "SELECT COUNT(*) as c FROM collaboration_requests WHERE status = 'pending'"
         ).fetchone()["c"]
         ratings = db.execute("SELECT COUNT(*) as c FROM ratings").fetchone()["c"]
+        tickets = db.execute("SELECT COUNT(*) as c FROM team_tickets").fetchone()["c"]
+        audit_entries = db.execute("SELECT COUNT(*) as c FROM audit_log").fetchone()["c"]
         db.close()
         # Check embedding engine status
         try:
@@ -1306,6 +1477,8 @@ def _health_stats() -> Dict[str, Any]:
                 "teams": teams,
                 "pending_requests": pending_requests,
                 "ratings": ratings,
+                "tickets": tickets,
+                "audit_entries": audit_entries,
             },
         }
     except Exception as e:
@@ -1387,6 +1560,19 @@ def _reputation_badge(score: float, total_ratings: int) -> str:
         return f"⚠️ Mixed ({score:.0f}/100, {total_ratings} ratings)"
     else:
         return f"🚩 Low ({score:.0f}/100, {total_ratings} ratings)"
+
+
+def _write_audit_log(db: sqlite3.Connection, team_id: str, actor_id: str,
+                     action: str, resource_ref: str = None, details: dict = None) -> str:
+    """Write an immutable entry to the audit log. Returns the log entry ID."""
+    log_id = str(uuid.uuid4())
+    db.execute(
+        """INSERT INTO audit_log (id, team_id, actor_id, action, resource_ref, details)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (log_id, team_id, actor_id, action, resource_ref,
+         json.dumps(details) if details else None)
+    )
+    return log_id
 
 
 # =============================================================================
@@ -1976,13 +2162,26 @@ async def research_match_respond_request(params: RespondRequestInput, ctx=None) 
             "INSERT INTO team_members (team_id, user_id, role) VALUES (?, ?, 'co-lead')",
             (team_id, request["requester_id"])
         )
+
+        # Audit log: team license generated
+        _write_audit_log(db, team_id, user["id"], "license_generated",
+                         resource_ref=team_id,
+                         details={"license_type": "joint-equal",
+                                  "members": [user["id"], request["requester_id"]]})
         db.commit()
 
         result["team"] = {
             "team_id": team_id,
             "team_name": team_name,
             "license": "joint-equal",
-            "message": "Team created! Gradual revelation process begins. You can now rate each other after collaborating using research_match_rate_user."
+            "message": (
+                "Team created! NEXT STEPS: "
+                "(1) research_match_reveal_request to request Level 3 reveal of your teammate's full Research Commit, "
+                "(2) research_match_needs_create to create tickets (needs, offers, questions), "
+                "(3) research_match_needs_list to see the team board, "
+                "(4) research_match_needs_resolve to close tickets. "
+                "After collaborating, use research_match_rate_user to rate each other."
+            ),
         }
     else:
         db.commit()
@@ -2319,6 +2518,687 @@ async def research_match_cold_search(params: ColdSearchInput, ctx=None) -> str:
         "internal_results": internal_results,
         "github_results": github_results,
     }, indent=2)
+
+
+# =============================================================================
+# COLLABORATION LAYER TOOLS (v2.4)
+# =============================================================================
+
+@mcp.tool(
+    name="research_match_needs_create",
+    description=(
+        "POST-TEAM STEP — Create a structured ticket for your team. "
+        "Tickets replace free-form chat with 'intellectual pull requests': "
+        "type 'need_help' (request assistance), 'can_offer' (volunteer a skill), "
+        "'warning' (flag a risk), 'question' (ask for clarification). "
+        "Each ticket targets an area: theory, code, data, review, infrastructure. "
+        "Priority: critical > important > nice_to_have. "
+        f"Max {MAX_OPEN_TICKETS_PER_USER_PER_TEAM} open tickets per user per team. "
+        "After creating, use research_match_needs_list to see all tickets, "
+        "or research_match_needs_resolve to close them. "
+        "Example: type='need_help', area='code', title='Need GPU optimization for MD sim', priority='critical'."
+    ),
+    annotations={
+        "title": "Create Team Ticket",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    }
+)
+@_log_tool_call
+async def research_match_needs_create(params: NeedsCreateInput, ctx=None) -> str:
+    """Create a structured ticket in a team.
+
+    Args:
+        params (NeedsCreateInput): Ticket data:
+            - team_id (str): Team ID
+            - type (str): need_help|can_offer|warning|question
+            - area (str): theory|code|data|review|infrastructure
+            - title (str): 5-200 chars
+            - description (str): 10-2000 chars
+            - priority (str): critical|important|nice_to_have (default: important)
+
+    Returns:
+        str: JSON with ticket_id, remaining slots, and next_step guidance
+    """
+    db = _get_db(ctx)
+    user = _get_current_user(db)
+    if not user:
+        return json.dumps({"error": "No registered user found. Use research_match_register first."})
+
+    # Verify user is a member of the team
+    membership = db.execute(
+        "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
+        (params.team_id, user["id"])
+    ).fetchone()
+    if not membership:
+        return json.dumps({"error": "You are not a member of this team."})
+
+    # Check open ticket limit
+    open_count = db.execute(
+        "SELECT COUNT(*) as c FROM team_tickets WHERE team_id = ? AND author_id = ? AND status IN ('open', 'in_progress')",
+        (params.team_id, user["id"])
+    ).fetchone()["c"]
+    if open_count >= MAX_OPEN_TICKETS_PER_USER_PER_TEAM:
+        return json.dumps({
+            "error": f"You already have {open_count} open tickets in this team (max {MAX_OPEN_TICKETS_PER_USER_PER_TEAM}). "
+                     "Resolve existing tickets before creating new ones."
+        })
+
+    ticket_id = str(uuid.uuid4())
+    db.execute(
+        """INSERT INTO team_tickets (id, team_id, author_id, type, area, title, description, priority)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (ticket_id, params.team_id, user["id"], params.type, params.area,
+         params.title, params.description, params.priority)
+    )
+
+    _write_audit_log(db, params.team_id, user["id"], "ticket_created",
+                     resource_ref=ticket_id,
+                     details={"type": params.type, "area": params.area, "priority": params.priority})
+    db.commit()
+
+    remaining_slots = MAX_OPEN_TICKETS_PER_USER_PER_TEAM - open_count - 1
+    return json.dumps({
+        "status": "created",
+        "ticket_id": ticket_id,
+        "type": params.type,
+        "area": params.area,
+        "priority": params.priority,
+        "title": params.title,
+        "remaining_open_slots": remaining_slots,
+        "next_step": "Use research_match_needs_list to see all team tickets, or research_match_needs_resolve to close tickets.",
+    }, indent=2)
+
+
+@mcp.tool(
+    name="research_match_needs_list",
+    description=(
+        "POST-TEAM STEP — List all tickets in a team with optional filters. "
+        "Shows structured needs, offers, warnings, and questions from all team members. "
+        "Filter by status (open, in_progress, resolved, wont_fix), "
+        "area (theory, code, data, review, infrastructure), "
+        "or type (need_help, can_offer, warning, question). "
+        "Tickets are ordered by priority (critical first) then by creation date. "
+        "Returns a summary with counts plus the full ticket list with pseudonyms. "
+        "Use after research_match_needs_create, or to check team progress."
+    ),
+    annotations={
+        "title": "List Team Tickets",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+@_log_tool_call
+async def research_match_needs_list(params: NeedsListInput, ctx=None) -> str:
+    """List tickets in a team with optional filters.
+
+    Args:
+        params (NeedsListInput): Filter criteria:
+            - team_id (str, required): Team ID
+            - status (str, optional): Filter by status
+            - area (str, optional): Filter by area
+            - type (str, optional): Filter by type
+
+    Returns:
+        str: JSON with summary counts and ticket list
+    """
+    db = _get_db(ctx)
+    user = _get_current_user(db)
+    if not user:
+        return json.dumps({"error": "No registered user found. Use research_match_register first."})
+
+    membership = db.execute(
+        "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
+        (params.team_id, user["id"])
+    ).fetchone()
+    if not membership:
+        return json.dumps({"error": "You are not a member of this team."})
+
+    # Build query with optional filters
+    query = "SELECT t.*, u.pseudonym as author_pseudonym FROM team_tickets t JOIN users u ON t.author_id = u.id WHERE t.team_id = ?"
+    query_params: list = [params.team_id]
+
+    if params.status:
+        query += " AND t.status = ?"
+        query_params.append(params.status)
+    if params.area:
+        query += " AND t.area = ?"
+        query_params.append(params.area)
+    if params.type:
+        query += " AND t.type = ?"
+        query_params.append(params.type)
+
+    # Order by priority (critical > important > nice_to_have), then by date
+    query += """
+        ORDER BY
+            CASE t.priority
+                WHEN 'critical' THEN 1
+                WHEN 'important' THEN 2
+                WHEN 'nice_to_have' THEN 3
+            END,
+            t.created_at DESC
+    """
+
+    rows = db.execute(query, query_params).fetchall()
+
+    # Build summary counts
+    all_tickets = db.execute(
+        "SELECT status, COUNT(*) as c FROM team_tickets WHERE team_id = ? GROUP BY status",
+        (params.team_id,)
+    ).fetchall()
+    summary = {dict(r)["status"]: dict(r)["c"] for r in all_tickets}
+
+    tickets = []
+    for r in rows:
+        rd = dict(r)
+        ticket = {
+            "ticket_id": rd["id"],
+            "type": rd["type"],
+            "area": rd["area"],
+            "title": rd["title"],
+            "description": rd["description"],
+            "priority": rd["priority"],
+            "status": rd["status"],
+            "author": rd["author_pseudonym"],
+            "created_at": rd["created_at"],
+            "updated_at": rd["updated_at"],
+        }
+        if rd["resolved_by"]:
+            resolver = db.execute("SELECT pseudonym FROM users WHERE id = ?", (rd["resolved_by"],)).fetchone()
+            ticket["resolved_by"] = resolver["pseudonym"] if resolver else rd["resolved_by"]
+            ticket["resolved_at"] = rd["resolved_at"]
+        tickets.append(ticket)
+
+    return json.dumps({
+        "status": "ok",
+        "team_id": params.team_id,
+        "summary": summary,
+        "total_shown": len(tickets),
+        "filters_applied": {
+            k: v for k, v in {"status": params.status, "area": params.area, "type": params.type}.items() if v
+        },
+        "tickets": tickets,
+        "tip": "Use research_match_needs_resolve to close a ticket, or research_match_needs_create to add one.",
+    }, indent=2)
+
+
+@mcp.tool(
+    name="research_match_needs_resolve",
+    description=(
+        "POST-TEAM STEP — Resolve (close) a team ticket. "
+        "Set resolution to 'resolved' (work done) or 'wont_fix' (not needed / out of scope). "
+        "Any team member can resolve any ticket — this builds team trust. "
+        "REPUTATION IMPACT: Resolving a 'need_help' or 'question' ticket created by another "
+        "team member gives you a +0.5 effort boost in the reputation system. "
+        "Add a resolution_note to explain what was done or why it won't be fixed. "
+        "Resolved tickets remain visible in research_match_needs_list for team history."
+    ),
+    annotations={
+        "title": "Resolve Team Ticket",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+@_log_tool_call
+async def research_match_needs_resolve(params: NeedsResolveInput, ctx=None) -> str:
+    """Resolve a team ticket.
+
+    Args:
+        params (NeedsResolveInput): Resolution data:
+            - ticket_id (str, required): Ticket ID
+            - resolution (str, required): 'resolved' or 'wont_fix'
+            - resolution_note (str, optional): Explanation (max 1000 chars)
+
+    Returns:
+        str: JSON with resolution status and reputation impact if applicable
+    """
+    db = _get_db(ctx)
+    user = _get_current_user(db)
+    if not user:
+        return json.dumps({"error": "No registered user found. Use research_match_register first."})
+
+    ticket = db.execute("SELECT * FROM team_tickets WHERE id = ?", (params.ticket_id,)).fetchone()
+    if not ticket:
+        return json.dumps({"error": "Ticket not found."})
+    ticket = dict(ticket)
+
+    # Verify user is a member of the ticket's team
+    membership = db.execute(
+        "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
+        (ticket["team_id"], user["id"])
+    ).fetchone()
+    if not membership:
+        return json.dumps({"error": "You are not a member of this team."})
+
+    if ticket["status"] in ("resolved", "wont_fix"):
+        return json.dumps({"error": f"Ticket already {ticket['status']}. Cannot resolve again."})
+
+    # Update ticket
+    db.execute(
+        """UPDATE team_tickets
+           SET status = ?, resolved_by = ?, resolved_at = datetime('now'), updated_at = datetime('now')
+           WHERE id = ?""",
+        (params.resolution, user["id"], params.ticket_id)
+    )
+
+    # Audit log
+    _write_audit_log(db, ticket["team_id"], user["id"], "ticket_resolved",
+                     resource_ref=params.ticket_id,
+                     details={"resolution": params.resolution,
+                              "note": params.resolution_note,
+                              "original_type": ticket["type"],
+                              "original_author": ticket["author_id"]})
+
+    # Reputation boost: resolving someone else's need_help/question
+    effort_boosted = False
+    if (params.resolution == "resolved"
+            and ticket["type"] in ("need_help", "question")
+            and ticket["author_id"] != user["id"]):
+        # Apply effort boost via exponential smoothing
+        current = db.execute(
+            "SELECT running_effort FROM users WHERE id = ?", (user["id"],)
+        ).fetchone()
+        if current and current["running_effort"] is not None:
+            new_effort = min(5.0, current["running_effort"] + TICKET_EFFORT_BONUS * REPUTATION_ALPHA)
+            db.execute("UPDATE users SET running_effort = ? WHERE id = ?", (new_effort, user["id"]))
+        effort_boosted = True
+
+    db.commit()
+
+    result = {
+        "status": "ok",
+        "ticket_id": params.ticket_id,
+        "resolution": params.resolution,
+        "resolved_by": user["pseudonym"],
+    }
+    if params.resolution_note:
+        result["resolution_note"] = params.resolution_note
+    if effort_boosted:
+        result["reputation_impact"] = f"+{TICKET_EFFORT_BONUS} effort boost for resolving a {ticket['type']} ticket"
+    result["next_step"] = "Use research_match_needs_list to see updated ticket board, or research_match_rate_user to rate your collaborator."
+
+    return json.dumps(result, indent=2)
+
+
+# =============================================================================
+# REVEAL TOOLS (Level 3 — Bilateral Consent)
+# =============================================================================
+
+
+@mcp.tool(
+    name="research_match_reveal_request",
+    description=(
+        "POST-TEAM STEP — Request Level 3 reveal of a teammate's full Research Commit. "
+        "After forming a team (respond_request), members only see scores and semaphore (Level 2). "
+        "Use this tool to request explicit consent to view the complete commit content "
+        "(hypothesis, theory, demonstrations, ad-hoc ideas, cherry-picking declarations). "
+        "The target user must approve via research_match_reveal_respond before content is visible. "
+        "Each consent is tied to a specific commit version — new versions require new consent. "
+        "Use research_match_reveal_status to check current reveal state."
+    ),
+    annotations={
+        "title": "Request Level 3 Reveal",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    }
+)
+@_log_tool_call
+async def research_match_reveal_request(params: RevealRequestInput, ctx=None) -> str:
+    """Request Level 3 reveal of a teammate's Research Commit.
+
+    Args:
+        params (RevealRequestInput): Request data:
+            - team_id (str, required): Team where both users are members
+            - target_user_id (str, required): User whose commit you want revealed
+
+    Returns:
+        str: JSON with consent_id and status, or error
+    """
+    db = _get_db(ctx)
+    user = _get_current_user(db)
+    if not user:
+        return json.dumps({"error": "No registered user found. Use research_match_register first."})
+
+    # Verify requester is team member
+    membership = db.execute(
+        "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
+        (params.team_id, user["id"])
+    ).fetchone()
+    if not membership:
+        return json.dumps({"error": "You are not a member of this team."})
+
+    # Cannot request own reveal
+    if params.target_user_id == user["id"]:
+        return json.dumps({"error": "Cannot request reveal of your own commit. You already have access to your own work."})
+
+    # Verify target is team member
+    target_membership = db.execute(
+        "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
+        (params.team_id, params.target_user_id)
+    ).fetchone()
+    if not target_membership:
+        return json.dumps({"error": "Target user is not a member of this team."})
+
+    # Verify target has at least one commit
+    target_commit = db.execute(
+        "SELECT id FROM research_commits WHERE user_id = ? ORDER BY version DESC LIMIT 1",
+        (params.target_user_id,)
+    ).fetchone()
+    if not target_commit:
+        return json.dumps({"error": "Target user has no Research Commits yet. They must use research_match_submit_commit first."})
+    commit_id = target_commit["id"]
+
+    # Check for existing pending consent
+    existing_pending = db.execute(
+        """SELECT id FROM reveal_consents
+           WHERE team_id = ? AND level = 3 AND requester_id = ? AND resource_ref = ? AND status = 'pending'""",
+        (params.team_id, user["id"], commit_id)
+    ).fetchone()
+    if existing_pending:
+        return json.dumps({
+            "status": "already_pending",
+            "consent_id": existing_pending["id"],
+            "message": "A reveal request for this commit is already pending. Wait for the target user to respond via research_match_reveal_respond.",
+        })
+
+    # Check for already approved
+    existing_approved = db.execute(
+        """SELECT id FROM reveal_consents
+           WHERE team_id = ? AND level = 3 AND requester_id = ? AND resource_ref = ? AND status = 'approved'""",
+        (params.team_id, user["id"], commit_id)
+    ).fetchone()
+    if existing_approved:
+        return json.dumps({
+            "status": "already_approved",
+            "consent_id": existing_approved["id"],
+            "message": "This commit is already revealed to you. Use research_match_reveal_status to view the content.",
+        })
+
+    # Check pending limit
+    pending_count = db.execute(
+        "SELECT COUNT(*) as c FROM reveal_consents WHERE team_id = ? AND status = 'pending'",
+        (params.team_id,)
+    ).fetchone()["c"]
+    if pending_count >= MAX_PENDING_REVEALS_PER_TEAM:
+        return json.dumps({"error": f"Too many pending reveal requests for this team (max {MAX_PENDING_REVEALS_PER_TEAM}). Resolve existing requests first."})
+
+    # Create consent
+    consent_id = str(uuid.uuid4())
+    db.execute(
+        """INSERT INTO reveal_consents (id, team_id, level, requester_id, approver_id, resource_type, resource_ref)
+           VALUES (?, ?, 3, ?, ?, 'commit', ?)""",
+        (consent_id, params.team_id, user["id"], params.target_user_id, commit_id)
+    )
+
+    _write_audit_log(db, params.team_id, user["id"], "reveal_requested",
+                     resource_ref=commit_id,
+                     details={"level": 3, "target_user_id": params.target_user_id})
+    db.commit()
+
+    # Get target pseudonym for the response
+    target_user = db.execute("SELECT pseudonym FROM users WHERE id = ?", (params.target_user_id,)).fetchone()
+
+    return json.dumps({
+        "status": "pending",
+        "consent_id": consent_id,
+        "target_pseudonym": target_user["pseudonym"] if target_user else params.target_user_id,
+        "commit_id": commit_id,
+        "message": "Reveal request sent. The target user must approve via research_match_reveal_respond.",
+        "next_steps": [
+            "research_match_reveal_status to check current reveal state",
+            "research_match_reveal_respond (for the target user) to approve or deny",
+        ],
+    }, indent=2)
+
+
+@mcp.tool(
+    name="research_match_reveal_respond",
+    description=(
+        "POST-TEAM STEP — Approve or deny a Level 3 reveal request for your Research Commit. "
+        "When a teammate requests to see your full commit, you will have a pending consent. "
+        "Use research_match_reveal_status to see pending requests, then this tool to respond. "
+        "IMPORTANT: Approval is IRREVERSIBLE — once approved, the requester can see your full "
+        "commit content (hypothesis, theory, demos, ad-hoc, cherry-picking, scores, breakdowns). "
+        "Denial is final for that request but the requester can submit a new request later."
+    ),
+    annotations={
+        "title": "Respond to Reveal Request",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+@_log_tool_call
+async def research_match_reveal_respond(params: RevealRespondInput, ctx=None) -> str:
+    """Approve or deny a Level 3 reveal consent request.
+
+    Args:
+        params (RevealRespondInput): Response data:
+            - consent_id (str, required): Consent ID to respond to
+            - approve (bool, required): True to approve, False to deny
+
+    Returns:
+        str: JSON with result and guidance
+    """
+    db = _get_db(ctx)
+    user = _get_current_user(db)
+    if not user:
+        return json.dumps({"error": "No registered user found. Use research_match_register first."})
+
+    consent = db.execute("SELECT * FROM reveal_consents WHERE id = ?", (params.consent_id,)).fetchone()
+    if not consent:
+        return json.dumps({"error": "Consent not found."})
+    consent = dict(consent)
+
+    # Only the approver can respond
+    if consent["approver_id"] != user["id"]:
+        return json.dumps({"error": "Only the target user (approver) can respond to this reveal request."})
+
+    # Must be pending
+    if consent["status"] != "pending":
+        return json.dumps({
+            "error": f"Consent already {consent['status']}. Cannot change a resolved consent.",
+            "consent_id": params.consent_id,
+            "current_status": consent["status"],
+        })
+
+    new_status = "approved" if params.approve else "denied"
+    db.execute(
+        "UPDATE reveal_consents SET status = ?, resolved_at = datetime('now') WHERE id = ?",
+        (new_status, params.consent_id)
+    )
+
+    action = "reveal_approved" if params.approve else "reveal_denied"
+    _write_audit_log(db, consent["team_id"], user["id"], action,
+                     resource_ref=consent["resource_ref"],
+                     details={"consent_id": params.consent_id, "level": consent["level"],
+                              "requester_id": consent["requester_id"]})
+    db.commit()
+
+    requester = db.execute("SELECT pseudonym FROM users WHERE id = ?", (consent["requester_id"],)).fetchone()
+
+    result = {
+        "status": "ok",
+        "consent_id": params.consent_id,
+        "decision": new_status,
+        "requester_pseudonym": requester["pseudonym"] if requester else consent["requester_id"],
+    }
+
+    if params.approve:
+        result["message"] = (
+            "Reveal APPROVED. This is irreversible — the requester can now view your full "
+            "Research Commit via research_match_reveal_status."
+        )
+    else:
+        result["message"] = (
+            "Reveal DENIED. The requester cannot see your commit content. "
+            "They may submit a new request later if desired."
+        )
+
+    result["next_step"] = "Use research_match_reveal_status to see the full reveal matrix for your team."
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool(
+    name="research_match_reveal_status",
+    description=(
+        "POST-TEAM STEP — View reveal status, consent matrix, and revealed content for a team. "
+        "Shows all reveal consents (pending, approved, denied) with pseudonyms. "
+        "For approved consents where YOU are the requester, includes the FULL Research Commit "
+        "content (hypothesis, theory, demonstrations, ad-hoc ideas, cherry-picking, scores). "
+        "Also shows a reveal_matrix summarizing who can see whose commits. "
+        "Use this to check pending requests before using research_match_reveal_respond."
+    ),
+    annotations={
+        "title": "Reveal Status & Content",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+@_log_tool_call
+async def research_match_reveal_status(params: RevealStatusInput, ctx=None) -> str:
+    """View reveal consents, matrix, and revealed content for a team.
+
+    Args:
+        params (RevealStatusInput): Query data:
+            - team_id (str, required): Team to check
+
+    Returns:
+        str: JSON with consents, reveal_matrix, and revealed content where applicable
+    """
+    db = _get_db(ctx)
+    user = _get_current_user(db)
+    if not user:
+        return json.dumps({"error": "No registered user found. Use research_match_register first."})
+
+    # Verify membership
+    membership = db.execute(
+        "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
+        (params.team_id, user["id"])
+    ).fetchone()
+    if not membership:
+        return json.dumps({"error": "You are not a member of this team."})
+
+    # Fetch all consents for this team with pseudonyms
+    consents_rows = db.execute(
+        """SELECT rc.*, u_req.pseudonym AS requester_pseudonym, u_app.pseudonym AS approver_pseudonym
+           FROM reveal_consents rc
+           JOIN users u_req ON rc.requester_id = u_req.id
+           JOIN users u_app ON rc.approver_id = u_app.id
+           WHERE rc.team_id = ?
+           ORDER BY rc.created_at DESC""",
+        (params.team_id,)
+    ).fetchall()
+
+    consents = []
+    summary = {"pending": 0, "approved": 0, "denied": 0}
+
+    for row in consents_rows:
+        r = dict(row)
+        summary[r["status"]] = summary.get(r["status"], 0) + 1
+
+        consent_info = {
+            "consent_id": r["id"],
+            "level": r["level"],
+            "requester_pseudonym": r["requester_pseudonym"],
+            "approver_pseudonym": r["approver_pseudonym"],
+            "resource_type": r["resource_type"],
+            "status": r["status"],
+            "created_at": r["created_at"],
+            "resolved_at": r["resolved_at"],
+        }
+
+        # If approved and current user is the requester, include full commit content
+        if r["status"] == "approved" and r["requester_id"] == user["id"] and r["resource_ref"]:
+            commit = db.execute(
+                "SELECT * FROM research_commits WHERE id = ?", (r["resource_ref"],)
+            ).fetchone()
+            if commit:
+                c = dict(commit)
+                consent_info["revealed_content"] = {
+                    "commit_id": c["id"],
+                    "version": c["version"],
+                    "domain": c["domain"],
+                    "subdomain": c["subdomain"],
+                    "problem": c["problem"],
+                    "hypothesis": c["hypothesis"],
+                    "theoretical_framework": c["theoretical_framework"],
+                    "demonstrations_summary": c["demonstrations_summary"],
+                    "demo_types": json.loads(c["demo_types"] or "[]"),
+                    "code_languages": json.loads(c["code_languages"] or "[]"),
+                    "adhoc_summary": c["adhoc_summary"],
+                    "adhoc_connections": json.loads(c["adhoc_connections"] or "[]"),
+                    "cherry_picking": json.loads(c["cherry_picking"] or "[]"),
+                    "solidity_levels": json.loads(c["solidity_levels"] or "{}"),
+                    "overall_solidity": c["overall_solidity"],
+                    "ot_score": c["ot_score"],
+                    "ofc_score": c["ofc_score"],
+                    "ot_breakdown": json.loads(c["ot_breakdown"] or "{}"),
+                    "ofc_breakdown": json.loads(c["ofc_breakdown"] or "{}"),
+                    "solidity_impact": json.loads(c["solidity_impact"] or "{}"),
+                }
+
+        consents.append(consent_info)
+
+    # Build reveal matrix
+    members = db.execute(
+        """SELECT tm.user_id, u.pseudonym
+           FROM team_members tm JOIN users u ON tm.user_id = u.id
+           WHERE tm.team_id = ?""",
+        (params.team_id,)
+    ).fetchall()
+
+    reveal_matrix = []
+    for member in members:
+        m = dict(member)
+        # Who can see this member's commits (approved consents where member is approver)
+        visible_to = db.execute(
+            """SELECT u.pseudonym FROM reveal_consents rc
+               JOIN users u ON rc.requester_id = u.id
+               WHERE rc.team_id = ? AND rc.approver_id = ? AND rc.status = 'approved' AND rc.level = 3""",
+            (params.team_id, m["user_id"])
+        ).fetchall()
+
+        # Whose commits this member can see (approved consents where member is requester)
+        can_see = db.execute(
+            """SELECT u.pseudonym FROM reveal_consents rc
+               JOIN users u ON rc.approver_id = u.id
+               WHERE rc.team_id = ? AND rc.requester_id = ? AND rc.status = 'approved' AND rc.level = 3""",
+            (params.team_id, m["user_id"])
+        ).fetchall()
+
+        reveal_matrix.append({
+            "pseudonym": m["pseudonym"],
+            "commit_visible_to": [r["pseudonym"] for r in visible_to],
+            "can_see_commits_of": [r["pseudonym"] for r in can_see],
+        })
+
+    result = {
+        "team_id": params.team_id,
+        "summary": summary,
+        "reveal_matrix": reveal_matrix,
+        "consents": consents,
+    }
+
+    if summary["pending"] > 0:
+        result["tip"] = "Use research_match_reveal_respond to approve or deny pending requests."
+    elif summary["approved"] == 0:
+        result["tip"] = "No reveals yet. Use research_match_reveal_request to request access to a teammate's commit."
+    else:
+        result["tip"] = "Use research_match_rate_user to rate your collaborator after reviewing their work."
+
+    return json.dumps(result, indent=2)
 
 
 # =============================================================================
