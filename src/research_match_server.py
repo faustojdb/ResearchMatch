@@ -181,6 +181,34 @@ TICKET_EFFORT_BONUS = 0.5
 MAX_TICKET_TITLE_LENGTH = 200
 MAX_TICKET_DESCRIPTION_LENGTH = 2000
 MAX_PENDING_REVEALS_PER_TEAM = 10
+LICENSE_STALE_DAYS = 30  # Days without reveal before team becomes "time-limited"
+
+LICENSE_TERMS = {
+    "joint-equal": [
+        "Both parties are co-authors with equal rights.",
+        "Either party may publish with mandatory co-author credit.",
+        "Derived works require consent from both parties.",
+        "Neither party may sublicense without mutual agreement.",
+    ],
+    "joint-weighted": [
+        "Both parties are co-authors with weighted rights.",
+        "Contribution split reflects ticket resolution balance.",
+        "Publishing rights proportional to contribution percentage.",
+        "Split recalculates as collaboration evolves.",
+    ],
+    "advisory-only": [
+        "Content owner retains full IP rights.",
+        "Advisor receives acknowledgment credit only.",
+        "Advisor may NOT publish or derive from shared content.",
+        "Upgrade to joint-equal requires bilateral reveal.",
+    ],
+    "time-limited": [
+        "Collaboration window has not progressed to active sharing.",
+        "No IP rights transferred — team exists for coordination only.",
+        "Use research_match_reveal_request to activate full collaboration.",
+        "Team may be dissolved if no activity within 60 days.",
+    ],
+}
 
 # Embedding model
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"  # 384 dims, ~90MB, fast
@@ -480,6 +508,13 @@ def init_database(db_path: str) -> sqlite3.Connection:
             conn.execute(f"ALTER TABLE users ADD COLUMN {col} REAL DEFAULT NULL")
         except sqlite3.OperationalError:
             pass  # Column already exists
+
+    # Migration: add license_updated_at to teams (NEED-03)
+    try:
+        conn.execute("ALTER TABLE teams ADD COLUMN license_updated_at TEXT")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
     conn.commit()
 
     return conn
@@ -1409,6 +1444,13 @@ class RevealStatusInput(BaseModel):
     team_id: str = Field(..., description="Team to check reveal status for")
 
 
+class TeamLicenseInput(BaseModel):
+    """Input for viewing the automatically computed license for a team."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    team_id: str = Field(..., description="Team to view license for")
+
+
 # =============================================================================
 # LIFESPAN & SERVER INITIALIZATION
 # =============================================================================
@@ -1573,6 +1615,203 @@ def _write_audit_log(db: sqlite3.Connection, team_id: str, actor_id: str,
          json.dumps(details) if details else None)
     )
     return log_id
+
+
+def _compute_license(db: sqlite3.Connection, team_id: str) -> dict:
+    """Compute license type and contribution split based on team activity.
+
+    Pure function (reads DB only, no writes). Evaluates 5 rules in order:
+      R1: No approved reveals → joint-equal (default)
+      R2: Unilateral reveals → advisory-only
+      R3: Bilateral reveals + balanced tickets → joint-equal
+      R4: Bilateral reveals + asymmetric tickets → joint-weighted
+      R5: Team >30 days old with no reveals → time-limited
+    """
+    # Get team members
+    members = db.execute(
+        """SELECT tm.user_id, u.pseudonym
+           FROM team_members tm JOIN users u ON tm.user_id = u.id
+           WHERE tm.team_id = ?""",
+        (team_id,)
+    ).fetchall()
+    if len(members) < 2:
+        return {
+            "license_type": "joint-equal",
+            "contribution_split": {},
+            "rationale": "Team has fewer than 2 members.",
+            "terms": LICENSE_TERMS["joint-equal"],
+            "reveal_state": "none",
+            "ticket_balance": {},
+        }
+
+    member_a = dict(members[0])
+    member_b = dict(members[1])
+
+    # Check approved Level 3 reveals in each direction
+    a_revealed_to_b = db.execute(
+        """SELECT COUNT(*) as c FROM reveal_consents
+           WHERE team_id = ? AND level = 3 AND status = 'approved'
+             AND approver_id = ? AND requester_id = ?""",
+        (team_id, member_a["user_id"], member_b["user_id"])
+    ).fetchone()["c"]  # A approved B's request → A revealed to B
+
+    b_revealed_to_a = db.execute(
+        """SELECT COUNT(*) as c FROM reveal_consents
+           WHERE team_id = ? AND level = 3 AND status = 'approved'
+             AND approver_id = ? AND requester_id = ?""",
+        (team_id, member_b["user_id"], member_a["user_id"])
+    ).fetchone()["c"]  # B approved A's request → B revealed to A
+
+    total_reveals = a_revealed_to_b + b_revealed_to_a
+    bilateral = a_revealed_to_b > 0 and b_revealed_to_a > 0
+    unilateral_a = a_revealed_to_b > 0 and b_revealed_to_a == 0  # A revealed, B didn't
+    unilateral_b = b_revealed_to_a > 0 and a_revealed_to_b == 0  # B revealed, A didn't
+
+    if bilateral:
+        reveal_state = "bilateral"
+    elif unilateral_a:
+        reveal_state = "unilateral_a"
+    elif unilateral_b:
+        reveal_state = "unilateral_b"
+    else:
+        reveal_state = "none"
+
+    # Count resolved tickets per member
+    tickets_a = db.execute(
+        """SELECT COUNT(*) as c FROM team_tickets
+           WHERE team_id = ? AND resolved_by = ? AND status = 'resolved'""",
+        (team_id, member_a["user_id"])
+    ).fetchone()["c"]
+
+    tickets_b = db.execute(
+        """SELECT COUNT(*) as c FROM team_tickets
+           WHERE team_id = ? AND resolved_by = ? AND status = 'resolved'""",
+        (team_id, member_b["user_id"])
+    ).fetchone()["c"]
+
+    ticket_balance = {
+        member_a["pseudonym"]: tickets_a,
+        member_b["pseudonym"]: tickets_b,
+    }
+
+    # RULE 5: Team >30 days with no reveals → time-limited
+    if total_reveals == 0:
+        team_row = db.execute("SELECT created_at FROM teams WHERE id = ?", (team_id,)).fetchone()
+        if team_row:
+            created = team_row["created_at"]
+            age_days_row = db.execute(
+                "SELECT julianday('now') - julianday(?) as age", (created,)
+            ).fetchone()
+            if age_days_row and age_days_row["age"] is not None and age_days_row["age"] > LICENSE_STALE_DAYS:
+                return {
+                    "license_type": "time-limited",
+                    "contribution_split": {
+                        member_a["pseudonym"]: 0,
+                        member_b["pseudonym"]: 0,
+                    },
+                    "rationale": (
+                        f"Team is {int(age_days_row['age'])} days old with no Level 3 reveals. "
+                        "Collaboration has not progressed to active sharing."
+                    ),
+                    "terms": LICENSE_TERMS["time-limited"],
+                    "reveal_state": reveal_state,
+                    "ticket_balance": ticket_balance,
+                }
+
+    # RULE 1: No approved reveals → joint-equal (default)
+    if total_reveals == 0:
+        return {
+            "license_type": "joint-equal",
+            "contribution_split": {
+                member_a["pseudonym"]: 50,
+                member_b["pseudonym"]: 50,
+            },
+            "rationale": "Pre-collaboration: no Level 3 reveals yet. Default equal co-authorship.",
+            "terms": LICENSE_TERMS["joint-equal"],
+            "reveal_state": reveal_state,
+            "ticket_balance": ticket_balance,
+        }
+
+    # RULE 2: Unilateral reveals → advisory-only
+    if unilateral_a or unilateral_b:
+        if unilateral_a:
+            owner_pseudo = member_a["pseudonym"]
+            advisor_pseudo = member_b["pseudonym"]
+        else:
+            owner_pseudo = member_b["pseudonym"]
+            advisor_pseudo = member_a["pseudonym"]
+        return {
+            "license_type": "advisory-only",
+            "contribution_split": {
+                owner_pseudo: 100,
+                advisor_pseudo: 0,
+            },
+            "rationale": (
+                f"{owner_pseudo} has revealed content but {advisor_pseudo} has not. "
+                "One-sided consultation — advisor receives acknowledgment only."
+            ),
+            "terms": LICENSE_TERMS["advisory-only"],
+            "reveal_state": reveal_state,
+            "ticket_balance": ticket_balance,
+        }
+
+    # Bilateral reveals — check ticket balance
+    total_tickets = tickets_a + tickets_b
+
+    # RULE 3: Bilateral + balanced tickets → joint-equal
+    if total_tickets == 0:
+        return {
+            "license_type": "joint-equal",
+            "contribution_split": {
+                member_a["pseudonym"]: 50,
+                member_b["pseudonym"]: 50,
+            },
+            "rationale": "Bilateral reveals with no resolved tickets yet. Equal co-authorship.",
+            "terms": LICENSE_TERMS["joint-equal"],
+            "reveal_state": reveal_state,
+            "ticket_balance": ticket_balance,
+        }
+
+    ratio = max(tickets_a, tickets_b) / min(tickets_a, tickets_b) if min(tickets_a, tickets_b) > 0 else float("inf")
+
+    if ratio < 2.0:
+        # RULE 3: Balanced
+        return {
+            "license_type": "joint-equal",
+            "contribution_split": {
+                member_a["pseudonym"]: 50,
+                member_b["pseudonym"]: 50,
+            },
+            "rationale": (
+                f"Bilateral reveals with balanced ticket resolution "
+                f"({tickets_a}:{tickets_b} ratio = {ratio:.1f}x)."
+            ),
+            "terms": LICENSE_TERMS["joint-equal"],
+            "reveal_state": reveal_state,
+            "ticket_balance": ticket_balance,
+        }
+
+    # RULE 4: Bilateral + asymmetric → joint-weighted
+    ratio_a = tickets_a / total_tickets
+    ratio_b = tickets_b / total_tickets
+    split_a = max(0.25, min(0.75, ratio_a))
+    split_b = 1.0 - split_a
+
+    return {
+        "license_type": "joint-weighted",
+        "contribution_split": {
+            member_a["pseudonym"]: round(split_a * 100),
+            member_b["pseudonym"]: round(split_b * 100),
+        },
+        "rationale": (
+            f"Bilateral reveals with asymmetric ticket resolution "
+            f"({tickets_a}:{tickets_b} ratio = {ratio:.1f}x). "
+            f"Weighted split with 25% floor for lesser contributor."
+        ),
+        "terms": LICENSE_TERMS["joint-weighted"],
+        "reveal_state": reveal_state,
+        "ticket_balance": ticket_balance,
+    }
 
 
 # =============================================================================
@@ -2809,6 +3048,28 @@ async def research_match_needs_resolve(params: NeedsResolveInput, ctx=None) -> s
             db.execute("UPDATE users SET running_effort = ? WHERE id = ?", (new_effort, user["id"]))
         effort_boosted = True
 
+    # NEED-03: Recalculate license after ticket resolution (only if bilateral reveals exist)
+    license_update = None
+    if params.resolution == "resolved":
+        lic = _compute_license(db, ticket["team_id"])
+        current_type = db.execute("SELECT license_type FROM teams WHERE id = ?",
+                                  (ticket["team_id"],)).fetchone()["license_type"]
+        if lic["license_type"] != current_type:
+            db.execute("UPDATE teams SET license_type = ?, license_updated_at = datetime('now') WHERE id = ?",
+                       (lic["license_type"], ticket["team_id"]))
+            for m_row in db.execute(
+                "SELECT tm.user_id, u.pseudonym FROM team_members tm JOIN users u ON tm.user_id = u.id WHERE tm.team_id = ?",
+                (ticket["team_id"],)
+            ).fetchall():
+                pct = lic["contribution_split"].get(m_row["pseudonym"], 0)
+                db.execute("UPDATE team_members SET contribution_percentage = ? WHERE team_id = ? AND user_id = ?",
+                           (pct, ticket["team_id"], m_row["user_id"]))
+            _write_audit_log(db, ticket["team_id"], user["id"], "license_generated",
+                             resource_ref=ticket["team_id"],
+                             details={"old_type": current_type, "new_type": lic["license_type"],
+                                      "trigger": "ticket_resolved"})
+        license_update = {"license_type": lic["license_type"], "changed": lic["license_type"] != current_type}
+
     db.commit()
 
     result = {
@@ -2821,6 +3082,8 @@ async def research_match_needs_resolve(params: NeedsResolveInput, ctx=None) -> s
         result["resolution_note"] = params.resolution_note
     if effort_boosted:
         result["reputation_impact"] = f"+{TICKET_EFFORT_BONUS} effort boost for resolving a {ticket['type']} ticket"
+    if license_update:
+        result["license_update"] = license_update
     result["next_step"] = "Use research_match_needs_list to see updated ticket board, or research_match_rate_user to rate your collaborator."
 
     return json.dumps(result, indent=2)
@@ -3022,6 +3285,30 @@ async def research_match_reveal_respond(params: RevealRespondInput, ctx=None) ->
                      resource_ref=consent["resource_ref"],
                      details={"consent_id": params.consent_id, "level": consent["level"],
                               "requester_id": consent["requester_id"]})
+
+    # NEED-03: Recalculate license after reveal approval
+    license_update = None
+    if params.approve:
+        lic = _compute_license(db, consent["team_id"])
+        current_type = db.execute("SELECT license_type FROM teams WHERE id = ?",
+                                  (consent["team_id"],)).fetchone()["license_type"]
+        if lic["license_type"] != current_type:
+            db.execute("UPDATE teams SET license_type = ?, license_updated_at = datetime('now') WHERE id = ?",
+                       (lic["license_type"], consent["team_id"]))
+            # Update contribution percentages
+            for m_row in db.execute(
+                "SELECT tm.user_id, u.pseudonym FROM team_members tm JOIN users u ON tm.user_id = u.id WHERE tm.team_id = ?",
+                (consent["team_id"],)
+            ).fetchall():
+                pct = lic["contribution_split"].get(m_row["pseudonym"], 0)
+                db.execute("UPDATE team_members SET contribution_percentage = ? WHERE team_id = ? AND user_id = ?",
+                           (pct, consent["team_id"], m_row["user_id"]))
+            _write_audit_log(db, consent["team_id"], user["id"], "license_generated",
+                             resource_ref=consent["team_id"],
+                             details={"old_type": current_type, "new_type": lic["license_type"],
+                                      "trigger": "reveal_approved"})
+        license_update = {"license_type": lic["license_type"], "changed": lic["license_type"] != current_type}
+
     db.commit()
 
     requester = db.execute("SELECT pseudonym FROM users WHERE id = ?", (consent["requester_id"],)).fetchone()
@@ -3032,6 +3319,9 @@ async def research_match_reveal_respond(params: RevealRespondInput, ctx=None) ->
         "decision": new_status,
         "requester_pseudonym": requester["pseudonym"] if requester else consent["requester_id"],
     }
+
+    if license_update:
+        result["license_update"] = license_update
 
     if params.approve:
         result["message"] = (
@@ -3198,6 +3488,132 @@ async def research_match_reveal_status(params: RevealStatusInput, ctx=None) -> s
     else:
         result["tip"] = "Use research_match_rate_user to rate your collaborator after reviewing their work."
 
+    return json.dumps(result, indent=2)
+
+
+# =============================================================================
+# LICENSE TOOL (NEED-03 — Automatic Licensing)
+# =============================================================================
+
+@mcp.tool(
+    name="research_match_team_license",
+    description=(
+        "POST-TEAM STEP — View the automatically computed license for your team. "
+        "The license type is determined by collaboration activity: reveals (who shared what), "
+        "ticket resolution balance (who contributed more), and team age. "
+        "Types: joint-equal (50/50 co-authorship), joint-weighted (proportional to contributions), "
+        "advisory-only (one-sided consultation), time-limited (stale collaboration). "
+        "The license recalculates automatically — call anytime to see current terms. "
+        "Use after research_match_reveal_status to understand IP implications."
+    ),
+    annotations={
+        "title": "Team License",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+@_log_tool_call
+async def research_match_team_license(params: TeamLicenseInput, ctx=None) -> str:
+    """View and recalculate the automatic license for a team.
+
+    Args:
+        params (TeamLicenseInput): Query data:
+            - team_id (str, required): Team to view license for
+
+    Returns:
+        str: JSON with license type, contribution split, rationale, terms, and history
+    """
+    db = _get_db(ctx)
+    user = _get_current_user(db)
+    if not user:
+        return json.dumps({"error": "No registered user found. Use research_match_register first."})
+
+    # Verify membership
+    membership = db.execute(
+        "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
+        (params.team_id, user["id"])
+    ).fetchone()
+    if not membership:
+        return json.dumps({"error": "You are not a member of this team."})
+
+    # Compute current license
+    license_info = _compute_license(db, params.team_id)
+
+    # Check if license changed from stored value
+    team = db.execute("SELECT license_type, license_updated_at FROM teams WHERE id = ?",
+                      (params.team_id,)).fetchone()
+    if not team:
+        return json.dumps({"error": "Team not found."})
+
+    current_type = team["license_type"]
+    changed = license_info["license_type"] != current_type
+
+    if changed:
+        # Update team license
+        db.execute(
+            "UPDATE teams SET license_type = ?, license_updated_at = datetime('now') WHERE id = ?",
+            (license_info["license_type"], params.team_id)
+        )
+        # Update contribution percentages for each member
+        for member_row in db.execute(
+            "SELECT tm.user_id, u.pseudonym FROM team_members tm JOIN users u ON tm.user_id = u.id WHERE tm.team_id = ?",
+            (params.team_id,)
+        ).fetchall():
+            pseudo = member_row["pseudonym"]
+            pct = license_info["contribution_split"].get(pseudo, 0)
+            db.execute(
+                "UPDATE team_members SET contribution_percentage = ? WHERE team_id = ? AND user_id = ?",
+                (pct, params.team_id, member_row["user_id"])
+            )
+        # Audit log
+        _write_audit_log(db, params.team_id, user["id"], "license_generated",
+                         resource_ref=params.team_id,
+                         details={"old_type": current_type,
+                                  "new_type": license_info["license_type"],
+                                  "trigger": "team_license_tool"})
+        db.commit()
+
+    # Fetch license change history
+    history = db.execute(
+        """SELECT details, created_at FROM audit_log
+           WHERE team_id = ? AND action = 'license_generated'
+           ORDER BY created_at DESC LIMIT 10""",
+        (params.team_id,)
+    ).fetchall()
+    change_history = []
+    for h in history:
+        hd = dict(h)
+        details = json.loads(hd["details"]) if hd["details"] else {}
+        change_history.append({
+            "timestamp": hd["created_at"],
+            "old_type": details.get("old_type"),
+            "new_type": details.get("new_type"),
+            "trigger": details.get("trigger"),
+        })
+
+    result = {
+        "status": "ok",
+        "team_id": params.team_id,
+        "license_type": license_info["license_type"],
+        "contribution_split": license_info["contribution_split"],
+        "rationale": license_info["rationale"],
+        "terms": license_info["terms"],
+        "reveal_state": license_info["reveal_state"],
+        "ticket_balance": license_info["ticket_balance"],
+        "changed_on_this_call": changed,
+    }
+    if changed:
+        result["previous_type"] = current_type
+    if change_history:
+        result["change_history"] = change_history
+
+    result["next_step"] = (
+        "License recalculates automatically as collaboration evolves. "
+        "Use research_match_reveal_request to share more content, or "
+        "research_match_needs_create to create tickets."
+    )
     return json.dumps(result, indent=2)
 
 
