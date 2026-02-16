@@ -2333,10 +2333,16 @@ async def research_match_cold_search(params: ColdSearchInput, ctx=None) -> str:
 # =============================================================================
 
 if __name__ == "__main__":
+    # Ensure DB schema exists before server starts (lifespan only runs on MCP connect)
+    _boot_db = init_database(DB_PATH)
+    _boot_db.close()
+    _logger.info("Database initialized at %s", DB_PATH)
+
     if "--http" in sys.argv:
         port_idx = sys.argv.index("--http") + 1
         port = int(sys.argv[port_idx]) if port_idx < len(sys.argv) else 8000
         mcp.settings.port = port
+        _logger.info("Starting streamable-http on port %d", port)
         mcp.run(transport="streamable-http")
     else:
         mcp.run()
