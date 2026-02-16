@@ -119,7 +119,7 @@ def _log_tool_call(func):
 # =============================================================================
 
 DB_PATH = os.environ.get("RESEARCH_MATCH_DB", "research_match.db")
-SERVER_VERSION = "2.4.0-collab-step1"
+SERVER_VERSION = "2.5.0-file-sharing"
 
 # Scoring weights for Theoretical Originality (OT)
 OT_WEIGHTS = {
@@ -182,6 +182,9 @@ MAX_TICKET_TITLE_LENGTH = 200
 MAX_TICKET_DESCRIPTION_LENGTH = 2000
 MAX_PENDING_REVEALS_PER_TEAM = 10
 LICENSE_STALE_DAYS = 30  # Days without reveal before team becomes "time-limited"
+MAX_SHARED_FILES_PER_TEAM = 50
+MAX_FILE_PATH_LENGTH = 500
+MAX_FILE_DESCRIPTION_LENGTH = 500
 
 LICENSE_TERMS = {
     "joint-equal": [
@@ -463,6 +466,7 @@ def init_database(db_path: str) -> sqlite3.Connection:
             shared_by TEXT NOT NULL REFERENCES users(id),
             file_path TEXT NOT NULL,
             file_hash TEXT,
+            description TEXT,
             origin_user_id TEXT NOT NULL REFERENCES users(id),
             shared_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
@@ -512,6 +516,12 @@ def init_database(db_path: str) -> sqlite3.Connection:
     # Migration: add license_updated_at to teams (NEED-03)
     try:
         conn.execute("ALTER TABLE teams ADD COLUMN license_updated_at TEXT")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+    # Migration: add description to shared_files (NEED-04)
+    try:
+        conn.execute("ALTER TABLE shared_files ADD COLUMN description TEXT")
     except sqlite3.OperationalError:
         pass  # Column already exists
 
@@ -1451,6 +1461,23 @@ class TeamLicenseInput(BaseModel):
     team_id: str = Field(..., description="Team to view license for")
 
 
+class ShareFileInput(BaseModel):
+    """Input for sharing a file metadata record with a team."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    team_id: str = Field(..., description="Team to share the file with")
+    file_path: str = Field(..., min_length=1, max_length=500, description="File path or name (e.g. 'scripts/analysis.py')")
+    file_hash: Optional[str] = Field(None, description="SHA-256 hash for integrity verification")
+    description: Optional[str] = Field(None, max_length=500, description="Brief description of the file content")
+
+
+class SharedFilesInput(BaseModel):
+    """Input for listing shared files in a team."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    team_id: str = Field(..., description="Team to list shared files for")
+
+
 # =============================================================================
 # LIFESPAN & SERVER INITIALIZATION
 # =============================================================================
@@ -1497,6 +1524,7 @@ def _health_stats() -> Dict[str, Any]:
         ratings = db.execute("SELECT COUNT(*) as c FROM ratings").fetchone()["c"]
         tickets = db.execute("SELECT COUNT(*) as c FROM team_tickets").fetchone()["c"]
         audit_entries = db.execute("SELECT COUNT(*) as c FROM audit_log").fetchone()["c"]
+        shared_files = db.execute("SELECT COUNT(*) as c FROM shared_files").fetchone()["c"]
         db.close()
         # Check embedding engine status
         try:
@@ -1520,6 +1548,7 @@ def _health_stats() -> Dict[str, Any]:
                 "pending_requests": pending_requests,
                 "ratings": ratings,
                 "tickets": tickets,
+                "shared_files": shared_files,
                 "audit_entries": audit_entries,
             },
         }
@@ -2418,7 +2447,8 @@ async def research_match_respond_request(params: RespondRequestInput, ctx=None) 
                 "(1) research_match_reveal_request to request Level 3 reveal of your teammate's full Research Commit, "
                 "(2) research_match_needs_create to create tickets (needs, offers, questions), "
                 "(3) research_match_needs_list to see the team board, "
-                "(4) research_match_needs_resolve to close tickets. "
+                "(4) research_match_needs_resolve to close tickets, "
+                "(5) After bilateral Level 3 reveals: research_match_share_file to share supporting files. "
                 "After collaborating, use research_match_rate_user to rate each other."
             ),
         }
@@ -3474,10 +3504,17 @@ async def research_match_reveal_status(params: RevealStatusInput, ctx=None) -> s
             "can_see_commits_of": [r["pseudonym"] for r in can_see],
         })
 
+    # Count shared files for Level 4 context
+    shared_files_count = db.execute(
+        "SELECT COUNT(*) as c FROM shared_files WHERE team_id = ?",
+        (params.team_id,)
+    ).fetchone()["c"]
+
     result = {
         "team_id": params.team_id,
         "summary": summary,
         "reveal_matrix": reveal_matrix,
+        "shared_files_count": shared_files_count,
         "consents": consents,
     }
 
@@ -3614,6 +3651,222 @@ async def research_match_team_license(params: TeamLicenseInput, ctx=None) -> str
         "Use research_match_reveal_request to share more content, or "
         "research_match_needs_create to create tickets."
     )
+    return json.dumps(result, indent=2)
+
+
+# =============================================================================
+# FILE SHARING TOOLS (NEED-04 — Level 4 Metadata Registry)
+# =============================================================================
+
+@mcp.tool(
+    name="research_match_share_file",
+    description=(
+        "POST-REVEAL STEP — Register a file for sharing with your team. "
+        "REQUIRES bilateral Level 3 reveals (both members must have approved reveals in BOTH directions). "
+        "This is a metadata registry: you provide file path, optional SHA-256 hash, and description. "
+        "Actual file content is exchanged out-of-band (email, repo, etc.). "
+        "Idempotent: sharing the same file_path twice returns the existing record. "
+        "Limit: 50 files per team. Use after research_match_reveal_status shows bilateral reveals."
+    ),
+    annotations={
+        "title": "Share File",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+@_log_tool_call
+async def research_match_share_file(params: ShareFileInput, ctx=None) -> str:
+    """Register a file metadata record for sharing with a team.
+
+    Args:
+        params (ShareFileInput): File data:
+            - team_id (str, required): Team to share with
+            - file_path (str, required): Path or name of the file
+            - file_hash (Optional[str]): SHA-256 hash for integrity
+            - description (Optional[str]): Brief description
+
+    Returns:
+        str: JSON with status, file_id, and next steps
+    """
+    db = _get_db(ctx)
+    user = _get_current_user(db)
+    if not user:
+        return json.dumps({"error": "No registered user found. Use research_match_register first."})
+
+    # Verify membership
+    membership = db.execute(
+        "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
+        (params.team_id, user["id"])
+    ).fetchone()
+    if not membership:
+        return json.dumps({"error": "You are not a member of this team."})
+
+    # Bilateral Level 3 gate: both members must have approved reveals in EACH direction
+    members = db.execute(
+        "SELECT user_id FROM team_members WHERE team_id = ?",
+        (params.team_id,)
+    ).fetchall()
+    member_ids = [m["user_id"] for m in members]
+
+    for m_id in member_ids:
+        other_ids = [o for o in member_ids if o != m_id]
+        for other_id in other_ids:
+            # m_id approved a reveal for other_id (other_id requested, m_id approved)
+            consent = db.execute(
+                """SELECT id FROM reveal_consents
+                   WHERE team_id = ? AND level = 3 AND requester_id = ? AND approver_id = ?
+                   AND status = 'approved'""",
+                (params.team_id, other_id, m_id)
+            ).fetchone()
+            if not consent:
+                return json.dumps({
+                    "error": "Bilateral Level 3 reveals required. Both members must have approved reveals in both directions.",
+                    "tip": "Use research_match_reveal_request and research_match_reveal_respond first."
+                })
+
+    # Check file limit
+    file_count = db.execute(
+        "SELECT COUNT(*) as c FROM shared_files WHERE team_id = ?",
+        (params.team_id,)
+    ).fetchone()["c"]
+    if file_count >= MAX_SHARED_FILES_PER_TEAM:
+        return json.dumps({
+            "error": f"File limit reached ({MAX_SHARED_FILES_PER_TEAM} files per team).",
+            "tip": "Remove old files or use a shared repository for large collections."
+        })
+
+    # Dedup: check (team_id, shared_by, file_path)
+    existing = db.execute(
+        "SELECT id FROM shared_files WHERE team_id = ? AND shared_by = ? AND file_path = ?",
+        (params.team_id, user["id"], params.file_path)
+    ).fetchone()
+    if existing:
+        return json.dumps({
+            "status": "already_shared",
+            "file_id": existing["id"],
+            "file_path": params.file_path,
+            "team_id": params.team_id,
+            "message": "This file was already shared. Use research_match_shared_files to see all files."
+        })
+
+    # Insert new file record
+    file_id = str(uuid.uuid4())
+    db.execute(
+        """INSERT INTO shared_files (id, team_id, shared_by, file_path, file_hash, description, origin_user_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (file_id, params.team_id, user["id"], params.file_path,
+         params.file_hash, params.description, user["id"])
+    )
+
+    # Audit log
+    _write_audit_log(db, params.team_id, user["id"], "file_shared",
+                     resource_ref=file_id,
+                     details={"file_path": params.file_path,
+                              "file_hash": params.file_hash,
+                              "description": params.description})
+    db.commit()
+
+    return json.dumps({
+        "status": "ok",
+        "file_id": file_id,
+        "file_path": params.file_path,
+        "team_id": params.team_id,
+        "message": "File registered successfully. Share the actual content out-of-band (email, repo, etc.).",
+        "next_steps": [
+            "Share the file content directly with your teammate (email, shared drive, git repo).",
+            "Use research_match_shared_files to see all shared files in the team.",
+            "Use research_match_needs_create if you need help with the shared content."
+        ]
+    }, indent=2)
+
+
+@mcp.tool(
+    name="research_match_shared_files",
+    description=(
+        "POST-REVEAL STEP — List all shared file records in a team. "
+        "Shows file path, hash, description, who shared it, and when. "
+        "Includes is_yours flag and by_member summary for quick overview. "
+        "Use after research_match_share_file to see the complete file registry."
+    ),
+    annotations={
+        "title": "Shared Files",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+@_log_tool_call
+async def research_match_shared_files(params: SharedFilesInput, ctx=None) -> str:
+    """List all shared file records for a team.
+
+    Args:
+        params (SharedFilesInput): Query data:
+            - team_id (str, required): Team to list files for
+
+    Returns:
+        str: JSON with files list, by_member summary, and tips
+    """
+    db = _get_db(ctx)
+    user = _get_current_user(db)
+    if not user:
+        return json.dumps({"error": "No registered user found. Use research_match_register first."})
+
+    # Verify membership
+    membership = db.execute(
+        "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
+        (params.team_id, user["id"])
+    ).fetchone()
+    if not membership:
+        return json.dumps({"error": "You are not a member of this team."})
+
+    # Fetch shared files with pseudonyms
+    rows = db.execute(
+        """SELECT sf.*, u.pseudonym AS shared_by_pseudonym
+           FROM shared_files sf
+           JOIN users u ON sf.shared_by = u.id
+           WHERE sf.team_id = ?
+           ORDER BY sf.shared_at DESC""",
+        (params.team_id,)
+    ).fetchall()
+
+    files = []
+    by_member = {}
+    for row in rows:
+        r = dict(row)
+        pseudo = r["shared_by_pseudonym"]
+        by_member[pseudo] = by_member.get(pseudo, 0) + 1
+        files.append({
+            "file_id": r["id"],
+            "file_path": r["file_path"],
+            "file_hash": r["file_hash"],
+            "description": r["description"],
+            "shared_by": pseudo,
+            "is_yours": r["shared_by"] == user["id"],
+            "shared_at": r["shared_at"],
+        })
+
+    # Audit log for file access (only if there are files)
+    if files:
+        _write_audit_log(db, params.team_id, user["id"], "file_accessed",
+                         resource_ref=params.team_id,
+                         details={"file_count": len(files)})
+        db.commit()
+
+    result = {
+        "team_id": params.team_id,
+        "total_files": len(files),
+        "by_member": by_member,
+        "files": files,
+    }
+
+    if not files:
+        result["tip"] = "No files shared yet. Use research_match_share_file to register a file."
+    else:
+        result["tip"] = "Files are metadata records. Exchange actual content out-of-band (email, repo, etc.)."
+
     return json.dumps(result, indent=2)
 
 
