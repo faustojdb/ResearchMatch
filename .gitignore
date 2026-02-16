@@ -26,5 +26,9 @@ Thumbs.db
 *.pem
 *.key
 
+# Build artifacts
+*.dxt
+*.zip
+
 # Reference repos (cloned for analysis, not part of project)
 research_refs/
