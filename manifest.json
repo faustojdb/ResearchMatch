@@ -1,0 +1,100 @@
+{
+  "dxt_version": "0.1",
+  "name": "research-match",
+  "version": "2.3.0",
+  "description": "MCP server that connects isolated researchers via AI originality scoring and bilateral matching.",
+  "long_description": "Research Match is an MCP server that helps researchers find complementary collaborators while protecting intellectual property. It uses AI-powered originality scoring on two independent axes (Theoretical Originality and Formal-Computational Originality) and bilateral matching with a semaphore system (GREEN/YELLOW/RED) that shows each researcher what they gain from a potential collaboration.\n\n**KEY FEATURES**\n- **AI Originality Scoring**: Dual-axis evaluation (OT/OFC) with solidity multipliers (proven, functional, speculative, adhoc, cherry_picked)\n- **Bilateral Matching**: Complementarity-based matching with perspective-aware reasoning — each side sees gains from their own viewpoint\n- **Privacy by Design**: Emails are SHA-256 hashed, pseudonymous identities, no raw content shared until collaboration is accepted\n- **Reputation System**: Anti-retaliation ratings (anonymous until both rate), exponential smoothing, honesty-weighted\n- **Cold Search**: Free search across internal DB and GitHub — no registration required\n- **Semantic Similarity**: sentence-transformers embeddings with Jaccard fallback\n\n**MINIMUM REQUIREMENTS**\n- Python 3.12 or higher\n- UV Package Manager\nThis MCP server requires UV, a fast Python package manager.\nInstallation:\n`curl -LsSf https://astral.sh/uv/install.sh | sh`\nFor detailed installation instructions, [see the UV documentation](https://github.com/astral-sh/uv)",
+  "author": {
+    "name": "faustojdb",
+    "url": "https://github.com/faustojdb"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/faustojdb/ResearchMatch"
+  },
+  "homepage": "https://github.com/faustojdb/ResearchMatch",
+  "documentation": "https://github.com/faustojdb/ResearchMatch",
+  "icon": "assets/icon.png",
+  "server": {
+    "type": "python",
+    "entry_point": "./src/research_match_server.py",
+    "mcp_config": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "${__dirname}",
+        "run",
+        "research-match"
+      ],
+      "env": {
+        "RESEARCH_MATCH_DB": "${user_config.database_path}"
+      }
+    }
+  },
+  "user_config": {
+    "database_path": {
+      "type": "string",
+      "title": "Database Path",
+      "description": "Path to the SQLite database file. Leave empty to use the default (research_match.db in the extension directory).",
+      "required": false,
+      "default": ""
+    }
+  },
+  "tools": [
+    {
+      "name": "research_match_register",
+      "description": "STEP 1 — Register with a pseudonymous identity. Email is SHA-256 hashed and never stored in plain text. Idempotent: safe to call multiple times."
+    },
+    {
+      "name": "research_match_analyze_work",
+      "description": "HELPER — Get the Research Commit template before submitting. Returns structured template with all fields and solidity guide."
+    },
+    {
+      "name": "research_match_submit_commit",
+      "description": "STEP 2 — Submit a structured Research Commit for AI originality evaluation on two axes: Theoretical Originality (OT) and Formal-Computational Originality (OFC)."
+    },
+    {
+      "name": "research_match_my_profile",
+      "description": "View your Research Match profile: reputation, scores, commit history, and team memberships."
+    },
+    {
+      "name": "research_match_find_collaborators",
+      "description": "STEP 3 — Find researchers with complementary skills. Returns candidates with bilateral semaphore (GREEN/YELLOW/RED) and perspective-aware reasoning."
+    },
+    {
+      "name": "research_match_send_request",
+      "description": "STEP 4 — Send a collaboration request to a matched researcher. The recipient sees scores from their own perspective."
+    },
+    {
+      "name": "research_match_inbox",
+      "description": "View all collaboration requests — incoming and outgoing — with semaphore, scores, and status."
+    },
+    {
+      "name": "research_match_respond_request",
+      "description": "Accept or reject an incoming collaboration request. Acceptance creates a team with joint-equal licensing (50/50)."
+    },
+    {
+      "name": "research_match_rate_user",
+      "description": "Rate a collaborator on honesty, quality, and effort (1-5 each). Ratings are anonymous until both members rate."
+    },
+    {
+      "name": "research_match_cold_search",
+      "description": "FREE cold search — no registration required. Searches internal DB and GitHub for research topics."
+    }
+  ],
+  "keywords": [
+    "research",
+    "collaboration",
+    "matching",
+    "originality",
+    "mcp",
+    "ai"
+  ],
+  "compatibility": {
+    "platforms": ["win32", "linux", "darwin"],
+    "runtimes": {
+      "python": ">=3.12"
+    }
+  },
+  "license": "MIT"
+}

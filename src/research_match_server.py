@@ -2332,7 +2332,8 @@ async def research_match_cold_search(params: ColdSearchInput, ctx=None) -> str:
 # ENTRY POINT
 # =============================================================================
 
-if __name__ == "__main__":
+def main():
+    """Entry point for `uv run research-match` and direct execution."""
     # Ensure DB schema exists before server starts (lifespan only runs on MCP connect)
     _boot_db = init_database(DB_PATH)
     _boot_db.close()
@@ -2346,3 +2347,7 @@ if __name__ == "__main__":
         mcp.run(transport="streamable-http")
     else:
         mcp.run()
+
+
+if __name__ == "__main__":
+    main()
