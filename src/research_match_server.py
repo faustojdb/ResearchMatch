@@ -122,7 +122,7 @@ def _log_tool_call(func):
 # =============================================================================
 
 DB_PATH = os.environ.get("RESEARCH_MATCH_DB", "research_match.db")
-SERVER_VERSION = "2.7.0-proforma"
+SERVER_VERSION = "2.8.0-contracts"
 
 # Scoring weights for Theoretical Originality (OT)
 OT_WEIGHTS = {
@@ -198,6 +198,13 @@ MAX_FILE_READ_CHARS = 8000              # max chars per file in prompt context
 MAX_PROMPT_TOTAL_CHARS = 25000          # total prompt size cap
 MAX_KEY_FILES = 6                       # max files included in prompt
 NARRATIVE_JSON_MAX_LENGTH = 20000       # max length of narrative_json input
+
+# Contract constants (NEED-08)
+CONTRACT_VERSION = "1.0"
+CONTRACT_DIR_NAME = ".research-match"
+CONTRACT_FILE_PREFIX = "CONTRACT_"
+GIT_COMMIT_HASH_PATTERN = r'^[0-9a-f]{40}$'
+MAX_CONTRACT_CONFIRMATIONS_PER_TEAM = 20
 
 LICENSE_TERMS = {
     "joint-equal": [
@@ -499,6 +506,30 @@ def init_database(db_path: str) -> sqlite3.Connection:
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
+        -- Collaboration contracts (NEED-08)
+        CREATE TABLE IF NOT EXISTS collaboration_contracts (
+            id TEXT PRIMARY KEY,
+            team_id TEXT NOT NULL REFERENCES teams(id),
+            contract_version INTEGER NOT NULL DEFAULT 1,
+            license_type TEXT NOT NULL,
+            contribution_split TEXT NOT NULL,
+            contract_content TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            generated_by TEXT NOT NULL REFERENCES users(id),
+            generated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            confirmation_a_user_id TEXT REFERENCES users(id),
+            confirmation_a_git_hash TEXT,
+            confirmation_a_repo_url TEXT,
+            confirmation_a_at TEXT,
+            confirmation_b_user_id TEXT REFERENCES users(id),
+            confirmation_b_git_hash TEXT,
+            confirmation_b_repo_url TEXT,
+            confirmation_b_at TEXT,
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK(status IN ('pending', 'partial', 'confirmed', 'superseded')),
+            UNIQUE(team_id, contract_version)
+        );
+
         -- Original indexes
         CREATE INDEX IF NOT EXISTS idx_commits_user ON research_commits(user_id);
         CREATE INDEX IF NOT EXISTS idx_commits_domain ON research_commits(domain, subdomain);
@@ -515,6 +546,7 @@ def init_database(db_path: str) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_shared_files_origin ON shared_files(origin_user_id);
         CREATE INDEX IF NOT EXISTS idx_audit_team ON audit_log(team_id);
         CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log(actor_id);
+        CREATE INDEX IF NOT EXISTS idx_contracts_team ON collaboration_contracts(team_id, status);
     """)
 
     conn.commit()
@@ -537,6 +569,13 @@ def init_database(db_path: str) -> sqlite3.Connection:
         conn.execute("ALTER TABLE shared_files ADD COLUMN description TEXT")
     except sqlite3.OperationalError:
         pass  # Column already exists
+
+    # Migration: add git refs to research_commits (NEED-08)
+    for col in ("git_repo_url TEXT", "git_commit_hash TEXT"):
+        try:
+            conn.execute(f"ALTER TABLE research_commits ADD COLUMN {col}")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
 
     conn.commit()
 
@@ -1326,6 +1365,19 @@ class SubmitCommitInput(BaseModel):
         description="Overall solidity if not specifying per-component: proven, functional, speculative, adhoc, cherry_picked"
     )
 
+    # Git references (NEED-08)
+    git_repo_url: Optional[str] = Field(None, description="Repository URL where this work lives", max_length=500)
+    git_commit_hash: Optional[str] = Field(None, description="Git commit SHA-1 hash (40-char hex)", max_length=40)
+
+    @field_validator("git_commit_hash")
+    @classmethod
+    def validate_git_commit_hash(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            import re
+            if not re.match(GIT_COMMIT_HASH_PATTERN, v):
+                raise ValueError("git_commit_hash must be a 40-character lowercase hex string")
+        return v
+
 
 class FindCollaboratorsInput(BaseModel):
     """Input for finding potential collaborators."""
@@ -1476,6 +1528,33 @@ class PrepareCommitInput(BaseModel):
                 v = v[:-4]
             if not re.match(r"^https?://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", v):
                 raise ValueError("Only GitHub URLs accepted. Format: https://github.com/owner/repo")
+        return v
+
+
+# --- Contract Models (NEED-08) ---
+
+class ExportContractInput(BaseModel):
+    """Input for generating a git-verifiable collaboration contract."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    team_id: str = Field(..., description="ID of the team to generate a contract for")
+
+
+class ConfirmContractInput(BaseModel):
+    """Input for confirming a contract has been committed to git."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    team_id: str = Field(..., description="ID of the team")
+    contract_id: str = Field(..., description="Contract ID from export_contract")
+    git_commit_hash: str = Field(..., description="Git commit SHA-1 hash (40-char hex)", max_length=40)
+    repo_url: Optional[str] = Field(None, description="Repository URL where contract was committed", max_length=500)
+
+    @field_validator("git_commit_hash")
+    @classmethod
+    def validate_git_commit_hash(cls, v: str) -> str:
+        import re
+        if not re.match(GIT_COMMIT_HASH_PATTERN, v):
+            raise ValueError("git_commit_hash must be a 40-character lowercase hex string")
         return v
 
 
@@ -1648,6 +1727,7 @@ def _health_stats() -> Dict[str, Any]:
         tickets = db.execute("SELECT COUNT(*) as c FROM team_tickets").fetchone()["c"]
         audit_entries = db.execute("SELECT COUNT(*) as c FROM audit_log").fetchone()["c"]
         shared_files = db.execute("SELECT COUNT(*) as c FROM shared_files").fetchone()["c"]
+        contracts = db.execute("SELECT COUNT(*) as c FROM collaboration_contracts WHERE status = 'confirmed'").fetchone()["c"]
         db.close()
         # Check embedding engine status
         try:
@@ -1672,6 +1752,7 @@ def _health_stats() -> Dict[str, Any]:
                 "ratings": ratings,
                 "tickets": tickets,
                 "shared_files": shared_files,
+                "contracts": contracts,
                 "audit_entries": audit_entries,
             },
         }
@@ -1792,6 +1873,129 @@ def _check_resharing_violation(db: sqlite3.Connection, user_id: str,
             "file_path": row["file_path"],
         }
     return None
+
+
+# --- Contract Helpers (NEED-08) ---
+
+def _generate_contract_content(db: sqlite3.Connection, team_id: str,
+                                license_info: dict, contract_version: int) -> str:
+    """Generate a human-readable markdown collaboration contract.
+
+    Includes both parties, their latest commits with scores, license terms,
+    contribution split, reveal state, and verification instructions.
+    """
+    team = db.execute("SELECT * FROM teams WHERE id = ?", (team_id,)).fetchone()
+    team_name = team["name"] if team else f"team-{team_id[:8]}"
+
+    members = db.execute(
+        """SELECT tm.user_id, tm.role, tm.contribution_percentage, tm.joined_at,
+                  u.pseudonym, u.reputation_score
+           FROM team_members tm JOIN users u ON tm.user_id = u.id
+           WHERE tm.team_id = ?""",
+        (team_id,)
+    ).fetchall()
+
+    now = datetime.now(timezone.utc).isoformat()
+    contract_id = f"{team_id[:8]}-v{contract_version}"
+    license_type = license_info["license_type"]
+
+    lines = [
+        "# Research Match Collaboration Contract",
+        "",
+        f"**Contract ID:** `{contract_id}`",
+        f"**Team:** `{team_name}` (`{team_id}`)",
+        f"**Generated:** {now}",
+        f"**Contract Version:** {contract_version}",
+        f"**Format Version:** {CONTRACT_VERSION}",
+        f"**License Type:** {license_type}",
+        "",
+        "## Parties",
+        "",
+    ]
+
+    for m in members:
+        m = dict(m)
+        pseudo = m["pseudonym"]
+        role = m["role"] or "contributor"
+        pct = m["contribution_percentage"]
+        pct_str = f"{pct:.0f}%" if pct is not None else "TBD"
+        joined = m["joined_at"] or "unknown"
+        rep = m["reputation_score"] or 100.0
+
+        lines.append(f"### {pseudo}")
+        lines.append(f"- **Role:** {role}")
+        lines.append(f"- **Contribution:** {pct_str}")
+        lines.append(f"- **Joined:** {joined}")
+        lines.append(f"- **Reputation:** {rep:.1f}")
+
+        # Latest commit
+        commit = db.execute(
+            """SELECT id, version, domain, problem, content_hash,
+                      ot_score, ofc_score, overall_solidity,
+                      git_repo_url, git_commit_hash
+               FROM research_commits WHERE user_id = ?
+               ORDER BY version DESC LIMIT 1""",
+            (m["user_id"],)
+        ).fetchone()
+
+        if commit:
+            c = dict(commit)
+            lines.append(f"- **Latest Commit:** `{c['id'][:12]}...` (v{c['version']})")
+            lines.append(f"  - Domain: {c['domain']}")
+            lines.append(f"  - Problem: {c['problem'][:80]}{'...' if len(c['problem'] or '') > 80 else ''}")
+            lines.append(f"  - Content Hash: `{c['content_hash'][:16]}...`")
+            lines.append(f"  - OT: {c['ot_score']:.1f}% / OFC: {c['ofc_score']:.1f}%")
+            lines.append(f"  - Solidity: {c['overall_solidity']}")
+            if c["git_repo_url"]:
+                lines.append(f"  - Git Repo: {c['git_repo_url']}")
+            if c["git_commit_hash"]:
+                lines.append(f"  - Git Ref: `{c['git_commit_hash']}`")
+        else:
+            lines.append("- **Latest Commit:** none")
+
+        lines.append("")
+
+    # License Terms
+    terms = license_info.get("terms", LICENSE_TERMS.get(license_type, []))
+    rationale = license_info.get("rationale", "")
+
+    lines.append("## License Terms")
+    lines.append("")
+    lines.append(f"**Type:** {license_type}")
+    lines.append(f"**Rationale:** {rationale}")
+    lines.append("")
+    for i, term in enumerate(terms, 1):
+        lines.append(f"{i}. {term}")
+    lines.append("")
+
+    # Contribution Split
+    split = license_info.get("contribution_split", {})
+    lines.append("## Contribution Split")
+    lines.append("")
+    for name, pct in split.items():
+        lines.append(f"- **{name}:** {pct:.0f}%")
+    lines.append("")
+
+    # Collaboration State
+    reveal_state = license_info.get("reveal_state", "none")
+    ticket_balance = license_info.get("ticket_balance", {})
+
+    lines.append("## Collaboration State")
+    lines.append("")
+    lines.append(f"- **Reveal State:** {reveal_state}")
+    lines.append(f"- **Tickets Resolved:** {json.dumps(ticket_balance)}")
+    lines.append("")
+
+    # Verification
+    lines.append("## Verification")
+    lines.append("")
+    lines.append("This contract is valid when committed to BOTH parties' git repositories.")
+    lines.append("Deletion of this file is tracked by git history and constitutes breach.")
+    lines.append("")
+    lines.append("---")
+    lines.append(f"*Generated by Research Match v{SERVER_VERSION}*")
+
+    return "\n".join(lines)
 
 
 # --- Deep Search Helpers ---
@@ -2540,8 +2744,8 @@ async def research_match_submit_commit(params: SubmitCommitInput, ctx=None) -> s
          code_languages, adhoc_summary, adhoc_connections, cherry_picking,
          solidity_levels, overall_solidity,
          content_hash, ot_score, ofc_score, ot_breakdown, ofc_breakdown,
-         solidity_impact)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         solidity_impact, git_repo_url, git_commit_hash)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         commit_id, user_id, version,
         params.domain, params.subdomain, params.problem, params.hypothesis,
@@ -2554,10 +2758,11 @@ async def research_match_submit_commit(params: SubmitCommitInput, ctx=None) -> s
         scores["ot_score"], scores["ofc_score"],
         json.dumps(scores["ot_breakdown"]), json.dumps(scores["ofc_breakdown"]),
         json.dumps(scores["solidity_impact"]),
+        params.git_repo_url, params.git_commit_hash,
     ))
     db.commit()
 
-    return json.dumps({
+    result = {
         "status": "evaluated",
         "commit_id": commit_id,
         "version": version,
@@ -2579,7 +2784,12 @@ async def research_match_submit_commit(params: SubmitCommitInput, ctx=None) -> s
         },
         "profile_summary": f"OT: {scores['ot_score']}% / OFC: {scores['ofc_score']}% (solidity: {overall_sol})",
         "message": "Your Research Commit has been evaluated. Solidity levels affect score confidence. Honest declaration builds your reputation over time."
-    }, indent=2)
+    }
+    if params.git_repo_url:
+        result["git_repo_url"] = params.git_repo_url
+    if params.git_commit_hash:
+        result["git_commit_hash"] = params.git_commit_hash
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool(
@@ -3018,6 +3228,7 @@ async def research_match_respond_request(params: RespondRequestInput, ctx=None) 
                 "(4) research_match_needs_resolve to close tickets, "
                 "(5) After bilateral Level 3 reveals: research_match_share_file to share supporting files. "
                 "(6) Use research_match_audit_log to review team activity and compliance. "
+                "(7) Use research_match_export_contract to generate a git-verifiable collaboration contract. "
                 "After collaborating, use research_match_rate_user to rate each other."
             ),
         }
@@ -4354,6 +4565,17 @@ async def research_match_team_license(params: TeamLicenseInput, ctx=None) -> str
     if change_history:
         result["change_history"] = change_history
 
+    # Contract info
+    contracts_count = db.execute(
+        "SELECT COUNT(*) as c FROM collaboration_contracts WHERE team_id = ? AND status = 'confirmed'",
+        (params.team_id,)
+    ).fetchone()["c"]
+    result["contracts_count"] = contracts_count
+    result["contract_tip"] = (
+        "Use research_match_export_contract to generate a git-verifiable contract "
+        "that both parties commit to their repos for independent verification."
+    )
+
     result["next_step"] = (
         "License recalculates automatically as collaboration evolves. "
         "Use research_match_reveal_request to share more content, or "
@@ -5111,6 +5333,269 @@ async def research_match_prepare_commit(params: PrepareCommitInput, ctx=None) ->
     finally:
         if tmp_dir and os.path.isdir(tmp_dir):
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# =============================================================================
+# CONTRACT TOOLS (NEED-08 — Git-Verifiable Collaboration Contracts)
+# =============================================================================
+
+@mcp.tool(
+    name="research_match_export_contract",
+    description=(
+        "Generate a git-verifiable collaboration contract for your team. "
+        "Captures both parties, commits with scores, license type, contribution split, "
+        "and timestamps as a markdown file. BOTH members must commit this file to their repos. "
+        "Suggested path: .research-match/CONTRACT_<team_short>.md. "
+        "After committing, use research_match_confirm_contract to record the git hash. "
+        "Contract is valid only when BOTH parties confirm."
+    ),
+    annotations={
+        "title": "Export Contract",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    }
+)
+@_log_tool_call
+async def research_match_export_contract(params: ExportContractInput, ctx=None) -> str:
+    """Generate a collaboration contract for bilateral git verification.
+
+    Args:
+        params (ExportContractInput): Query data:
+            - team_id (str, required): Team to generate contract for
+
+    Returns:
+        str: JSON with contract_id, version, content_hash, markdown content,
+             suggested_path, instructions, and status
+    """
+    db = _get_db(ctx)
+    user = _get_current_user(db)
+    if not user:
+        return json.dumps({"error": "No registered user found. Use research_match_register first."})
+
+    # Verify membership
+    membership = db.execute(
+        "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
+        (params.team_id, user["id"])
+    ).fetchone()
+    if not membership:
+        return json.dumps({"error": "You are not a member of this team."})
+
+    # Compute current license
+    license_info = _compute_license(db, params.team_id)
+
+    # Get next contract version
+    last_version = db.execute(
+        "SELECT MAX(contract_version) as v FROM collaboration_contracts WHERE team_id = ?",
+        (params.team_id,)
+    ).fetchone()
+    contract_version = (last_version["v"] or 0) + 1
+
+    # Supersede previous pending/partial contracts
+    db.execute(
+        """UPDATE collaboration_contracts
+           SET status = 'superseded'
+           WHERE team_id = ? AND status IN ('pending', 'partial')""",
+        (params.team_id,)
+    )
+
+    # Generate contract content
+    content = _generate_contract_content(db, params.team_id, license_info, contract_version)
+    content_hash = hashlib.sha256(content.encode()).hexdigest()
+
+    contract_id = str(uuid.uuid4())
+    team = db.execute("SELECT name FROM teams WHERE id = ?", (params.team_id,)).fetchone()
+    team_short = (team["name"] if team else params.team_id[:8]).replace(" ", "_")
+
+    db.execute(
+        """INSERT INTO collaboration_contracts
+           (id, team_id, contract_version, license_type, contribution_split,
+            contract_content, content_hash, generated_by, status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')""",
+        (contract_id, params.team_id, contract_version,
+         license_info["license_type"],
+         json.dumps(license_info.get("contribution_split", {})),
+         content, content_hash, user["id"])
+    )
+
+    # Audit log
+    _write_audit_log(db, params.team_id, user["id"], "license_generated",
+                     resource_ref=contract_id,
+                     details={"trigger": "contract_generated",
+                              "contract_version": contract_version,
+                              "license_type": license_info["license_type"],
+                              "content_hash": content_hash})
+    db.commit()
+
+    suggested_path = f"{CONTRACT_DIR_NAME}/{CONTRACT_FILE_PREFIX}{team_short}.md"
+
+    return json.dumps({
+        "status": "pending",
+        "contract_id": contract_id,
+        "contract_version": contract_version,
+        "content_hash": content_hash,
+        "suggested_path": suggested_path,
+        "contract_content": content,
+        "instructions": (
+            f"1. Save this contract to '{suggested_path}' in BOTH parties' repositories.\n"
+            f"2. Commit the file: git add {suggested_path} && git commit -m 'Add collaboration contract'\n"
+            f"3. Each party calls research_match_confirm_contract with the git commit hash.\n"
+            f"4. Contract becomes 'confirmed' only when BOTH parties confirm."
+        ),
+    }, indent=2)
+
+
+@mcp.tool(
+    name="research_match_confirm_contract",
+    description=(
+        "Confirm that a collaboration contract has been committed to your git repository. "
+        "Call AFTER committing the contract file. Provide contract_id and git commit hash. "
+        "Contract becomes 'confirmed' only when BOTH members confirm. "
+        "Until both confirm, status is 'partial'."
+    ),
+    annotations={
+        "title": "Confirm Contract",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+@_log_tool_call
+async def research_match_confirm_contract(params: ConfirmContractInput, ctx=None) -> str:
+    """Confirm that a collaboration contract has been committed to git.
+
+    Args:
+        params (ConfirmContractInput): Confirmation data:
+            - team_id (str, required): Team ID
+            - contract_id (str, required): Contract ID from export_contract
+            - git_commit_hash (str, required): 40-char hex SHA
+            - repo_url (str, optional): Repository URL
+
+    Returns:
+        str: JSON with contract_id, status, your/partner confirmations, message
+    """
+    db = _get_db(ctx)
+    user = _get_current_user(db)
+    if not user:
+        return json.dumps({"error": "No registered user found. Use research_match_register first."})
+
+    # Verify membership
+    membership = db.execute(
+        "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
+        (params.team_id, user["id"])
+    ).fetchone()
+    if not membership:
+        return json.dumps({"error": "You are not a member of this team."})
+
+    # Fetch contract
+    contract = db.execute(
+        "SELECT * FROM collaboration_contracts WHERE id = ? AND team_id = ?",
+        (params.contract_id, params.team_id)
+    ).fetchone()
+    if not contract:
+        return json.dumps({"error": "Contract not found for this team."})
+
+    contract = dict(contract)
+    if contract["status"] in ("superseded", "confirmed"):
+        return json.dumps({
+            "error": f"Contract is already '{contract['status']}'. Cannot modify.",
+            "contract_id": params.contract_id,
+            "status": contract["status"],
+        })
+
+    now = datetime.now(timezone.utc).isoformat()
+    user_id = user["id"]
+
+    # Determine slot (A or B)
+    if contract["confirmation_a_user_id"] is None:
+        # Slot A is free — take it
+        slot = "a"
+    elif contract["confirmation_a_user_id"] == user_id:
+        # Idempotent update to slot A
+        slot = "a"
+    else:
+        # Slot A taken by someone else — use slot B
+        slot = "b"
+
+    # Update the slot
+    if slot == "a":
+        db.execute(
+            """UPDATE collaboration_contracts
+               SET confirmation_a_user_id = ?, confirmation_a_git_hash = ?,
+                   confirmation_a_repo_url = ?, confirmation_a_at = ?
+               WHERE id = ?""",
+            (user_id, params.git_commit_hash, params.repo_url, now, params.contract_id)
+        )
+    else:
+        db.execute(
+            """UPDATE collaboration_contracts
+               SET confirmation_b_user_id = ?, confirmation_b_git_hash = ?,
+                   confirmation_b_repo_url = ?, confirmation_b_at = ?
+               WHERE id = ?""",
+            (user_id, params.git_commit_hash, params.repo_url, now, params.contract_id)
+        )
+
+    # Re-read to check both slots
+    updated = dict(db.execute(
+        "SELECT * FROM collaboration_contracts WHERE id = ?",
+        (params.contract_id,)
+    ).fetchone())
+
+    both_confirmed = (
+        updated["confirmation_a_user_id"] is not None and
+        updated["confirmation_b_user_id"] is not None
+    )
+    new_status = "confirmed" if both_confirmed else "partial"
+
+    db.execute(
+        "UPDATE collaboration_contracts SET status = ? WHERE id = ?",
+        (new_status, params.contract_id)
+    )
+
+    # Audit log
+    _write_audit_log(db, params.team_id, user_id, "license_generated",
+                     resource_ref=params.contract_id,
+                     details={"trigger": "contract_confirmed",
+                              "slot": slot,
+                              "git_commit_hash": params.git_commit_hash,
+                              "new_status": new_status})
+    db.commit()
+
+    your_confirmation = {
+        "user_id": user_id,
+        "git_commit_hash": params.git_commit_hash,
+        "repo_url": params.repo_url,
+        "confirmed_at": now,
+    }
+
+    partner_slot = "b" if slot == "a" else "a"
+    partner_user = updated[f"confirmation_{partner_slot}_user_id"]
+    partner_confirmation = None
+    if partner_user:
+        partner_confirmation = {
+            "user_id": partner_user,
+            "git_commit_hash": updated[f"confirmation_{partner_slot}_git_hash"],
+            "repo_url": updated[f"confirmation_{partner_slot}_repo_url"],
+            "confirmed_at": updated[f"confirmation_{partner_slot}_at"],
+        }
+
+    message = (
+        "Contract CONFIRMED — both parties have committed the contract to their repos."
+        if new_status == "confirmed"
+        else "Your confirmation recorded. Waiting for your partner to confirm."
+    )
+
+    return json.dumps({
+        "status": new_status,
+        "contract_id": params.contract_id,
+        "contract_version": updated["contract_version"],
+        "content_hash": updated["content_hash"],
+        "your_confirmation": your_confirmation,
+        "partner_confirmation": partner_confirmation,
+        "message": message,
+    }, indent=2)
 
 
 # =============================================================================
