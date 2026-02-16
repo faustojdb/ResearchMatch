@@ -119,7 +119,7 @@ def _log_tool_call(func):
 # =============================================================================
 
 DB_PATH = os.environ.get("RESEARCH_MATCH_DB", "research_match.db")
-SERVER_VERSION = "2.5.0-file-sharing"
+SERVER_VERSION = "2.5.1-audit-mad"
 
 # Scoring weights for Theoretical Originality (OT)
 OT_WEIGHTS = {
@@ -185,6 +185,7 @@ LICENSE_STALE_DAYS = 30  # Days without reveal before team becomes "time-limited
 MAX_SHARED_FILES_PER_TEAM = 50
 MAX_FILE_PATH_LENGTH = 500
 MAX_FILE_DESCRIPTION_LENGTH = 500
+RESHARING_PENALTY_HONESTY = 1.0  # Forced honesty score on re-sharing violation
 
 LICENSE_TERMS = {
     "joint-equal": [
@@ -1478,6 +1479,16 @@ class SharedFilesInput(BaseModel):
     team_id: str = Field(..., description="Team to list shared files for")
 
 
+class AuditLogInput(BaseModel):
+    """Input for viewing the audit trail of a team."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    team_id: str = Field(..., description="Team to view audit log for")
+    action_filter: Optional[str] = Field(
+        None, description="Filter by action type (e.g. 'file_shared', 'violation_detected')")
+    limit: int = Field(50, ge=1, le=200, description="Max entries to return")
+
+
 # =============================================================================
 # LIFESPAN & SERVER INITIALIZATION
 # =============================================================================
@@ -1644,6 +1655,31 @@ def _write_audit_log(db: sqlite3.Connection, team_id: str, actor_id: str,
          json.dumps(details) if details else None)
     )
     return log_id
+
+
+def _check_resharing_violation(db: sqlite3.Connection, user_id: str,
+                               file_hash: str) -> Optional[dict]:
+    """Check if a file hash was already shared by a DIFFERENT user.
+
+    Returns violation info dict if found, None otherwise.
+    Only detects cross-user hash collisions — same user sharing
+    the same hash in another team is valid (it's their own file).
+    """
+    if file_hash is None:
+        return None
+    row = db.execute(
+        "SELECT id, team_id, origin_user_id, file_path FROM shared_files "
+        "WHERE file_hash = ? AND origin_user_id != ? LIMIT 1",
+        (file_hash, user_id)
+    ).fetchone()
+    if row:
+        return {
+            "original_file_id": row["id"],
+            "original_team_id": row["team_id"],
+            "origin_user_id": row["origin_user_id"],
+            "file_path": row["file_path"],
+        }
+    return None
 
 
 def _compute_license(db: sqlite3.Connection, team_id: str) -> dict:
@@ -2449,6 +2485,7 @@ async def research_match_respond_request(params: RespondRequestInput, ctx=None) 
                 "(3) research_match_needs_list to see the team board, "
                 "(4) research_match_needs_resolve to close tickets, "
                 "(5) After bilateral Level 3 reveals: research_match_share_file to share supporting files. "
+                "(6) Use research_match_audit_log to review team activity and compliance. "
                 "After collaborating, use research_match_rate_user to rate each other."
             ),
         }
@@ -3726,6 +3763,37 @@ async def research_match_share_file(params: ShareFileInput, ctx=None) -> str:
                     "tip": "Use research_match_reveal_request and research_match_reveal_respond first."
                 })
 
+    # Re-sharing detection (MAD mechanism)
+    if params.file_hash:
+        violation = _check_resharing_violation(db, user["id"], params.file_hash)
+        if violation:
+            # Penalty: tank honesty score
+            db.execute(
+                "UPDATE users SET running_honesty = ?, avg_honesty = ? WHERE id = ?",
+                (RESHARING_PENALTY_HONESTY, RESHARING_PENALTY_HONESTY, user["id"])
+            )
+            # Audit: record violation
+            _write_audit_log(db, params.team_id, user["id"], "violation_detected",
+                             resource_ref=violation["original_file_id"],
+                             details={
+                                 "type": "resharing",
+                                 "file_hash": params.file_hash,
+                                 "original_team_id": violation["original_team_id"],
+                                 "origin_user_id": violation["origin_user_id"],
+                                 "attempted_file_path": params.file_path,
+                             })
+            db.commit()
+            return json.dumps({
+                "error": "RE-SHARING VIOLATION DETECTED.",
+                "violation": {
+                    "type": "resharing",
+                    "message": "This file (by hash) was originally shared by another user. Re-sharing others' content is prohibited.",
+                    "penalty": "Your honesty score has been set to minimum. This affects your reputation permanently.",
+                    "original_owner_notified": True,
+                },
+                "tip": "Only share files YOU created. Use research_match_audit_log to review the violation record."
+            })
+
     # Check file limit
     file_count = db.execute(
         "SELECT COUNT(*) as c FROM shared_files WHERE team_id = ?",
@@ -3866,6 +3934,108 @@ async def research_match_shared_files(params: SharedFilesInput, ctx=None) -> str
         result["tip"] = "No files shared yet. Use research_match_share_file to register a file."
     else:
         result["tip"] = "Files are metadata records. Exchange actual content out-of-band (email, repo, etc.)."
+
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool(
+    name="research_match_audit_log",
+    description=(
+        "POST-TEAM STEP — View the immutable audit trail for your team. "
+        "Shows all logged actions: reveals (requested/approved/denied), file sharing, "
+        "ticket lifecycle, license changes, and violation detections. "
+        "Filter by action type to focus on specific events. "
+        "The audit trail is append-only — entries cannot be modified or deleted. "
+        "Use this to review team activity, verify compliance, or investigate violations."
+    ),
+    annotations={
+        "title": "Audit Log",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+@_log_tool_call
+async def research_match_audit_log(params: AuditLogInput, ctx=None) -> str:
+    """View the audit trail for a team.
+
+    Args:
+        params (AuditLogInput): Query data:
+            - team_id (str, required): Team to view audit log for
+            - action_filter (Optional[str]): Filter by action type
+            - limit (int, default=50): Max entries to return
+
+    Returns:
+        str: JSON with audit entries and filtering guidance
+    """
+    db = _get_db(ctx)
+    user = _get_current_user(db)
+    if not user:
+        return json.dumps({"error": "No registered user found. Use research_match_register first."})
+
+    # Verify membership
+    membership = db.execute(
+        "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
+        (params.team_id, user["id"])
+    ).fetchone()
+    if not membership:
+        return json.dumps({"error": "You are not a member of this team."})
+
+    # Build query
+    if params.action_filter:
+        rows = db.execute(
+            """SELECT al.*, u.pseudonym AS actor_pseudonym
+               FROM audit_log al
+               JOIN users u ON al.actor_id = u.id
+               WHERE al.team_id = ? AND al.action = ?
+               ORDER BY al.created_at DESC
+               LIMIT ?""",
+            (params.team_id, params.action_filter, params.limit)
+        ).fetchall()
+    else:
+        rows = db.execute(
+            """SELECT al.*, u.pseudonym AS actor_pseudonym
+               FROM audit_log al
+               JOIN users u ON al.actor_id = u.id
+               WHERE al.team_id = ?
+               ORDER BY al.created_at DESC
+               LIMIT ?""",
+            (params.team_id, params.limit)
+        ).fetchall()
+
+    entries = []
+    for row in rows:
+        r = dict(row)
+        details = None
+        if r["details"]:
+            try:
+                details = json.loads(r["details"])
+            except (json.JSONDecodeError, TypeError):
+                details = r["details"]
+        entries.append({
+            "id": r["id"],
+            "action": r["action"],
+            "actor_pseudonym": r["actor_pseudonym"],
+            "resource_ref": r["resource_ref"],
+            "details": details,
+            "created_at": r["created_at"],
+        })
+
+    available_actions = [
+        "reveal_requested", "reveal_approved", "reveal_denied",
+        "file_shared", "file_accessed",
+        "ticket_created", "ticket_updated", "ticket_resolved",
+        "license_generated", "violation_detected",
+    ]
+
+    result = {
+        "team_id": params.team_id,
+        "total_entries": len(entries),
+        "entries": entries,
+        "available_actions": available_actions,
+        "tip": "Use action_filter='violation_detected' to check for re-sharing violations.",
+    }
 
     return json.dumps(result, indent=2)
 
