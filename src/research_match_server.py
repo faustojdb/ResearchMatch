@@ -29,6 +29,9 @@ from enum import Enum
 import urllib.request
 import urllib.parse
 import logging
+import tempfile
+import shutil
+import subprocess
 
 import numpy as np
 from mcp.server.fastmcp import FastMCP
@@ -119,7 +122,7 @@ def _log_tool_call(func):
 # =============================================================================
 
 DB_PATH = os.environ.get("RESEARCH_MATCH_DB", "research_match.db")
-SERVER_VERSION = "2.5.1-audit-mad"
+SERVER_VERSION = "2.6.0-deep-search"
 
 # Scoring weights for Theoretical Originality (OT)
 OT_WEIGHTS = {
@@ -186,6 +189,8 @@ MAX_SHARED_FILES_PER_TEAM = 50
 MAX_FILE_PATH_LENGTH = 500
 MAX_FILE_DESCRIPTION_LENGTH = 500
 RESHARING_PENALTY_HONESTY = 1.0  # Forced honesty score on re-sharing violation
+DEEP_SEARCH_CLONE_TIMEOUT = 60          # seconds for git clone
+DEEP_SEARCH_MAX_REPO_SIZE_MB = 500      # refuse repos larger than this
 
 LICENSE_TERMS = {
     "joint-equal": [
@@ -1367,6 +1372,29 @@ class ColdSearchInput(BaseModel):
     max_results: int = Field(10, description="Maximum results to return", ge=1, le=25)
 
 
+class DeepSearchInput(BaseModel):
+    """Input for deep repository analysis — no registration required."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    repo_url: str = Field(..., description="GitHub repository URL to analyze", min_length=10, max_length=300)
+    include_mcp_analysis: bool = Field(True, description="Include MCP framework/tool extraction (Layer 2)")
+    include_comparison: bool = Field(True, description="Include gap analysis vs Research Match (Layer 3)")
+    include_scoring: bool = Field(False, description="Include originality scoring via OT/OFC (Layer 4, heavier)")
+
+    @field_validator("repo_url")
+    @classmethod
+    def validate_repo_url(cls, v: str) -> str:
+        import re
+        v = v.rstrip("/")
+        if v.endswith(".git"):
+            v = v[:-4]
+        if not re.match(r"^https?://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", v):
+            raise ValueError(
+                "Only GitHub URLs accepted. Format: https://github.com/owner/repo"
+            )
+        return v
+
+
 # --- Collaboration Layer Models (v2.4) ---
 
 class NeedsCreateInput(BaseModel):
@@ -1680,6 +1708,93 @@ def _check_resharing_violation(db: sqlite3.Connection, user_id: str,
             "file_path": row["file_path"],
         }
     return None
+
+
+# --- Deep Search Helpers ---
+
+def _import_analyze_repo() -> dict:
+    """Lazy-import functions from analyze_repo.py at repo root.
+
+    Returns dict of callable functions needed for deep analysis.
+    Raises ImportError if analyze_repo.py cannot be found.
+    """
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    import analyze_repo
+    return {
+        "analyze_git": analyze_repo.analyze_git,
+        "analyze_readme": analyze_repo.analyze_readme,
+        "analyze_file_tree": analyze_repo.analyze_file_tree,
+        "analyze_dependencies": analyze_repo.analyze_dependencies,
+        "analyze_mcp": analyze_repo.analyze_mcp,
+        "compare_tool_lists": analyze_repo.compare_tool_lists,
+        "map_repo_to_commit_data": analyze_repo.map_repo_to_commit_data,
+        "score_originality": analyze_repo.score_originality,
+        "asdict": analyze_repo.asdict,
+        "AnalysisReport": analyze_repo.AnalysisReport,
+    }
+
+
+def _deep_search_clone(repo_url: str, target_dir: str) -> None:
+    """Shallow-clone a GitHub repo into target_dir.
+
+    Uses --depth 1 --single-branch to minimize download.
+    Raises RuntimeError on clone failure or timeout.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "clone", "--depth", "1", "--single-branch", repo_url, target_dir],
+            capture_output=True, text=True,
+            timeout=DEEP_SEARCH_CLONE_TIMEOUT,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"git clone failed: {result.stderr.strip()}")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"git clone timed out after {DEEP_SEARCH_CLONE_TIMEOUT}s. "
+            "The repository may be too large or the network is slow."
+        )
+
+
+def _deep_search_check_size(repo_url: str) -> Optional[int]:
+    """Check repo size via GitHub API. Returns size in KB, or None on failure."""
+    try:
+        # Extract owner/repo from URL
+        parts = repo_url.rstrip("/").split("/")
+        owner, repo = parts[-2], parts[-1]
+        api_url = f"https://api.github.com/repos/{owner}/{repo}"
+        req = urllib.request.Request(api_url, headers={"User-Agent": "ResearchMatch"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+            return data.get("size")  # KB
+    except Exception:
+        return None
+
+
+def _deep_search_sanitize_report(report_dict: dict, repo_url: str) -> dict:
+    """Replace local filesystem paths with the repo URL in the report.
+
+    Prevents leaking server-side temp directory paths to users.
+    """
+    if "repo" in report_dict and isinstance(report_dict["repo"], dict):
+        report_dict["repo"]["path"] = repo_url
+    if "files" in report_dict and isinstance(report_dict["files"], dict):
+        largest = report_dict["files"].get("largest_files")
+        if largest and isinstance(largest, list):
+            sanitized = []
+            for entry in largest:
+                if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                    filepath = str(entry[0])
+                    # Strip temp dir prefix, keep relative path
+                    parts = filepath.split("/")
+                    # Find repo name in path and keep from there
+                    rel_path = "/".join(parts[-2:]) if len(parts) >= 2 else filepath
+                    sanitized.append([rel_path, entry[1]])
+                else:
+                    sanitized.append(entry)
+            report_dict["files"]["largest_files"] = sanitized
+    return report_dict
 
 
 def _compute_license(db: sqlite3.Connection, team_id: str) -> dict:
@@ -2824,6 +2939,145 @@ async def research_match_cold_search(params: ColdSearchInput, ctx=None) -> str:
         "internal_results": internal_results,
         "github_results": github_results,
     }, indent=2)
+
+
+@mcp.tool(
+    name="research_match_deep_search",
+    description=(
+        "FREE deep analysis — NO REGISTRATION REQUIRED. "
+        "Given a GitHub repository URL (from cold_search results), clones and analyzes: "
+        "Layer 1: Git metadata, file tree, LOC by language, dependencies. "
+        "Layer 2: MCP framework/tool extraction (Python + JS/TS). "
+        "Layer 3: Gap analysis comparing target vs Research Match. "
+        "Layer 4 (optional): Originality scoring via OT/OFC evaluator. "
+        "Returns structured JSON. Use after cold_search to evaluate a repo deeply. "
+        "Example: repo_url='https://github.com/owner/repo', include_scoring=true."
+    ),
+    annotations={
+        "title": "Deep Repository Analysis",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
+@_log_tool_call
+async def research_match_deep_search(params: DeepSearchInput, ctx=None) -> str:
+    """Clone and deeply analyze a GitHub repository.
+
+    Args:
+        params (DeepSearchInput): Analysis parameters:
+            - repo_url (str): GitHub URL (https://github.com/owner/repo)
+            - include_mcp_analysis (bool): Layer 2 MCP extraction (default True)
+            - include_comparison (bool): Layer 3 gap analysis (default True)
+            - include_scoring (bool): Layer 4 originality scoring (default False)
+
+    Returns:
+        str: JSON with structured analysis report or error details
+    """
+    repo_url = params.repo_url
+    tmp_dir = None
+
+    try:
+        # Step 1: Lazy import analyze_repo
+        try:
+            funcs = _import_analyze_repo()
+        except ImportError as e:
+            return json.dumps({
+                "error": f"analyze_repo.py not found: {e}",
+                "tip": "The deep analysis module is not available in this deployment.",
+            }, indent=2)
+
+        # Step 2: Check repo size via GitHub API
+        size_kb = _deep_search_check_size(repo_url)
+        size_mb = None
+        if size_kb is not None:
+            size_mb = round(size_kb / 1024, 1)
+            if size_mb > DEEP_SEARCH_MAX_REPO_SIZE_MB:
+                return json.dumps({
+                    "error": f"Repository is {size_mb} MB, exceeds limit of {DEEP_SEARCH_MAX_REPO_SIZE_MB} MB.",
+                    "tip": "Try a smaller repository or use cold_search for surface-level info.",
+                }, indent=2)
+
+        # Step 3: Clone (shallow)
+        tmp_dir = tempfile.mkdtemp(prefix="rm_deep_")
+        clone_target = os.path.join(tmp_dir, "repo")
+        try:
+            _deep_search_clone(repo_url, clone_target)
+        except RuntimeError as e:
+            return json.dumps({
+                "error": str(e),
+                "tip": "Check the URL is correct and the repository is public.",
+            }, indent=2)
+
+        # Step 4: Layer 1 — Generic analysis
+        report = funcs["AnalysisReport"]()
+        report.repo = funcs["analyze_git"](clone_target)
+        title, desc = funcs["analyze_readme"](clone_target)
+        report.repo.readme_title = title
+        report.repo.readme_description = desc
+        report.files = funcs["analyze_file_tree"](clone_target)
+        report.deps = funcs["analyze_dependencies"](clone_target)
+
+        layers_executed = {"generic": True, "mcp": False, "comparison": False, "scoring": False}
+
+        # Step 5: Layer 2 — MCP analysis
+        if params.include_mcp_analysis:
+            try:
+                report.mcp = funcs["analyze_mcp"](clone_target, report.deps)
+                layers_executed["mcp"] = True
+            except Exception as e:
+                logger.warning(f"MCP analysis failed for {repo_url}: {e}")
+
+        # Step 6: Layer 3 — Comparison with Research Match
+        if params.include_comparison and report.mcp is not None:
+            try:
+                our_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                our_deps = funcs["analyze_dependencies"](our_root)
+                our_mcp = funcs["analyze_mcp"](our_root, our_deps)
+                report.comparison = funcs["compare_tool_lists"](
+                    report.mcp, our_mcp,
+                    target_name=repo_url.split("/")[-1],
+                    reference_name="ResearchMatch",
+                )
+                layers_executed["comparison"] = True
+            except Exception as e:
+                logger.warning(f"Comparison analysis failed for {repo_url}: {e}")
+
+        # Step 7: Layer 4 — Originality scoring (optional, heavier)
+        if params.include_scoring:
+            try:
+                commit_data = funcs["map_repo_to_commit_data"](
+                    report.repo, report.files, report.deps, report.mcp
+                )
+                report.originality = funcs["score_originality"](commit_data)
+                layers_executed["scoring"] = True
+            except Exception as e:
+                logger.warning(f"Originality scoring failed for {repo_url}: {e}")
+
+        # Step 8: Serialize, sanitize, return
+        report_dict = funcs["asdict"](report)
+        report_dict = _deep_search_sanitize_report(report_dict, repo_url)
+
+        return json.dumps({
+            "status": "ok",
+            "repo_url": repo_url,
+            "repo_size_mb": size_mb,
+            "layers_executed": layers_executed,
+            "analysis": report_dict,
+            "tip": "Use cold_search to find more repos.",
+        }, indent=2, default=str)
+
+    except Exception as e:
+        logger.error(f"Deep search failed for {repo_url}: {e}")
+        return json.dumps({
+            "error": f"Unexpected error during deep analysis: {e}",
+            "tip": "Try again or use cold_search for surface-level info.",
+        }, indent=2)
+
+    finally:
+        if tmp_dir and os.path.exists(tmp_dir):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # =============================================================================
