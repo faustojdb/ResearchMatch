@@ -2295,20 +2295,13 @@ async def research_match_cold_search(params: ColdSearchInput, ctx=None) -> str:
     query = params.query
     limit = params.max_results
 
-    # Split limit between sources
-    internal_limit = max(1, limit // 2)
-    github_limit = max(1, limit - internal_limit)
-
-    # Search internal DB
+    # Always search BOTH sources with full limit each.
+    # Internal results may be few (early-stage DB), but external repos are
+    # always valuable — there could be 1000 useful projects out there even
+    # when the internal DB has matches.
     db = _get_db(ctx)
-    internal_results = _cold_search_internal(db, query, internal_limit)
-
-    # If few internal results, give more slots to GitHub
-    if len(internal_results) < internal_limit:
-        github_limit += (internal_limit - len(internal_results))
-
-    # Search GitHub
-    github_results = _cold_search_github(query, github_limit)
+    internal_results = _cold_search_internal(db, query, limit)
+    github_results = _cold_search_github(query, limit)
 
     total = len(internal_results) + len(github_results)
     if total == 0:
