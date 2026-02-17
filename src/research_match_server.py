@@ -2024,15 +2024,32 @@ def _import_analyze_repo() -> dict:
     }
 
 
+def _find_git_executable() -> str:
+    """Find git executable, checking common Windows paths if not in PATH."""
+    if shutil.which("git"):
+        return "git"
+    # Common Windows Git locations
+    candidates = [
+        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "cmd", "git.exe"),
+        os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Git", "cmd", "git.exe"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Git", "cmd", "git.exe"),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    raise RuntimeError("git executable not found. Install Git or add it to PATH.")
+
+
 def _deep_search_clone(repo_url: str, target_dir: str) -> None:
     """Shallow-clone a GitHub repo into target_dir.
 
     Uses --depth 1 --single-branch to minimize download.
     Raises RuntimeError on clone failure or timeout.
     """
+    git_cmd = _find_git_executable()
     try:
         result = subprocess.run(
-            ["git", "clone", "--depth", "1", "--single-branch", repo_url, target_dir],
+            [git_cmd, "clone", "--depth", "1", "--single-branch", repo_url, target_dir],
             capture_output=True, text=True,
             timeout=DEEP_SEARCH_CLONE_TIMEOUT,
         )
@@ -3603,96 +3620,110 @@ async def research_match_deep_search(params: DeepSearchInput, ctx: Context = Non
         str: JSON with structured analysis report or error details
     """
     repo_url = params.repo_url
-    tmp_dir = None
 
     try:
-        # Step 1: Lazy import analyze_repo
-        try:
-            funcs = _import_analyze_repo()
-        except ImportError as e:
-            return json.dumps({
-                "error": f"analyze_repo.py not found: {e}",
-                "tip": "The deep analysis module is not available in this deployment.",
-            }, indent=2)
+        # Extract owner/repo from URL
+        url_parts = repo_url.rstrip("/").split("/")
+        owner, repo_name = url_parts[-2], url_parts[-1]
 
-        # Step 2: Check repo size via GitHub API
-        size_kb = _deep_search_check_size(repo_url)
-        size_mb = None
-        if size_kb is not None:
-            size_mb = round(size_kb / 1024, 1)
-            if size_mb > DEEP_SEARCH_MAX_REPO_SIZE_MB:
-                return json.dumps({
-                    "error": f"Repository is {size_mb} MB, exceeds limit of {DEEP_SEARCH_MAX_REPO_SIZE_MB} MB.",
-                    "tip": "Try a smaller repository or use cold_search for surface-level info.",
-                }, indent=2)
+        # --- GitHub API-only analysis (no clone — avoids MCP timeout) ---
+        api_base = f"https://api.github.com/repos/{owner}/{repo_name}"
+        api_headers = {"User-Agent": "ResearchMatch-MCP/2.8"}
 
-        # Step 3: Clone (shallow)
-        tmp_dir = tempfile.mkdtemp(prefix="rm_deep_")
-        clone_target = os.path.join(tmp_dir, "repo")
-        try:
-            _deep_search_clone(repo_url, clone_target)
-        except RuntimeError as e:
-            return json.dumps({
-                "error": str(e),
-                "tip": "Check the URL is correct and the repository is public.",
-            }, indent=2)
+        def _gh_api(endpoint: str = "") -> Optional[dict]:
+            try:
+                url = f"{api_base}{endpoint}"
+                req = urllib.request.Request(url, headers=api_headers)
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    return json.loads(resp.read())
+            except Exception:
+                return None
 
-        # Step 4: Layer 1 — Generic analysis
-        report = funcs["AnalysisReport"]()
-        report.repo = funcs["analyze_git"](clone_target)
-        title, desc = funcs["analyze_readme"](clone_target)
-        report.repo.readme_title = title
-        report.repo.readme_description = desc
-        report.files = funcs["analyze_file_tree"](clone_target)
-        report.deps = funcs["analyze_dependencies"](clone_target)
+        # Fetch repo metadata
+        repo_data = _gh_api()
+        if not repo_data:
+            return json.dumps({"error": f"Cannot access {repo_url}. Check URL and that repo is public."})
+
+        size_mb = round(repo_data.get("size", 0) / 1024, 1)
+
+        # Fetch languages
+        languages = _gh_api("/languages") or {}
+
+        # Fetch recent commits (top 5)
+        commits_data = _gh_api("/commits?per_page=5") or []
+        recent_commits = []
+        for c in commits_data:
+            if isinstance(c, dict) and "commit" in c:
+                recent_commits.append({
+                    "sha": c["sha"][:8],
+                    "message": (c["commit"]["message"] or "")[:100],
+                    "date": c["commit"]["committer"]["date"],
+                })
+
+        # Fetch top-level file tree
+        default_branch = repo_data.get("default_branch", "main")
+        tree_data = _gh_api(f"/git/trees/{default_branch}") or {}
+        top_files = [
+            {"path": item["path"], "type": item["type"], "size": item.get("size", 0)}
+            for item in tree_data.get("tree", [])
+        ]
+
+        # Fetch README preview
+        readme_preview = ""
+        readme_data = _gh_api("/readme")
+        if readme_data and readme_data.get("content"):
+            import base64
+            try:
+                raw = base64.b64decode(readme_data["content"]).decode("utf-8", errors="replace")
+                readme_preview = raw[:500]
+            except Exception:
+                readme_preview = "(could not decode)"
+
+        # Check for dependency files
+        deps_found = {}
+        for dep_file in ["requirements.txt", "pyproject.toml", "package.json", "Cargo.toml", "go.mod"]:
+            dep_data = _gh_api(f"/contents/{dep_file}")
+            if dep_data and dep_data.get("content"):
+                import base64
+                try:
+                    content = base64.b64decode(dep_data["content"]).decode("utf-8", errors="replace")
+                    deps_found[dep_file] = content[:300]
+                except Exception:
+                    deps_found[dep_file] = "(present but could not decode)"
+
+        # Build analysis report
+        analysis = {
+            "repo": {
+                "name": repo_data.get("full_name"),
+                "description": repo_data.get("description", ""),
+                "default_branch": default_branch,
+                "stars": repo_data.get("stargazers_count", 0),
+                "forks": repo_data.get("forks_count", 0),
+                "open_issues": repo_data.get("open_issues_count", 0),
+                "created_at": repo_data.get("created_at"),
+                "updated_at": repo_data.get("updated_at"),
+                "license": (repo_data.get("license") or {}).get("spdx_id", "None"),
+                "topics": repo_data.get("topics", []),
+            },
+            "size_mb": size_mb,
+            "languages": languages,
+            "primary_language": repo_data.get("language"),
+            "total_bytes": sum(languages.values()),
+            "top_level_files": top_files[:30],
+            "recent_commits": recent_commits,
+            "readme_preview": readme_preview,
+            "dependency_files": deps_found,
+        }
 
         layers_executed = {"generic": True, "mcp": False, "comparison": False, "scoring": False}
-
-        # Step 5: Layer 2 — MCP analysis
-        if params.include_mcp_analysis:
-            try:
-                report.mcp = funcs["analyze_mcp"](clone_target, report.deps)
-                layers_executed["mcp"] = True
-            except Exception as e:
-                logger.warning(f"MCP analysis failed for {repo_url}: {e}")
-
-        # Step 6: Layer 3 — Comparison with Research Match
-        if params.include_comparison and report.mcp is not None:
-            try:
-                our_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-                our_deps = funcs["analyze_dependencies"](our_root)
-                our_mcp = funcs["analyze_mcp"](our_root, our_deps)
-                report.comparison = funcs["compare_tool_lists"](
-                    report.mcp, our_mcp,
-                    target_name=repo_url.split("/")[-1],
-                    reference_name="ResearchMatch",
-                )
-                layers_executed["comparison"] = True
-            except Exception as e:
-                logger.warning(f"Comparison analysis failed for {repo_url}: {e}")
-
-        # Step 7: Layer 4 — Originality scoring (optional, heavier)
-        if params.include_scoring:
-            try:
-                commit_data = funcs["map_repo_to_commit_data"](
-                    report.repo, report.files, report.deps, report.mcp
-                )
-                report.originality = funcs["score_originality"](commit_data)
-                layers_executed["scoring"] = True
-            except Exception as e:
-                logger.warning(f"Originality scoring failed for {repo_url}: {e}")
-
-        # Step 8: Serialize, sanitize, return
-        report_dict = funcs["asdict"](report)
-        report_dict = _deep_search_sanitize_report(report_dict, repo_url)
 
         return json.dumps({
             "status": "ok",
             "repo_url": repo_url,
             "repo_size_mb": size_mb,
             "layers_executed": layers_executed,
-            "analysis": report_dict,
-            "tip": "Use cold_search to find more repos.",
+            "analysis": analysis,
+            "note": "API-based analysis (no clone). For full clone-based analysis with MCP extraction and scoring, use the CLI version.",
         }, indent=2, default=str)
 
     except Exception as e:
@@ -3701,10 +3732,6 @@ async def research_match_deep_search(params: DeepSearchInput, ctx: Context = Non
             "error": f"Unexpected error during deep analysis: {e}",
             "tip": "Try again or use cold_search for surface-level info.",
         }, indent=2)
-
-    finally:
-        if tmp_dir and os.path.exists(tmp_dir):
-            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # =============================================================================

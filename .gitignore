@@ -1,34 +1,25 @@
-# Database
-*.db
-*.db-journal
-*.db-wal
-data/
-
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-dist/
-build/
+# Virtual environment
 .venv/
-venv/
+
+# Database files
+*.db
+*.db-shm
+*.db-wal
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
 
 # IDE
-.vscode/
 .idea/
+.vscode/
+*.swp
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Secrets
-.env
-*.pem
-*.key
-
-# Build artifacts
-*.dxt
-*.zip
-
-# Reference repos (cloned for analysis, not part of project)
-research_refs/
+# Claude local config
+.claude/
+.mcp.json

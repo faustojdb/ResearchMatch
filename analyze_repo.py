@@ -19,11 +19,27 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+
+def _find_git() -> str:
+    """Find git executable, checking common Windows paths if not in PATH."""
+    if shutil.which("git"):
+        return "git"
+    candidates = [
+        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "cmd", "git.exe"),
+        os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Git", "cmd", "git.exe"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Git", "cmd", "git.exe"),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return "git"  # fallback, let OS raise FileNotFoundError
 
 
 # =============================================================================
@@ -334,8 +350,9 @@ def analyze_git(repo_path: str) -> RepoMetadata:
 
     def _git(cmd: List[str]) -> str:
         try:
+            git_cmd = _find_git()
             result = subprocess.run(
-                ["git", "-C", repo_path] + cmd,
+                [git_cmd, "-C", repo_path] + cmd,
                 capture_output=True, text=True, timeout=15,
             )
             return result.stdout.strip()

@@ -1,5 +1,5 @@
 {
-  "manifest_version": "0.3",
+  "manifest_version": "0.4",
   "name": "research-match",
   "version": "2.8.0",
   "description": "MCP server with 24 tools that connects isolated researchers via AI originality scoring, bilateral matching, collaboration contracts, and privacy-first knowledge sharing.",
@@ -16,16 +16,11 @@
   "documentation": "https://github.com/faustojdb/ResearchMatch",
   "icon": "assets/icon.png",
   "server": {
-    "type": "python",
-    "entry_point": "./src/research_match_server.py",
+    "type": "uv",
+    "entry_point": "src/research_match_server.py",
     "mcp_config": {
       "command": "uv",
-      "args": [
-        "--directory",
-        "${__dirname}",
-        "run",
-        "research-match"
-      ],
+      "args": ["run", "--directory", "${__dirname}", "research-match"],
       "env": {
         "RESEARCH_MATCH_DB": "${user_config.database_path}"
       }
