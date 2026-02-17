@@ -1,0 +1,9 @@
+{
+  "name": "research-match",
+  "version": "2.8.0",
+  "description": "MCP server with 24 tools that connects isolated researchers via AI originality scoring, bilateral matching, collaboration contracts, and privacy-first knowledge sharing.",
+  "author": {
+    "name": "faustojdb"
+  },
+  "keywords": ["research", "collaboration", "matching", "originality", "mcp", "ai"]
+}

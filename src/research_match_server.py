@@ -34,7 +34,7 @@ import shutil
 import subprocess
 
 import numpy as np
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Context
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 
@@ -121,7 +121,7 @@ def _log_tool_call(func):
 # CONSTANTS
 # =============================================================================
 
-DB_PATH = os.environ.get("RESEARCH_MATCH_DB", "research_match.db")
+DB_PATH = os.environ.get("RESEARCH_MATCH_DB") or "research_match.db"
 SERVER_VERSION = "2.8.0-contracts"
 
 # Scoring weights for Theoretical Originality (OT)
@@ -1688,7 +1688,7 @@ _server_start_time: Optional[str] = None
 
 
 @asynccontextmanager
-async def app_lifespan():
+async def app_lifespan(app):
     """Initialize database and engines."""
     global _server_start_time
     _server_start_time = datetime.now(timezone.utc).isoformat()
@@ -2637,7 +2637,7 @@ def _compute_license(db: sqlite3.Connection, team_id: str) -> dict:
     }
 )
 @_log_tool_call
-async def research_match_register(params: RegisterInput, ctx=None) -> str:
+async def research_match_register(params: RegisterInput, ctx: Context = None) -> str:
     """Register a new user on Research Match. Creates a pseudonymous profile.
     Email is hashed and never stored in plain text. Idempotent: safe to call multiple times.
 
@@ -2649,7 +2649,6 @@ async def research_match_register(params: RegisterInput, ctx=None) -> str:
     Returns:
         str: JSON with user_id, pseudonym, and welcome message
     """
-    from mcp.server.fastmcp import Context
     db = _get_db(ctx)
     user_id = _get_or_create_user(db, params.email, params.pseudonym)
     user = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
@@ -2685,7 +2684,7 @@ async def research_match_register(params: RegisterInput, ctx=None) -> str:
     }
 )
 @_log_tool_call
-async def research_match_submit_commit(params: SubmitCommitInput, ctx=None) -> str:
+async def research_match_submit_commit(params: SubmitCommitInput, ctx: Context = None) -> str:
     """Submit a Research Commit for AI evaluation.
 
     Args:
@@ -2811,7 +2810,7 @@ async def research_match_submit_commit(params: SubmitCommitInput, ctx=None) -> s
     }
 )
 @_log_tool_call
-async def research_match_my_profile(ctx=None) -> str:
+async def research_match_my_profile(ctx: Context = None) -> str:
     """View current originality profile, scores, reputation, and commit history.
 
     Returns:
@@ -2903,7 +2902,7 @@ async def research_match_my_profile(ctx=None) -> str:
     }
 )
 @_log_tool_call
-async def research_match_find_collaborators(params: FindCollaboratorsInput, ctx=None) -> str:
+async def research_match_find_collaborators(params: FindCollaboratorsInput, ctx: Context = None) -> str:
     """Find researchers with complementary skills and knowledge.
 
     Args:
@@ -3003,7 +3002,7 @@ async def research_match_find_collaborators(params: FindCollaboratorsInput, ctx=
     }
 )
 @_log_tool_call
-async def research_match_send_request(params: SendRequestInput, ctx=None) -> str:
+async def research_match_send_request(params: SendRequestInput, ctx: Context = None) -> str:
     """Send a collaboration request to a matched researcher.
 
     Args:
@@ -3075,7 +3074,7 @@ async def research_match_send_request(params: SendRequestInput, ctx=None) -> str
     }
 )
 @_log_tool_call
-async def research_match_inbox(ctx=None) -> str:
+async def research_match_inbox(ctx: Context = None) -> str:
     """View incoming and outgoing collaboration requests with semaphore indicators.
 
     Returns:
@@ -3155,7 +3154,7 @@ async def research_match_inbox(ctx=None) -> str:
     }
 )
 @_log_tool_call
-async def research_match_respond_request(params: RespondRequestInput, ctx=None) -> str:
+async def research_match_respond_request(params: RespondRequestInput, ctx: Context = None) -> str:
     """Accept or reject a collaboration request.
 
     Args:
@@ -3263,7 +3262,7 @@ async def research_match_respond_request(params: RespondRequestInput, ctx=None) 
     }
 )
 @_log_tool_call
-async def research_match_rate_user(params: RateUserInput, ctx=None) -> str:
+async def research_match_rate_user(params: RateUserInput, ctx: Context = None) -> str:
     """Rate a collaborator after working together in a team.
 
     Args:
@@ -3388,7 +3387,7 @@ async def research_match_rate_user(params: RateUserInput, ctx=None) -> str:
     }
 )
 @_log_tool_call
-async def research_match_analyze_work(ctx=None) -> str:
+async def research_match_analyze_work(ctx: Context = None) -> str:
     """Returns the Research Commit template for Claude to help fill out.
 
     Returns:
@@ -3538,7 +3537,7 @@ def _cold_search_github(query: str, limit: int) -> List[Dict]:
     ),
 )
 @_log_tool_call
-async def research_match_cold_search(params: ColdSearchInput, ctx=None) -> str:
+async def research_match_cold_search(params: ColdSearchInput, ctx: Context = None) -> str:
     """Execute a cold search across internal DB and GitHub."""
     query = params.query
     limit = params.max_results
@@ -3590,7 +3589,7 @@ async def research_match_cold_search(params: ColdSearchInput, ctx=None) -> str:
     }
 )
 @_log_tool_call
-async def research_match_deep_search(params: DeepSearchInput, ctx=None) -> str:
+async def research_match_deep_search(params: DeepSearchInput, ctx: Context = None) -> str:
     """Clone and deeply analyze a GitHub repository.
 
     Args:
@@ -3735,7 +3734,7 @@ async def research_match_deep_search(params: DeepSearchInput, ctx=None) -> str:
     }
 )
 @_log_tool_call
-async def research_match_needs_create(params: NeedsCreateInput, ctx=None) -> str:
+async def research_match_needs_create(params: NeedsCreateInput, ctx: Context = None) -> str:
     """Create a structured ticket in a team.
 
     Args:
@@ -3821,7 +3820,7 @@ async def research_match_needs_create(params: NeedsCreateInput, ctx=None) -> str
     }
 )
 @_log_tool_call
-async def research_match_needs_list(params: NeedsListInput, ctx=None) -> str:
+async def research_match_needs_list(params: NeedsListInput, ctx: Context = None) -> str:
     """List tickets in a team with optional filters.
 
     Args:
@@ -3934,7 +3933,7 @@ async def research_match_needs_list(params: NeedsListInput, ctx=None) -> str:
     }
 )
 @_log_tool_call
-async def research_match_needs_resolve(params: NeedsResolveInput, ctx=None) -> str:
+async def research_match_needs_resolve(params: NeedsResolveInput, ctx: Context = None) -> str:
     """Resolve a team ticket.
 
     Args:
@@ -4063,7 +4062,7 @@ async def research_match_needs_resolve(params: NeedsResolveInput, ctx=None) -> s
     }
 )
 @_log_tool_call
-async def research_match_reveal_request(params: RevealRequestInput, ctx=None) -> str:
+async def research_match_reveal_request(params: RevealRequestInput, ctx: Context = None) -> str:
     """Request Level 3 reveal of a teammate's Research Commit.
 
     Args:
@@ -4190,7 +4189,7 @@ async def research_match_reveal_request(params: RevealRequestInput, ctx=None) ->
     }
 )
 @_log_tool_call
-async def research_match_reveal_respond(params: RevealRespondInput, ctx=None) -> str:
+async def research_match_reveal_respond(params: RevealRespondInput, ctx: Context = None) -> str:
     """Approve or deny a Level 3 reveal consent request.
 
     Args:
@@ -4306,7 +4305,7 @@ async def research_match_reveal_respond(params: RevealRespondInput, ctx=None) ->
     }
 )
 @_log_tool_call
-async def research_match_reveal_status(params: RevealStatusInput, ctx=None) -> str:
+async def research_match_reveal_status(params: RevealStatusInput, ctx: Context = None) -> str:
     """View reveal consents, matrix, and revealed content for a team.
 
     Args:
@@ -4471,7 +4470,7 @@ async def research_match_reveal_status(params: RevealStatusInput, ctx=None) -> s
     }
 )
 @_log_tool_call
-async def research_match_team_license(params: TeamLicenseInput, ctx=None) -> str:
+async def research_match_team_license(params: TeamLicenseInput, ctx: Context = None) -> str:
     """View and recalculate the automatic license for a team.
 
     Args:
@@ -4607,7 +4606,7 @@ async def research_match_team_license(params: TeamLicenseInput, ctx=None) -> str
     }
 )
 @_log_tool_call
-async def research_match_share_file(params: ShareFileInput, ctx=None) -> str:
+async def research_match_share_file(params: ShareFileInput, ctx: Context = None) -> str:
     """Register a file metadata record for sharing with a team.
 
     Args:
@@ -4760,7 +4759,7 @@ async def research_match_share_file(params: ShareFileInput, ctx=None) -> str:
     }
 )
 @_log_tool_call
-async def research_match_shared_files(params: SharedFilesInput, ctx=None) -> str:
+async def research_match_shared_files(params: SharedFilesInput, ctx: Context = None) -> str:
     """List all shared file records for a team.
 
     Args:
@@ -4850,7 +4849,7 @@ async def research_match_shared_files(params: SharedFilesInput, ctx=None) -> str
     }
 )
 @_log_tool_call
-async def research_match_audit_log(params: AuditLogInput, ctx=None) -> str:
+async def research_match_audit_log(params: AuditLogInput, ctx: Context = None) -> str:
     """View the audit trail for a team.
 
     Args:
@@ -4958,7 +4957,7 @@ async def research_match_audit_log(params: AuditLogInput, ctx=None) -> str:
     }
 )
 @_log_tool_call
-async def research_match_prepare_commit(params: PrepareCommitInput, ctx=None) -> str:
+async def research_match_prepare_commit(params: PrepareCommitInput, ctx: Context = None) -> str:
     """Universal proforma generator for structured Research Commits.
 
     Args:
@@ -5358,7 +5357,7 @@ async def research_match_prepare_commit(params: PrepareCommitInput, ctx=None) ->
     }
 )
 @_log_tool_call
-async def research_match_export_contract(params: ExportContractInput, ctx=None) -> str:
+async def research_match_export_contract(params: ExportContractInput, ctx: Context = None) -> str:
     """Generate a collaboration contract for bilateral git verification.
 
     Args:
@@ -5463,7 +5462,7 @@ async def research_match_export_contract(params: ExportContractInput, ctx=None) 
     }
 )
 @_log_tool_call
-async def research_match_confirm_contract(params: ConfirmContractInput, ctx=None) -> str:
+async def research_match_confirm_contract(params: ConfirmContractInput, ctx: Context = None) -> str:
     """Confirm that a collaboration contract has been committed to git.
 
     Args:
