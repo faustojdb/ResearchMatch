@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "research-match": {
+      "command": "uv",
+      "args": ["--directory", ".", "run", "research-match"],
+      "env": {
+        "RESEARCH_MATCH_DB": "research_match.db"
+      }
+    }
+  }
+}

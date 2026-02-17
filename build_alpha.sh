@@ -23,8 +23,11 @@ REQUIRED_FILES=(
     "manifest.json"
     "pyproject.toml"
     "requirements.txt"
+    "README.md"
     "src/research_match_server.py"
     "assets/icon.png"
+    ".python-version"
+    "skills/research-match/SKILL.md"
 )
 for f in "${REQUIRED_FILES[@]}"; do
     if [[ ! -f "$f" ]]; then
@@ -41,7 +44,12 @@ if [[ "$MANIFEST_VERSION" != "$VERSION" ]]; then
 fi
 
 TOOL_COUNT=$(python3 -c "import json; print(len(json.load(open('manifest.json'))['tools']))")
-echo "  All files present. manifest v${MANIFEST_VERSION}, ${TOOL_COUNT} tools."
+CMD_COUNT=$(ls -1 commands/*.md 2>/dev/null | wc -l)
+if [[ "$CMD_COUNT" -eq 0 ]]; then
+    echo "  ERROR: No command files found in commands/"
+    exit 1
+fi
+echo "  All files present. manifest v${MANIFEST_VERSION}, ${TOOL_COUNT} tools, ${CMD_COUNT} commands, 1 skill."
 
 # ── 3. Build DXT ─────────────────────────────────────────────────────
 echo "[3/6] Building ${DXT_NAME}..."
@@ -49,13 +57,16 @@ zip -q "${DXT_NAME}" \
     manifest.json \
     pyproject.toml \
     requirements.txt \
+    README.md \
     src/research_match_server.py \
-    assets/icon.png
+    assets/icon.png \
+    .python-version
 echo "  Done."
 
 # ── 4. Generate plugin temporaries ───────────────────────────────────
 echo "[4/6] Generating plugin metadata..."
 mkdir -p .build_tmp/.claude-plugin
+mkdir -p .build_tmp/.claude
 
 # Generate .claude-plugin/plugin.json
 cat > .build_tmp/.claude-plugin/plugin.json << 'PLUGIN_EOF'
@@ -63,13 +74,14 @@ cat > .build_tmp/.claude-plugin/plugin.json << 'PLUGIN_EOF'
   "name": "research-match",
   "version": "2.8.0",
   "description": "MCP server with 24 tools that connects isolated researchers via AI originality scoring, bilateral matching, collaboration contracts, and privacy-first knowledge sharing.",
-  "entry_point": "src/research_match_server.py",
-  "runtime": "python",
-  "min_python_version": "3.12"
+  "author": {
+    "name": "faustojdb"
+  },
+  "keywords": ["research", "collaboration", "matching", "originality", "mcp", "ai"]
 }
 PLUGIN_EOF
 
-# Generate .mcp.json
+# Generate .mcp.json (MCP server definition)
 cat > .build_tmp/.mcp.json << 'MCP_EOF'
 {
   "mcpServers": {
@@ -84,6 +96,44 @@ cat > .build_tmp/.mcp.json << 'MCP_EOF'
 }
 MCP_EOF
 
+# Generate .claude/settings.local.json (enables MCP server + pre-allows tools)
+cat > .build_tmp/.claude/settings.local.json << 'SETTINGS_EOF'
+{
+  "permissions": {
+    "allow": [
+      "mcp__research-match__research_match_register",
+      "mcp__research-match__research_match_analyze_work",
+      "mcp__research-match__research_match_submit_commit",
+      "mcp__research-match__research_match_my_profile",
+      "mcp__research-match__research_match_find_collaborators",
+      "mcp__research-match__research_match_send_request",
+      "mcp__research-match__research_match_inbox",
+      "mcp__research-match__research_match_respond_request",
+      "mcp__research-match__research_match_rate_user",
+      "mcp__research-match__research_match_cold_search",
+      "mcp__research-match__research_match_deep_search",
+      "mcp__research-match__research_match_prepare_commit",
+      "mcp__research-match__research_match_needs_create",
+      "mcp__research-match__research_match_needs_list",
+      "mcp__research-match__research_match_needs_resolve",
+      "mcp__research-match__research_match_reveal_request",
+      "mcp__research-match__research_match_reveal_respond",
+      "mcp__research-match__research_match_reveal_status",
+      "mcp__research-match__research_match_team_license",
+      "mcp__research-match__research_match_share_file",
+      "mcp__research-match__research_match_shared_files",
+      "mcp__research-match__research_match_audit_log",
+      "mcp__research-match__research_match_export_contract",
+      "mcp__research-match__research_match_confirm_contract"
+    ]
+  },
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "research-match"
+  ]
+}
+SETTINGS_EOF
+
 echo "  Done."
 
 # ── 5. Build Plugin ZIP ──────────────────────────────────────────────
@@ -92,12 +142,17 @@ zip -q "${ZIP_NAME}" \
     manifest.json \
     pyproject.toml \
     requirements.txt \
+    README.md \
     src/research_match_server.py \
-    assets/icon.png
+    assets/icon.png \
+    .python-version \
+    commands/*.md \
+    skills/research-match/SKILL.md
 
 # Add plugin metadata from temp dir
 (cd .build_tmp && zip -q "../${ZIP_NAME}" \
     .claude-plugin/plugin.json \
+    .claude/settings.local.json \
     .mcp.json)
 echo "  Done."
 
