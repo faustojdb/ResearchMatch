@@ -1776,16 +1776,16 @@ async def health_endpoint(request):
 # =============================================================================
 
 def _get_db(ctx) -> sqlite3.Connection:
-    return ctx.request_context.lifespan_state["db"]
+    return ctx.request_context.lifespan_context["db"]
 
 def _get_evaluator(ctx) -> OriginalityEvaluator:
-    return ctx.request_context.lifespan_state["evaluator"]
+    return ctx.request_context.lifespan_context["evaluator"]
 
 def _get_matcher(ctx) -> MatchingEngine:
-    return ctx.request_context.lifespan_state["matcher"]
+    return ctx.request_context.lifespan_context["matcher"]
 
 def _get_reputation(ctx) -> ReputationEngine:
-    return ctx.request_context.lifespan_state["reputation"]
+    return ctx.request_context.lifespan_context["reputation"]
 
 def _get_or_create_user(db: sqlite3.Connection, email: str, pseudonym: Optional[str] = None) -> str:
     """Get existing user or create new one by email hash."""
