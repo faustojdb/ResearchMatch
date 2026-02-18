@@ -1,5 +1,6 @@
 # Virtual environment
 .venv/
+venv/
 
 # Database files
 *.db
@@ -23,3 +24,20 @@ Thumbs.db
 # Claude local config
 .claude/
 .mcp.json
+
+# Firebase emulator logs
+firestore-debug.log
+ui-debug.log
+*-debug.log
+
+# Build artifacts
+*.dxt
+*.zip
+build_alpha.sh
+
+# Reference repos (large, not committed)
+research_refs/
+
+# Ad-hoc test scripts
+test_whatsapp_*.py
+test_deep_search_real.py
