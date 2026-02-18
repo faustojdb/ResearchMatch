@@ -537,10 +537,12 @@ class FirestoreDataStore(DataStore):
                 return rec
         return None
 
-    async def update_request_status(self, request_id: str, status: str) -> None:
+    async def update_request_status(
+        self, request_id: str, status: str, responded_at: Optional[str] = None
+    ) -> None:
         self._requests_ref().document(request_id).update({
             "status": status,
-            "responded_at": _now_iso(),
+            "responded_at": responded_at or _now_iso(),
         })
 
     async def count_pending_requests(self) -> int:
@@ -621,10 +623,12 @@ class FirestoreDataStore(DataStore):
             "license_updated_at": None,
         })
 
-    async def update_team_license(self, team_id: str, license_type: str) -> None:
+    async def update_team_license(
+        self, team_id: str, license_type: str, updated_at: Optional[str] = None
+    ) -> None:
         self._teams_ref().document(team_id).update({
             "license_type": license_type,
-            "license_updated_at": _now_iso(),
+            "license_updated_at": updated_at or _now_iso(),
         })
 
     async def count_teams(self) -> int:
@@ -1029,19 +1033,29 @@ class FirestoreDataStore(DataStore):
         data["resolved_at"] = None
         self._team_consents_ref(team_id).document(consent_id).set(data)
 
-    async def update_reveal_consent_status(self, consent_id: str, status: str) -> None:
-        # Find via collection group
-        docs = list(
-            self.db.collection_group("reveal_consents")
-            .where(filter=FieldFilter("consent_id", "==", consent_id))
-            .limit(1)
-            .stream()
-        )
-        if docs:
-            docs[0].reference.update({
+    async def update_reveal_consent_status(
+        self, consent_id: str, status: str,
+        team_id: Optional[str] = None, resolved_at: Optional[str] = None
+    ) -> None:
+        # If team_id provided, go direct; otherwise use collection group
+        if team_id:
+            doc_ref = self._team_consents_ref(team_id).document(consent_id)
+            doc_ref.update({
                 "status": status,
-                "resolved_at": _now_iso(),
+                "resolved_at": resolved_at or _now_iso(),
             })
+        else:
+            docs = list(
+                self.db.collection_group("reveal_consents")
+                .where(filter=FieldFilter("consent_id", "==", consent_id))
+                .limit(1)
+                .stream()
+            )
+            if docs:
+                docs[0].reference.update({
+                    "status": status,
+                    "resolved_at": resolved_at or _now_iso(),
+                })
 
     # =================================================================
     # SHARED FILES (subcollection: teams/{team_id}/shared_files)
@@ -1102,7 +1116,9 @@ class FirestoreDataStore(DataStore):
             data["shared_at"] = _now_iso()
         self._team_files_ref(team_id).document(file_id).set(data)
 
-    async def count_shared_files(self) -> int:
+    async def count_shared_files(self, team_id: Optional[str] = None) -> int:
+        if team_id:
+            return await self.count_shared_files_in_team(team_id)
         return len(list(self.db.collection_group("shared_files").select([]).stream()))
 
     # =================================================================
@@ -1315,10 +1331,27 @@ class FirestoreDataStore(DataStore):
     # =================================================================
 
     async def create_team_with_members(
-        self, team_id: str, team_name: str, license_type: str,
-        member_user_ids: list[str], role: str = "co-lead"
+        self,
+        team_id: str = "",
+        team_name: str = "",
+        license_type: str = "joint-equal",
+        member_user_ids: Optional[list[str]] = None,
+        role: str = "co-lead",
+        *,
+        team: Optional[Record] = None,
+        members: Optional[list[Record]] = None,
     ) -> None:
-        """Atomic batch: create team + all members."""
+        """Atomic batch: create team + all members.
+        Accepts either positional args or dict-based kwargs."""
+        # Resolve dict-based kwargs if provided
+        if team is not None:
+            team_id = team.get("id", team_id)
+            team_name = team.get("name", team_name)
+            license_type = team.get("license_type", license_type)
+            created_at = team.get("created_at", _now_iso())
+        else:
+            created_at = _now_iso()
+
         batch = self.db.batch()
 
         # Team document
@@ -1326,20 +1359,31 @@ class FirestoreDataStore(DataStore):
         batch.set(team_ref, {
             "name": team_name,
             "license_type": license_type,
-            "created_at": _now_iso(),
+            "created_at": created_at,
             "repository_url": None,
             "license_updated_at": None,
         })
 
-        # Member documents
-        for uid in member_user_ids:
-            member_ref = self._team_members_ref(team_id).document(uid)
-            batch.set(member_ref, {
-                "user_id": uid,
-                "role": role,
-                "contribution_percentage": None,
-                "joined_at": _now_iso(),
-            })
+        # Member documents — from member dicts or user_id list
+        if members is not None:
+            for m in members:
+                uid = m["user_id"]
+                member_ref = self._team_members_ref(team_id).document(uid)
+                batch.set(member_ref, {
+                    "user_id": uid,
+                    "role": m.get("role", role),
+                    "contribution_percentage": None,
+                    "joined_at": m.get("joined_at", _now_iso()),
+                })
+        elif member_user_ids:
+            for uid in member_user_ids:
+                member_ref = self._team_members_ref(team_id).document(uid)
+                batch.set(member_ref, {
+                    "user_id": uid,
+                    "role": role,
+                    "contribution_percentage": None,
+                    "joined_at": _now_iso(),
+                })
 
         batch.commit()
 

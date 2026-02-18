@@ -37,6 +37,8 @@ import numpy as np
 from mcp.server.fastmcp import FastMCP, Context
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 
+from .datastore import DataStore, Record
+
 
 # =============================================================================
 # LOGGING SETUP
@@ -598,16 +600,19 @@ class OriginalityEvaluator:
     v2.2: Uses sentence-transformers for semantic similarity (with Jaccard fallback).
     """
 
-    def __init__(self, db: sqlite3.Connection, embeddings: Optional[EmbeddingEngine] = None):
+    def __init__(self, db: Optional[sqlite3.Connection] = None,
+                 embeddings: Optional[EmbeddingEngine] = None,
+                 datastore: Optional[DataStore] = None):
         self.db = db
+        self.datastore = datastore
         self.embeddings = embeddings or EmbeddingEngine()
 
-    def evaluate_commit(self, commit_data: Dict[str, Any], user_id: str) -> Dict[str, Any]:
+    async def evaluate_commit(self, commit_data: Dict[str, Any], user_id: str) -> Dict[str, Any]:
         """Evaluate a Research Commit and return originality scores."""
         eval_logger = logging.getLogger("research_match.evaluator")
 
         # Get existing commits in the same domain for comparison
-        corpus = self._get_corpus(commit_data["domain"], commit_data.get("subdomain"), user_id)
+        corpus = await self._get_corpus_async(commit_data["domain"], commit_data.get("subdomain"), user_id)
         eval_logger.debug("Evaluating commit in %s/%s, corpus size: %d",
                           commit_data["domain"], commit_data.get("subdomain", ""), len(corpus))
 
@@ -699,8 +704,11 @@ class OriginalityEvaluator:
             )
         }
 
-    def _get_corpus(self, domain: str, subdomain: Optional[str], exclude_user: str) -> List[Dict]:
+    async def _get_corpus_async(self, domain: str, subdomain: Optional[str], exclude_user: str) -> List[Dict]:
         """Get existing commits in the same domain for comparison."""
+        if self.datastore:
+            return await self.datastore.get_corpus_commits(domain, exclude_user, subdomain)
+
         query = "SELECT * FROM research_commits WHERE domain = ? AND user_id != ?"
         params = [domain, exclude_user]
         if subdomain:
@@ -853,8 +861,10 @@ class ReputationEngine:
     have rated each other. This prevents strategic rating.
     """
 
-    def __init__(self, db: sqlite3.Connection):
+    def __init__(self, db: Optional[sqlite3.Connection] = None,
+                 datastore: Optional[DataStore] = None):
         self.db = db
+        self.datastore = datastore
 
     def _compute_reputation_score(self, avg_honesty: float, avg_quality: float,
                                    avg_effort: float, total_ratings: int) -> float:
@@ -882,19 +892,22 @@ class ReputationEngine:
 
         return round(reputation, 1)
 
-    def calculate_reputation(self, user_id: str) -> Dict[str, Any]:
+    async def calculate_reputation(self, user_id: str) -> Dict[str, Any]:
         """Calculate composite reputation for a user.
 
         Uses running averages if available (O(1)), falls back to batch recalculation.
         """
-        user = self.db.execute(
-            "SELECT running_honesty, running_quality, running_effort, total_ratings_received FROM users WHERE id = ?",
-            (user_id,)
-        ).fetchone()
-
-        total_ratings = self.db.execute(
-            "SELECT COUNT(*) as c FROM ratings WHERE rated_id = ?", (user_id,)
-        ).fetchone()["c"]
+        if self.datastore:
+            user = await self.datastore.get_user_running_averages(user_id)
+            total_ratings = await self.datastore.count_ratings_received(user_id)
+        else:
+            user = self.db.execute(
+                "SELECT running_honesty, running_quality, running_effort, total_ratings_received FROM users WHERE id = ?",
+                (user_id,)
+            ).fetchone()
+            total_ratings = self.db.execute(
+                "SELECT COUNT(*) as c FROM ratings WHERE rated_id = ?", (user_id,)
+            ).fetchone()["c"]
 
         if total_ratings < MIN_RATINGS_FOR_REPUTATION:
             return {
@@ -914,7 +927,7 @@ class ReputationEngine:
             avg_effort = user["running_effort"]
         else:
             # Fallback: batch recalculate
-            avgs = self._batch_recalculate(user_id)
+            avgs = await self._batch_recalculate(user_id)
             avg_honesty = avgs["avg_honesty"]
             avg_quality = avgs["avg_quality"]
             avg_effort = avgs["avg_effort"]
@@ -930,45 +943,54 @@ class ReputationEngine:
             "status": "calculated",
         }
 
-    def apply_new_rating(self, user_id: str, honesty: int, quality: int, effort: int) -> None:
+    async def apply_new_rating(self, user_id: str, honesty: int, quality: int, effort: int) -> None:
         """Apply a single new rating using exponential smoothing O(1).
 
         Formula: new_avg = alpha * new_value + (1 - alpha) * old_avg
         """
-        user = self.db.execute(
-            "SELECT running_honesty, running_quality, running_effort FROM users WHERE id = ?",
-            (user_id,)
-        ).fetchone()
+        if self.datastore:
+            user = await self.datastore.get_user_running_averages(user_id)
+        else:
+            user = self.db.execute(
+                "SELECT running_honesty, running_quality, running_effort FROM users WHERE id = ?",
+                (user_id,)
+            ).fetchone()
 
         alpha = REPUTATION_ALPHA
 
-        if user and user["running_honesty"] is not None:
+        if user and user.get("running_honesty") is not None:
             new_honesty = alpha * honesty + (1 - alpha) * user["running_honesty"]
             new_quality = alpha * quality + (1 - alpha) * user["running_quality"]
             new_effort = alpha * effort + (1 - alpha) * user["running_effort"]
         else:
             # First rating or migration: initialize from batch
-            avgs = self._batch_recalculate(user_id)
+            avgs = await self._batch_recalculate(user_id)
             new_honesty = avgs["avg_honesty"]
             new_quality = avgs["avg_quality"]
             new_effort = avgs["avg_effort"]
 
-        self.db.execute("""
-            UPDATE users SET running_honesty = ?, running_quality = ?, running_effort = ?
-            WHERE id = ?
-        """, (new_honesty, new_quality, new_effort, user_id))
-        self.db.commit()
+        if self.datastore:
+            await self.datastore.update_user_running_averages(user_id, new_honesty, new_quality, new_effort)
+        else:
+            self.db.execute("""
+                UPDATE users SET running_honesty = ?, running_quality = ?, running_effort = ?
+                WHERE id = ?
+            """, (new_honesty, new_quality, new_effort, user_id))
+            self.db.commit()
 
-    def _batch_recalculate(self, user_id: str) -> Dict[str, float]:
+    async def _batch_recalculate(self, user_id: str) -> Dict[str, float]:
         """Recalculate running averages from all ratings (migration/fallback).
 
         Uses temporal weighting: recent ratings count more.
         Also stores the result as running averages for future O(1) updates.
         """
-        ratings = self.db.execute(
-            "SELECT * FROM ratings WHERE rated_id = ? ORDER BY created_at DESC",
-            (user_id,)
-        ).fetchall()
+        if self.datastore:
+            ratings = await self.datastore.get_ratings_received_desc(user_id)
+        else:
+            ratings = self.db.execute(
+                "SELECT * FROM ratings WHERE rated_id = ? ORDER BY created_at DESC",
+                (user_id,)
+            ).fetchall()
 
         if not ratings:
             return {"avg_honesty": 0.0, "avg_quality": 0.0, "avg_effort": 0.0}
@@ -991,11 +1013,14 @@ class ReputationEngine:
         avg_effort = weighted_effort / total_weight
 
         # Store as running averages
-        self.db.execute("""
-            UPDATE users SET running_honesty = ?, running_quality = ?, running_effort = ?
-            WHERE id = ?
-        """, (avg_honesty, avg_quality, avg_effort, user_id))
-        self.db.commit()
+        if self.datastore:
+            await self.datastore.update_user_running_averages(user_id, avg_honesty, avg_quality, avg_effort)
+        else:
+            self.db.execute("""
+                UPDATE users SET running_honesty = ?, running_quality = ?, running_effort = ?
+                WHERE id = ?
+            """, (avg_honesty, avg_quality, avg_effort, user_id))
+            self.db.commit()
 
         return {
             "avg_honesty": avg_honesty,
@@ -1003,51 +1028,60 @@ class ReputationEngine:
             "avg_effort": avg_effort,
         }
 
-    def update_user_reputation(self, user_id: str) -> None:
-        """Recalculate and store reputation for a user.
+    async def update_user_reputation(self, user_id: str) -> None:
+        """Recalculate and store reputation for a user."""
+        rep = await self.calculate_reputation(user_id)
+        if self.datastore:
+            await self.datastore.update_user_reputation_stats(
+                user_id, rep["reputation_score"], rep["total_ratings"],
+                rep["avg_honesty"], rep["avg_quality"], rep["avg_effort"])
+        else:
+            self.db.execute("""
+                UPDATE users SET
+                    reputation_score = ?,
+                    total_ratings_received = ?,
+                    avg_honesty = ?,
+                    avg_quality = ?,
+                    avg_effort = ?
+                WHERE id = ?
+            """, (
+                rep["reputation_score"],
+                rep["total_ratings"],
+                rep["avg_honesty"],
+                rep["avg_quality"],
+                rep["avg_effort"],
+                user_id
+            ))
+            self.db.commit()
 
-        Uses apply_new_rating for incremental path when possible.
-        """
-        rep = self.calculate_reputation(user_id)
-        self.db.execute("""
-            UPDATE users SET
-                reputation_score = ?,
-                total_ratings_received = ?,
-                avg_honesty = ?,
-                avg_quality = ?,
-                avg_effort = ?
-            WHERE id = ?
-        """, (
-            rep["reputation_score"],
-            rep["total_ratings"],
-            rep["avg_honesty"],
-            rep["avg_quality"],
-            rep["avg_effort"],
-            user_id
-        ))
-        self.db.commit()
-
-    def check_both_rated(self, team_id: str, user_a_id: str, user_b_id: str) -> bool:
+    async def check_both_rated(self, team_id: str, user_a_id: str, user_b_id: str) -> bool:
         """Check if both team members have rated each other."""
-        a_rated_b = self.db.execute(
-            "SELECT id FROM ratings WHERE team_id = ? AND rater_id = ? AND rated_id = ?",
-            (team_id, user_a_id, user_b_id)
-        ).fetchone()
-        b_rated_a = self.db.execute(
-            "SELECT id FROM ratings WHERE team_id = ? AND rater_id = ? AND rated_id = ?",
-            (team_id, user_b_id, user_a_id)
-        ).fetchone()
+        if self.datastore:
+            a_rated_b = await self.datastore.find_rating(team_id, user_a_id, user_b_id)
+            b_rated_a = await self.datastore.find_rating(team_id, user_b_id, user_a_id)
+        else:
+            a_rated_b = self.db.execute(
+                "SELECT id FROM ratings WHERE team_id = ? AND rater_id = ? AND rated_id = ?",
+                (team_id, user_a_id, user_b_id)
+            ).fetchone()
+            b_rated_a = self.db.execute(
+                "SELECT id FROM ratings WHERE team_id = ? AND rater_id = ? AND rated_id = ?",
+                (team_id, user_b_id, user_a_id)
+            ).fetchone()
         return bool(a_rated_b and b_rated_a)
 
-    def reveal_ratings(self, team_id: str) -> None:
+    async def reveal_ratings(self, team_id: str) -> None:
         """Mark all ratings in a team as revealed (both have rated)."""
-        self.db.execute(
-            "UPDATE ratings SET is_revealed = 1 WHERE team_id = ?",
-            (team_id,)
-        )
-        self.db.commit()
+        if self.datastore:
+            await self.datastore.reveal_team_ratings(team_id)
+        else:
+            self.db.execute(
+                "UPDATE ratings SET is_revealed = 1 WHERE team_id = ?",
+                (team_id,)
+            )
+            self.db.commit()
 
-    def detect_abuse_patterns(self, rater_id: str) -> Dict[str, Any]:
+    async def detect_abuse_patterns(self, rater_id: str) -> Dict[str, Any]:
         """Detect if a rater shows patterns of abusive rating behavior.
 
         Flags:
@@ -1055,10 +1089,13 @@ class ReputationEngine:
         - Always gives 5-star (inflating)
         - Rates too quickly after team formation (didn't actually collaborate)
         """
-        ratings_given = self.db.execute(
-            "SELECT * FROM ratings WHERE rater_id = ? ORDER BY created_at DESC",
-            (rater_id,)
-        ).fetchall()
+        if self.datastore:
+            ratings_given = await self.datastore.get_ratings_given_desc(rater_id)
+        else:
+            ratings_given = self.db.execute(
+                "SELECT * FROM ratings WHERE rater_id = ? ORDER BY created_at DESC",
+                (rater_id,)
+            ).fetchall()
 
         if len(ratings_given) < 3:
             return {"abuse_detected": False, "flags": []}
@@ -1096,19 +1133,25 @@ class MatchingEngine:
     v2.2: Uses sentence-transformers for semantic base similarity (with Jaccard fallback).
     """
 
-    def __init__(self, db: sqlite3.Connection, embeddings: Optional[EmbeddingEngine] = None):
+    def __init__(self, db: Optional[sqlite3.Connection] = None,
+                 embeddings: Optional[EmbeddingEngine] = None,
+                 datastore: Optional[DataStore] = None):
         self.db = db
+        self.datastore = datastore
         self.embeddings = embeddings or EmbeddingEngine()
 
-    def find_matches(self, user_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+    async def find_matches(self, user_id: str, limit: int = 10) -> List[Dict[str, Any]]:
         """Find potential collaborators for a user."""
         match_logger = logging.getLogger("research_match.matcher")
 
         # Get user's latest commit
-        user_commit = self.db.execute(
-            "SELECT * FROM research_commits WHERE user_id = ? ORDER BY version DESC LIMIT 1",
-            (user_id,)
-        ).fetchone()
+        if self.datastore:
+            user_commit = await self.datastore.get_latest_commit_by_user(user_id)
+        else:
+            user_commit = self.db.execute(
+                "SELECT * FROM research_commits WHERE user_id = ? ORDER BY version DESC LIMIT 1",
+                (user_id,)
+            ).fetchone()
 
         if not user_commit:
             return []
@@ -1116,21 +1159,25 @@ class MatchingEngine:
         user_commit = dict(user_commit)
 
         # Find commits in same/similar domain
-        candidates = self.db.execute("""
-            SELECT rc.*, u.pseudonym, u.reputation_score,
-                   u.total_ratings_received, u.avg_honesty, u.avg_quality, u.avg_effort
-            FROM research_commits rc
-            JOIN users u ON rc.user_id = u.id
-            WHERE rc.user_id != ?
-            AND rc.domain = ?
-            AND rc.id IN (
-                SELECT id FROM research_commits
-                GROUP BY user_id
-                HAVING version = MAX(version)
-            )
-            ORDER BY rc.created_at DESC
-            LIMIT ?
-        """, (user_id, user_commit["domain"], limit * 3)).fetchall()
+        if self.datastore:
+            candidates = await self.datastore.find_candidate_commits_in_domain(
+                user_id, user_commit["domain"])
+        else:
+            candidates = self.db.execute("""
+                SELECT rc.*, u.pseudonym, u.reputation_score,
+                       u.total_ratings_received, u.avg_honesty, u.avg_quality, u.avg_effort
+                FROM research_commits rc
+                JOIN users u ON rc.user_id = u.id
+                WHERE rc.user_id != ?
+                AND rc.domain = ?
+                AND rc.id IN (
+                    SELECT id FROM research_commits
+                    GROUP BY user_id
+                    HAVING version = MAX(version)
+                )
+                ORDER BY rc.created_at DESC
+                LIMIT ?
+            """, (user_id, user_commit["domain"], limit * 3)).fetchall()
 
         matches = []
         for candidate in candidates:
@@ -1689,19 +1736,43 @@ _server_start_time: Optional[str] = None
 
 @asynccontextmanager
 async def app_lifespan(app):
-    """Initialize database and engines."""
+    """Initialize database/datastore and engines."""
     global _server_start_time
     _server_start_time = datetime.now(timezone.utc).isoformat()
-    db = init_database(DB_PATH)
+
+    # Determine backend: Firestore if GOOGLE_APPLICATION_CREDENTIALS is set, else SQLite
+    use_firestore = bool(os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"))
+
+    if use_firestore:
+        from .firestore_datastore import FirestoreDataStore
+        from .firebase_init import init_firebase
+        init_firebase()
+        datastore = FirestoreDataStore()
+        await datastore.initialize()
+        db = None  # No SQLite in Firestore mode
+    else:
+        datastore = None
+        db = init_database(DB_PATH)
+
+    # Compute user identity for multi-user mode
+    user_email = os.environ.get("RESEARCH_MATCH_USER_EMAIL", "")
+    user_email_hash = ""
+    if user_email:
+        user_email_hash = hashlib.sha256(user_email.lower().strip().encode()).hexdigest()
+
     embeddings = EmbeddingEngine()
-    evaluator = OriginalityEvaluator(db, embeddings)
-    matcher = MatchingEngine(db, embeddings)
-    reputation = ReputationEngine(db)
+    evaluator = OriginalityEvaluator(db=db, embeddings=embeddings, datastore=datastore)
+    matcher = MatchingEngine(db=db, embeddings=embeddings, datastore=datastore)
+    reputation = ReputationEngine(db=db, datastore=datastore)
     yield {
-        "db": db, "evaluator": evaluator, "matcher": matcher,
-        "reputation": reputation, "embeddings": embeddings,
+        "db": db, "datastore": datastore, "evaluator": evaluator,
+        "matcher": matcher, "reputation": reputation,
+        "embeddings": embeddings, "user_email_hash": user_email_hash,
     }
-    db.close()
+    if db:
+        db.close()
+    if datastore:
+        await datastore.close()
 
 
 mcp = FastMCP("research_match_mcp", lifespan=app_lifespan)
@@ -1713,6 +1784,17 @@ mcp = FastMCP("research_match_mcp", lifespan=app_lifespan)
 
 def _health_stats() -> Dict[str, Any]:
     """Gather health statistics from the database."""
+    use_firestore = bool(os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"))
+    if use_firestore:
+        # Firestore mode — return basic stats without DB queries
+        return {
+            "status": "ok",
+            "version": SERVER_VERSION,
+            "started_at": _server_start_time,
+            "database": "firestore",
+            "backend": "firestore",
+            "message": "Health stats in Firestore mode — use individual tools for counts.",
+        }
     try:
         db = sqlite3.connect(DB_PATH)
         db.row_factory = sqlite3.Row
@@ -1775,8 +1857,11 @@ async def health_endpoint(request):
 # HELPER FUNCTIONS
 # =============================================================================
 
-def _get_db(ctx) -> sqlite3.Connection:
-    return ctx.request_context.lifespan_context["db"]
+def _get_db(ctx) -> Optional[sqlite3.Connection]:
+    return ctx.request_context.lifespan_context.get("db")
+
+def _get_datastore(ctx) -> Optional[DataStore]:
+    return ctx.request_context.lifespan_context.get("datastore")
 
 def _get_evaluator(ctx) -> OriginalityEvaluator:
     return ctx.request_context.lifespan_context["evaluator"]
@@ -1787,10 +1872,26 @@ def _get_matcher(ctx) -> MatchingEngine:
 def _get_reputation(ctx) -> ReputationEngine:
     return ctx.request_context.lifespan_context["reputation"]
 
-def _get_or_create_user(db: sqlite3.Connection, email: str, pseudonym: Optional[str] = None) -> str:
+def _get_user_email_hash(ctx) -> str:
+    return ctx.request_context.lifespan_context.get("user_email_hash", "")
+
+async def _get_or_create_user(db: Optional[sqlite3.Connection], email: str,
+                               pseudonym: Optional[str] = None,
+                               datastore: Optional[DataStore] = None) -> str:
     """Get existing user or create new one by email hash."""
     email_hash = hashlib.sha256(email.lower().strip().encode()).hexdigest()
 
+    if datastore:
+        rec = await datastore.find_user_by_email_hash(email_hash)
+        if rec:
+            return rec["id"]
+        user_id = str(uuid.uuid4())
+        if not pseudonym:
+            pseudonym = f"researcher-{user_id[:8]}"
+        await datastore.insert_user(user_id, pseudonym, email_hash)
+        return user_id
+
+    # SQLite fallback
     row = db.execute("SELECT id FROM users WHERE email_hash = ?", (email_hash,)).fetchone()
     if row:
         return row["id"]
@@ -1806,8 +1907,21 @@ def _get_or_create_user(db: sqlite3.Connection, email: str, pseudonym: Optional[
     db.commit()
     return user_id
 
-def _get_current_user(db: sqlite3.Connection) -> Optional[Dict]:
-    """Get the most recently created user (for single-user MVP)."""
+async def _get_current_user(db: Optional[sqlite3.Connection],
+                             datastore: Optional[DataStore] = None,
+                             user_email_hash: str = "") -> Optional[Dict]:
+    """Get the current user.
+
+    Multi-user mode (Firestore): looks up user by email hash from env var.
+    Single-user mode (SQLite): returns most recently created user.
+    """
+    if datastore and user_email_hash:
+        rec = await datastore.find_user_by_email_hash(user_email_hash)
+        return rec
+    if datastore:
+        rec = await datastore.get_most_recent_user()
+        return rec
+    # SQLite fallback
     row = db.execute("SELECT * FROM users ORDER BY created_at DESC LIMIT 1").fetchone()
     return dict(row) if row else None
 
@@ -1837,21 +1951,28 @@ def _reputation_badge(score: float, total_ratings: int) -> str:
         return f"🚩 Low ({score:.0f}/100, {total_ratings} ratings)"
 
 
-def _write_audit_log(db: sqlite3.Connection, team_id: str, actor_id: str,
-                     action: str, resource_ref: str = None, details: dict = None) -> str:
-    """Write an immutable entry to the audit log. Returns the log entry ID."""
+async def _write_audit_log(db_or_ds, team_id: str, actor_id: str,
+                           action: str, resource_ref: str = None, details: dict = None) -> str:
+    """Write an immutable entry to the audit log. Returns the log entry ID.
+
+    db_or_ds: either a sqlite3.Connection or a DataStore instance.
+    """
     log_id = str(uuid.uuid4())
-    db.execute(
-        """INSERT INTO audit_log (id, team_id, actor_id, action, resource_ref, details)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (log_id, team_id, actor_id, action, resource_ref,
-         json.dumps(details) if details else None)
-    )
+    details_str = json.dumps(details) if details else None
+
+    if isinstance(db_or_ds, DataStore):
+        await db_or_ds.insert_audit_entry(log_id, team_id, actor_id, action, resource_ref, details_str)
+    elif db_or_ds is not None:
+        db_or_ds.execute(
+            """INSERT INTO audit_log (id, team_id, actor_id, action, resource_ref, details)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (log_id, team_id, actor_id, action, resource_ref, details_str)
+        )
     return log_id
 
 
-def _check_resharing_violation(db: sqlite3.Connection, user_id: str,
-                               file_hash: str) -> Optional[dict]:
+async def _check_resharing_violation(db_or_ds, user_id: str,
+                                      file_hash: str) -> Optional[dict]:
     """Check if a file hash was already shared by a DIFFERENT user.
 
     Returns violation info dict if found, None otherwise.
@@ -1860,7 +1981,19 @@ def _check_resharing_violation(db: sqlite3.Connection, user_id: str,
     """
     if file_hash is None:
         return None
-    row = db.execute(
+
+    if isinstance(db_or_ds, DataStore):
+        rec = await db_or_ds.find_file_by_hash_other_user(file_hash, user_id)
+        if rec:
+            return {
+                "original_file_id": rec["id"],
+                "original_team_id": rec["team_id"],
+                "origin_user_id": rec["origin_user_id"],
+                "file_path": rec["file_path"],
+            }
+        return None
+
+    row = db_or_ds.execute(
         "SELECT id, team_id, origin_user_id, file_path FROM shared_files "
         "WHERE file_hash = ? AND origin_user_id != ? LIMIT 1",
         (file_hash, user_id)
@@ -1877,23 +2010,28 @@ def _check_resharing_violation(db: sqlite3.Connection, user_id: str,
 
 # --- Contract Helpers (NEED-08) ---
 
-def _generate_contract_content(db: sqlite3.Connection, team_id: str,
-                                license_info: dict, contract_version: int) -> str:
+async def _generate_contract_content(db: Optional[sqlite3.Connection], team_id: str,
+                                      license_info: dict, contract_version: int,
+                                      datastore: Optional[DataStore] = None) -> str:
     """Generate a human-readable markdown collaboration contract.
 
     Includes both parties, their latest commits with scores, license terms,
     contribution split, reveal state, and verification instructions.
     """
-    team = db.execute("SELECT * FROM teams WHERE id = ?", (team_id,)).fetchone()
-    team_name = team["name"] if team else f"team-{team_id[:8]}"
-
-    members = db.execute(
-        """SELECT tm.user_id, tm.role, tm.contribution_percentage, tm.joined_at,
-                  u.pseudonym, u.reputation_score
-           FROM team_members tm JOIN users u ON tm.user_id = u.id
-           WHERE tm.team_id = ?""",
-        (team_id,)
-    ).fetchall()
+    if datastore:
+        team = await datastore.get_team_by_id(team_id)
+        team_name = team["name"] if team else f"team-{team_id[:8]}"
+        members = await datastore.get_team_members_with_profiles(team_id)
+    else:
+        team = db.execute("SELECT * FROM teams WHERE id = ?", (team_id,)).fetchone()
+        team_name = team["name"] if team else f"team-{team_id[:8]}"
+        members = db.execute(
+            """SELECT tm.user_id, tm.role, tm.contribution_percentage, tm.joined_at,
+                      u.pseudonym, u.reputation_score
+               FROM team_members tm JOIN users u ON tm.user_id = u.id
+               WHERE tm.team_id = ?""",
+            (team_id,)
+        ).fetchall()
 
     now = datetime.now(timezone.utc).isoformat()
     contract_id = f"{team_id[:8]}-v{contract_version}"
@@ -1929,14 +2067,17 @@ def _generate_contract_content(db: sqlite3.Connection, team_id: str,
         lines.append(f"- **Reputation:** {rep:.1f}")
 
         # Latest commit
-        commit = db.execute(
-            """SELECT id, version, domain, problem, content_hash,
-                      ot_score, ofc_score, overall_solidity,
-                      git_repo_url, git_commit_hash
-               FROM research_commits WHERE user_id = ?
-               ORDER BY version DESC LIMIT 1""",
-            (m["user_id"],)
-        ).fetchone()
+        if datastore:
+            commit = await datastore.get_latest_commit_by_user(m["user_id"])
+        else:
+            commit = db.execute(
+                """SELECT id, version, domain, problem, content_hash,
+                          ot_score, ofc_score, overall_solidity,
+                          git_repo_url, git_commit_hash
+                   FROM research_commits WHERE user_id = ?
+                   ORDER BY version DESC LIMIT 1""",
+                (m["user_id"],)
+            ).fetchone()
 
         if commit:
             c = dict(commit)
@@ -2435,7 +2576,8 @@ def _validate_narrative(machine_dict: dict, narrative: ProformaNarrativeData) ->
     return {"errors": errors, "warnings": warnings}
 
 
-def _compute_license(db: sqlite3.Connection, team_id: str) -> dict:
+async def _compute_license(db: Optional[sqlite3.Connection], team_id: str,
+                            datastore: Optional[DataStore] = None) -> dict:
     """Compute license type and contribution split based on team activity.
 
     Pure function (reads DB only, no writes). Evaluates 5 rules in order:
@@ -2446,12 +2588,15 @@ def _compute_license(db: sqlite3.Connection, team_id: str) -> dict:
       R5: Team >30 days old with no reveals → time-limited
     """
     # Get team members
-    members = db.execute(
-        """SELECT tm.user_id, u.pseudonym
-           FROM team_members tm JOIN users u ON tm.user_id = u.id
-           WHERE tm.team_id = ?""",
-        (team_id,)
-    ).fetchall()
+    if datastore:
+        members = await datastore.get_team_member_pseudonyms(team_id)
+    else:
+        members = db.execute(
+            """SELECT tm.user_id, u.pseudonym
+               FROM team_members tm JOIN users u ON tm.user_id = u.id
+               WHERE tm.team_id = ?""",
+            (team_id,)
+        ).fetchall()
     if len(members) < 2:
         return {
             "license_type": "joint-equal",
@@ -2466,19 +2611,25 @@ def _compute_license(db: sqlite3.Connection, team_id: str) -> dict:
     member_b = dict(members[1])
 
     # Check approved Level 3 reveals in each direction
-    a_revealed_to_b = db.execute(
-        """SELECT COUNT(*) as c FROM reveal_consents
-           WHERE team_id = ? AND level = 3 AND status = 'approved'
-             AND approver_id = ? AND requester_id = ?""",
-        (team_id, member_a["user_id"], member_b["user_id"])
-    ).fetchone()["c"]  # A approved B's request → A revealed to B
+    if datastore:
+        a_revealed_to_b = await datastore.count_approved_reveals_direction(
+            team_id, member_a["user_id"], member_b["user_id"])
+        b_revealed_to_a = await datastore.count_approved_reveals_direction(
+            team_id, member_b["user_id"], member_a["user_id"])
+    else:
+        a_revealed_to_b = db.execute(
+            """SELECT COUNT(*) as c FROM reveal_consents
+               WHERE team_id = ? AND level = 3 AND status = 'approved'
+                 AND approver_id = ? AND requester_id = ?""",
+            (team_id, member_a["user_id"], member_b["user_id"])
+        ).fetchone()["c"]
 
-    b_revealed_to_a = db.execute(
-        """SELECT COUNT(*) as c FROM reveal_consents
-           WHERE team_id = ? AND level = 3 AND status = 'approved'
-             AND approver_id = ? AND requester_id = ?""",
-        (team_id, member_b["user_id"], member_a["user_id"])
-    ).fetchone()["c"]  # B approved A's request → B revealed to A
+        b_revealed_to_a = db.execute(
+            """SELECT COUNT(*) as c FROM reveal_consents
+               WHERE team_id = ? AND level = 3 AND status = 'approved'
+                 AND approver_id = ? AND requester_id = ?""",
+            (team_id, member_b["user_id"], member_a["user_id"])
+        ).fetchone()["c"]
 
     total_reveals = a_revealed_to_b + b_revealed_to_a
     bilateral = a_revealed_to_b > 0 and b_revealed_to_a > 0
@@ -2495,17 +2646,21 @@ def _compute_license(db: sqlite3.Connection, team_id: str) -> dict:
         reveal_state = "none"
 
     # Count resolved tickets per member
-    tickets_a = db.execute(
-        """SELECT COUNT(*) as c FROM team_tickets
-           WHERE team_id = ? AND resolved_by = ? AND status = 'resolved'""",
-        (team_id, member_a["user_id"])
-    ).fetchone()["c"]
+    if datastore:
+        tickets_a = await datastore.count_resolved_tickets_by_member(team_id, member_a["user_id"])
+        tickets_b = await datastore.count_resolved_tickets_by_member(team_id, member_b["user_id"])
+    else:
+        tickets_a = db.execute(
+            """SELECT COUNT(*) as c FROM team_tickets
+               WHERE team_id = ? AND resolved_by = ? AND status = 'resolved'""",
+            (team_id, member_a["user_id"])
+        ).fetchone()["c"]
 
-    tickets_b = db.execute(
-        """SELECT COUNT(*) as c FROM team_tickets
-           WHERE team_id = ? AND resolved_by = ? AND status = 'resolved'""",
-        (team_id, member_b["user_id"])
-    ).fetchone()["c"]
+        tickets_b = db.execute(
+            """SELECT COUNT(*) as c FROM team_tickets
+               WHERE team_id = ? AND resolved_by = ? AND status = 'resolved'""",
+            (team_id, member_b["user_id"])
+        ).fetchone()["c"]
 
     ticket_balance = {
         member_a["pseudonym"]: tickets_a,
@@ -2514,27 +2669,47 @@ def _compute_license(db: sqlite3.Connection, team_id: str) -> dict:
 
     # RULE 5: Team >30 days with no reveals → time-limited
     if total_reveals == 0:
-        team_row = db.execute("SELECT created_at FROM teams WHERE id = ?", (team_id,)).fetchone()
-        if team_row:
-            created = team_row["created_at"]
-            age_days_row = db.execute(
-                "SELECT julianday('now') - julianday(?) as age", (created,)
-            ).fetchone()
-            if age_days_row and age_days_row["age"] is not None and age_days_row["age"] > LICENSE_STALE_DAYS:
-                return {
-                    "license_type": "time-limited",
-                    "contribution_split": {
-                        member_a["pseudonym"]: 0,
-                        member_b["pseudonym"]: 0,
-                    },
-                    "rationale": (
-                        f"Team is {int(age_days_row['age'])} days old with no Level 3 reveals. "
-                        "Collaboration has not progressed to active sharing."
-                    ),
-                    "terms": LICENSE_TERMS["time-limited"],
-                    "reveal_state": reveal_state,
-                    "ticket_balance": ticket_balance,
-                }
+        if datastore:
+            created = await datastore.get_team_created_at(team_id)
+            if created:
+                age_days = await datastore.compute_age_in_days(created)
+                if age_days > LICENSE_STALE_DAYS:
+                    return {
+                        "license_type": "time-limited",
+                        "contribution_split": {
+                            member_a["pseudonym"]: 0,
+                            member_b["pseudonym"]: 0,
+                        },
+                        "rationale": (
+                            f"Team is {int(age_days)} days old with no Level 3 reveals. "
+                            "Collaboration has not progressed to active sharing."
+                        ),
+                        "terms": LICENSE_TERMS["time-limited"],
+                        "reveal_state": reveal_state,
+                        "ticket_balance": ticket_balance,
+                    }
+        else:
+            team_row = db.execute("SELECT created_at FROM teams WHERE id = ?", (team_id,)).fetchone()
+            if team_row:
+                created = team_row["created_at"]
+                age_days_row = db.execute(
+                    "SELECT julianday('now') - julianday(?) as age", (created,)
+                ).fetchone()
+                if age_days_row and age_days_row["age"] is not None and age_days_row["age"] > LICENSE_STALE_DAYS:
+                    return {
+                        "license_type": "time-limited",
+                        "contribution_split": {
+                            member_a["pseudonym"]: 0,
+                            member_b["pseudonym"]: 0,
+                        },
+                        "rationale": (
+                            f"Team is {int(age_days_row['age'])} days old with no Level 3 reveals. "
+                            "Collaboration has not progressed to active sharing."
+                        ),
+                        "terms": LICENSE_TERMS["time-limited"],
+                        "reveal_state": reveal_state,
+                        "ticket_balance": ticket_balance,
+                    }
 
     # RULE 1: No approved reveals → joint-equal (default)
     if total_reveals == 0:
@@ -2667,8 +2842,13 @@ async def research_match_register(params: RegisterInput, ctx: Context = None) ->
         str: JSON with user_id, pseudonym, and welcome message
     """
     db = _get_db(ctx)
-    user_id = _get_or_create_user(db, params.email, params.pseudonym)
-    user = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    datastore = _get_datastore(ctx)
+    user_id = await _get_or_create_user(db, params.email, params.pseudonym, datastore=datastore)
+
+    if datastore:
+        user = await datastore.get_user_by_id(user_id)
+    else:
+        user = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
 
     return json.dumps({
         "status": "registered",
@@ -2719,20 +2899,14 @@ async def research_match_submit_commit(params: SubmitCommitInput, ctx: Context =
         str: JSON with commit_id, version, OT/OFC scores, solidity impact, and breakdowns
     """
     db = _get_db(ctx)
+    datastore = _get_datastore(ctx)
     evaluator = _get_evaluator(ctx)
 
-    user = _get_current_user(db)
+    user = await _get_current_user(db, datastore=datastore, user_email_hash=_get_user_email_hash(ctx))
     if not user:
         return json.dumps({"error": "No registered user found. Please register first with research_match_register."})
 
     user_id = user["id"]
-
-    # Get next version
-    last = db.execute(
-        "SELECT MAX(version) as v FROM research_commits WHERE user_id = ?",
-        (user_id,)
-    ).fetchone()
-    version = (last["v"] or 0) + 1
 
     # Prepare commit data
     commit_data = params.model_dump()
@@ -2749,34 +2923,74 @@ async def research_match_submit_commit(params: SubmitCommitInput, ctx: Context =
     content_hash = _hash_content(commit_data)
 
     # AI Evaluation (in production: runs inside TEE enclave)
-    scores = evaluator.evaluate_commit(commit_data, user_id)
+    scores = await evaluator.evaluate_commit(commit_data, user_id)
 
     commit_id = str(uuid.uuid4())
+    now_iso = datetime.now(timezone.utc).isoformat()
 
-    db.execute("""
-        INSERT INTO research_commits
-        (id, user_id, version, domain, subdomain, problem, hypothesis,
-         theoretical_framework, demonstrations_summary, demo_types,
-         code_languages, adhoc_summary, adhoc_connections, cherry_picking,
-         solidity_levels, overall_solidity,
-         content_hash, ot_score, ofc_score, ot_breakdown, ofc_breakdown,
-         solidity_impact, git_repo_url, git_commit_hash)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        commit_id, user_id, version,
-        params.domain, params.subdomain, params.problem, params.hypothesis,
-        params.theoretical_framework, params.demonstrations_summary,
-        json.dumps(params.demo_types), json.dumps(params.code_languages),
-        params.adhoc_summary, json.dumps(params.adhoc_connections),
-        json.dumps(params.cherry_picking),
-        json.dumps(solidity_dict), overall_sol,
-        content_hash,
-        scores["ot_score"], scores["ofc_score"],
-        json.dumps(scores["ot_breakdown"]), json.dumps(scores["ofc_breakdown"]),
-        json.dumps(scores["solidity_impact"]),
-        params.git_repo_url, params.git_commit_hash,
-    ))
-    db.commit()
+    if datastore:
+        # Get next version
+        version = await datastore.get_next_commit_version(user_id)
+        # Find previous latest commit to unmark
+        prev = await datastore.get_latest_commit_by_user(user_id)
+        prev_id = prev["id"] if prev else None
+
+        commit_record = {
+            "id": commit_id, "user_id": user_id, "version": version,
+            "domain": params.domain, "subdomain": params.subdomain,
+            "problem": params.problem, "hypothesis": params.hypothesis,
+            "theoretical_framework": params.theoretical_framework,
+            "demonstrations_summary": params.demonstrations_summary,
+            "demo_types": json.dumps(params.demo_types),
+            "code_languages": json.dumps(params.code_languages),
+            "adhoc_summary": params.adhoc_summary,
+            "adhoc_connections": json.dumps(params.adhoc_connections),
+            "cherry_picking": json.dumps(params.cherry_picking),
+            "solidity_levels": json.dumps(solidity_dict),
+            "overall_solidity": overall_sol,
+            "content_hash": content_hash,
+            "ot_score": scores["ot_score"], "ofc_score": scores["ofc_score"],
+            "ot_breakdown": json.dumps(scores["ot_breakdown"]),
+            "ofc_breakdown": json.dumps(scores["ofc_breakdown"]),
+            "solidity_impact": json.dumps(scores["solidity_impact"]),
+            "git_repo_url": params.git_repo_url,
+            "git_commit_hash": params.git_commit_hash,
+            "is_latest": True,
+            "created_at": now_iso,
+        }
+        await datastore.submit_commit_and_mark_latest(commit_record, previous_commit_id=prev_id)
+    else:
+        # Get next version
+        last = db.execute(
+            "SELECT MAX(version) as v FROM research_commits WHERE user_id = ?",
+            (user_id,)
+        ).fetchone()
+        version = (last["v"] or 0) + 1
+
+        db.execute("""
+            INSERT INTO research_commits
+            (id, user_id, version, domain, subdomain, problem, hypothesis,
+             theoretical_framework, demonstrations_summary, demo_types,
+             code_languages, adhoc_summary, adhoc_connections, cherry_picking,
+             solidity_levels, overall_solidity,
+             content_hash, ot_score, ofc_score, ot_breakdown, ofc_breakdown,
+             solidity_impact, git_repo_url, git_commit_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            commit_id, user_id, version,
+            params.domain, params.subdomain, params.problem, params.hypothesis,
+            params.theoretical_framework, params.demonstrations_summary,
+            json.dumps(params.demo_types), json.dumps(params.code_languages),
+            params.adhoc_summary, json.dumps(params.adhoc_connections),
+            json.dumps(params.cherry_picking),
+            json.dumps(solidity_dict), overall_sol,
+            content_hash,
+            scores["ot_score"], scores["ofc_score"],
+            json.dumps(scores["ot_breakdown"]), json.dumps(scores["ofc_breakdown"]),
+            json.dumps(scores["solidity_impact"]),
+            params.git_repo_url, params.git_commit_hash,
+        ))
+        db.commit()
 
     result = {
         "status": "evaluated",
@@ -2835,15 +3049,19 @@ async def research_match_my_profile(ctx: Context = None) -> str:
              OT/OFC breakdowns, solidity impact, and team list
     """
     db = _get_db(ctx)
+    datastore = _get_datastore(ctx)
     reputation_engine = _get_reputation(ctx)
-    user = _get_current_user(db)
+    user = await _get_current_user(db, datastore=datastore, user_email_hash=_get_user_email_hash(ctx))
     if not user:
         return json.dumps({"error": "No registered user found. Please register first."})
 
-    commits = db.execute(
-        "SELECT * FROM research_commits WHERE user_id = ? ORDER BY version DESC",
-        (user["id"],)
-    ).fetchall()
+    if datastore:
+        commits = await datastore.get_commits_by_user(user["id"])
+    else:
+        commits = db.execute(
+            "SELECT * FROM research_commits WHERE user_id = ? ORDER BY version DESC",
+            (user["id"],)
+        ).fetchall()
 
     if not commits:
         return json.dumps({
@@ -2856,14 +3074,17 @@ async def research_match_my_profile(ctx: Context = None) -> str:
     ofc_breakdown = json.loads(latest.get("ofc_breakdown") or "{}")
     solidity_impact = json.loads(latest.get("solidity_impact") or "{}")
 
-    teams = db.execute("""
-        SELECT t.* FROM teams t
-        JOIN team_members tm ON t.id = tm.team_id
-        WHERE tm.user_id = ?
-    """, (user["id"],)).fetchall()
+    if datastore:
+        teams = await datastore.get_teams_for_user(user["id"])
+    else:
+        teams = db.execute("""
+            SELECT t.* FROM teams t
+            JOIN team_members tm ON t.id = tm.team_id
+            WHERE tm.user_id = ?
+        """, (user["id"],)).fetchall()
 
     # Get reputation details
-    rep = reputation_engine.calculate_reputation(user["id"])
+    rep = await reputation_engine.calculate_reputation(user["id"])
 
     return json.dumps({
         "pseudonym": user["pseudonym"],
@@ -2933,13 +3154,14 @@ async def research_match_find_collaborators(params: FindCollaboratorsInput, ctx:
              you_gain %, they_gain %, their OT/OFC scores, domain, reputation badge, solidity
     """
     db = _get_db(ctx)
+    datastore = _get_datastore(ctx)
     matcher = _get_matcher(ctx)
-    user = _get_current_user(db)
+    user = await _get_current_user(db, datastore=datastore, user_email_hash=_get_user_email_hash(ctx))
 
     if not user:
         return json.dumps({"error": "No registered user found. Please register first."})
 
-    matches = matcher.find_matches(user["id"], params.limit or 5)
+    matches = await matcher.find_matches(user["id"], params.limit or 5)
 
     # Filter by semaphore if requested
     if params.min_semaphore:
@@ -2954,27 +3176,49 @@ async def research_match_find_collaborators(params: FindCollaboratorsInput, ctx:
         })
 
     # Store matches in DB for later reference
-    for m in matches:
-        match_id = str(uuid.uuid4())
-        try:
-            db.execute("""
-                INSERT OR REPLACE INTO matches
-                (id, user_a_id, user_b_id, base_similarity, complementarity_score,
-                 semaphore, semaphore_reason_a, semaphore_reason_b, semaphore_summary,
-                 a_gains_from_b, b_gains_from_a)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (match_id, user["id"], m["candidate_user_id"],
-                  m["base_similarity"], m["complementarity_score"],
-               m["semaphore"], m.get("semaphore_reason", ""),
-                  m.get("semaphore_reason_for_candidate", ""),
-                  m.get("semaphore_summary", ""),
-                  m["a_gains_from_b"], m["b_gains_from_a"]))
-        except sqlite3.IntegrityError:
-            pass
-    db.commit()
+    if datastore:
+        for m in matches:
+            match_id = str(uuid.uuid4())
+            await datastore.upsert_match({
+                "id": match_id,
+                "user_a_id": user["id"],
+                "user_b_id": m["candidate_user_id"],
+                "base_similarity": m["base_similarity"],
+                "complementarity_score": m["complementarity_score"],
+                "semaphore": m["semaphore"],
+                "semaphore_reason_a": m.get("semaphore_reason", ""),
+                "semaphore_reason_b": m.get("semaphore_reason_for_candidate", ""),
+                "semaphore_summary": m.get("semaphore_summary", ""),
+                "a_gains_from_b": m["a_gains_from_b"],
+                "b_gains_from_a": m["b_gains_from_a"],
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            })
+        # Get user's latest commit scores
+        latest_commit = await datastore.get_latest_commit_by_user(user["id"])
+        your_profile_str = f"OT: {{'ot_score': {latest_commit['ot_score']}, 'ofc_score': {latest_commit['ofc_score']}}}" if latest_commit else "No commits"
+    else:
+        for m in matches:
+            match_id = str(uuid.uuid4())
+            try:
+                db.execute("""
+                    INSERT OR REPLACE INTO matches
+                    (id, user_a_id, user_b_id, base_similarity, complementarity_score,
+                     semaphore, semaphore_reason_a, semaphore_reason_b, semaphore_summary,
+                     a_gains_from_b, b_gains_from_a)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (match_id, user["id"], m["candidate_user_id"],
+                      m["base_similarity"], m["complementarity_score"],
+                   m["semaphore"], m.get("semaphore_reason", ""),
+                      m.get("semaphore_reason_for_candidate", ""),
+                      m.get("semaphore_summary", ""),
+                      m["a_gains_from_b"], m["b_gains_from_a"]))
+            except sqlite3.IntegrityError:
+                pass
+        db.commit()
+        your_profile_str = f"OT: {dict(db.execute('SELECT ot_score, ofc_score FROM research_commits WHERE user_id = ? ORDER BY version DESC LIMIT 1', (user['id'],)).fetchone())}"
 
     return json.dumps({
-        "your_profile": f"OT: {dict(db.execute('SELECT ot_score, ofc_score FROM research_commits WHERE user_id = ? ORDER BY version DESC LIMIT 1', (user['id'],)).fetchone())}",
+        "your_profile": your_profile_str,
         "candidates": [{
             "pseudonym": m["candidate_pseudonym"],
             "user_id": m["candidate_user_id"],
@@ -3031,16 +3275,20 @@ async def research_match_send_request(params: SendRequestInput, ctx: Context = N
         str: JSON with request_id, status, semaphore, reason, and next steps
     """
     db = _get_db(ctx)
-    user = _get_current_user(db)
+    datastore = _get_datastore(ctx)
+    user = await _get_current_user(db, datastore=datastore, user_email_hash=_get_user_email_hash(ctx))
     if not user:
         return json.dumps({"error": "No registered user found."})
 
     # Find the match record
-    match = db.execute("""
-        SELECT * FROM matches
-        WHERE (user_a_id = ? AND user_b_id = ?) OR (user_a_id = ? AND user_b_id = ?)
-        ORDER BY created_at DESC LIMIT 1
-    """, (user["id"], params.candidate_user_id, params.candidate_user_id, user["id"])).fetchone()
+    if datastore:
+        match = await datastore.find_match_between_users(user["id"], params.candidate_user_id)
+    else:
+        match = db.execute("""
+            SELECT * FROM matches
+            WHERE (user_a_id = ? AND user_b_id = ?) OR (user_a_id = ? AND user_b_id = ?)
+            ORDER BY created_at DESC LIMIT 1
+        """, (user["id"], params.candidate_user_id, params.candidate_user_id, user["id"])).fetchone()
 
     if not match:
         return json.dumps({"error": "No match found with this user. Run find_collaborators first."})
@@ -3048,20 +3296,34 @@ async def research_match_send_request(params: SendRequestInput, ctx: Context = N
     match = dict(match)
 
     # Check for existing pending request
-    existing = db.execute("""
-        SELECT * FROM collaboration_requests
-        WHERE requester_id = ? AND recipient_id = ? AND status = 'pending'
-    """, (user["id"], params.candidate_user_id)).fetchone()
+    if datastore:
+        existing = await datastore.find_pending_request(user["id"], params.candidate_user_id)
+    else:
+        existing = db.execute("""
+            SELECT * FROM collaboration_requests
+            WHERE requester_id = ? AND recipient_id = ? AND status = 'pending'
+        """, (user["id"], params.candidate_user_id)).fetchone()
 
     if existing:
         return json.dumps({"error": "You already have a pending request to this user."})
 
     request_id = str(uuid.uuid4())
-    db.execute("""
-        INSERT INTO collaboration_requests (id, match_id, requester_id, recipient_id, message, status)
-        VALUES (?, ?, ?, ?, ?, 'pending')
-    """, (request_id, match["id"], user["id"], params.candidate_user_id, params.message))
-    db.commit()
+    if datastore:
+        await datastore.create_collaboration_request({
+            "id": request_id,
+            "match_id": match["id"],
+            "requester_id": user["id"],
+            "recipient_id": params.candidate_user_id,
+            "message": params.message,
+            "status": "pending",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+    else:
+        db.execute("""
+            INSERT INTO collaboration_requests (id, match_id, requester_id, recipient_id, message, status)
+            VALUES (?, ?, ?, ?, ?, 'pending')
+        """, (request_id, match["id"], user["id"], params.candidate_user_id, params.message))
+        db.commit()
 
     return json.dumps({
         "status": "sent",
@@ -3100,31 +3362,36 @@ async def research_match_inbox(ctx: Context = None) -> str:
              complementarity %, message, status, and date
     """
     db = _get_db(ctx)
-    user = _get_current_user(db)
+    datastore = _get_datastore(ctx)
+    user = await _get_current_user(db, datastore=datastore, user_email_hash=_get_user_email_hash(ctx))
     if not user:
         return json.dumps({"error": "No registered user found."})
 
-    incoming = db.execute("""
-        SELECT cr.*, m.semaphore, m.complementarity_score, m.a_gains_from_b, m.b_gains_from_a,
-               m.semaphore_reason_b, m.semaphore_summary,
-               u.pseudonym as requester_pseudonym
-        FROM collaboration_requests cr
-        JOIN matches m ON cr.match_id = m.id
-        JOIN users u ON cr.requester_id = u.id
-        WHERE cr.recipient_id = ?
-        ORDER BY cr.created_at DESC
-    """, (user["id"],)).fetchall()
+    if datastore:
+        incoming = await datastore.get_incoming_requests_with_details(user["id"])
+        outgoing = await datastore.get_outgoing_requests_with_details(user["id"])
+    else:
+        incoming = db.execute("""
+            SELECT cr.*, m.semaphore, m.complementarity_score, m.a_gains_from_b, m.b_gains_from_a,
+                   m.semaphore_reason_b, m.semaphore_summary,
+                   u.pseudonym as requester_pseudonym
+            FROM collaboration_requests cr
+            JOIN matches m ON cr.match_id = m.id
+            JOIN users u ON cr.requester_id = u.id
+            WHERE cr.recipient_id = ?
+            ORDER BY cr.created_at DESC
+        """, (user["id"],)).fetchall()
 
-    outgoing = db.execute("""
-        SELECT cr.*, m.semaphore, m.complementarity_score,
-               m.semaphore_reason_a, m.semaphore_summary,
-               u.pseudonym as recipient_pseudonym
-        FROM collaboration_requests cr
-        JOIN matches m ON cr.match_id = m.id
-        JOIN users u ON cr.recipient_id = u.id
-        WHERE cr.requester_id = ?
-        ORDER BY cr.created_at DESC
-    """, (user["id"],)).fetchall()
+        outgoing = db.execute("""
+            SELECT cr.*, m.semaphore, m.complementarity_score,
+                   m.semaphore_reason_a, m.semaphore_summary,
+                   u.pseudonym as recipient_pseudonym
+            FROM collaboration_requests cr
+            JOIN matches m ON cr.match_id = m.id
+            JOIN users u ON cr.recipient_id = u.id
+            WHERE cr.requester_id = ?
+            ORDER BY cr.created_at DESC
+        """, (user["id"],)).fetchall()
 
     return json.dumps({
         "incoming": [{
@@ -3183,14 +3450,18 @@ async def research_match_respond_request(params: RespondRequestInput, ctx: Conte
         str: JSON with status ('accepted'/'rejected'), and if accepted: team_id, team_name, license type
     """
     db = _get_db(ctx)
-    user = _get_current_user(db)
+    datastore = _get_datastore(ctx)
+    user = await _get_current_user(db, datastore=datastore, user_email_hash=_get_user_email_hash(ctx))
     if not user:
         return json.dumps({"error": "No registered user found."})
 
-    request = db.execute(
-        "SELECT * FROM collaboration_requests WHERE id = ? AND recipient_id = ?",
-        (params.request_id, user["id"])
-    ).fetchone()
+    if datastore:
+        request = await datastore.get_request_for_recipient(params.request_id, user["id"])
+    else:
+        request = db.execute(
+            "SELECT * FROM collaboration_requests WHERE id = ? AND recipient_id = ?",
+            (params.request_id, user["id"])
+        ).fetchone()
 
     if not request:
         return json.dumps({"error": "Request not found or you're not the recipient."})
@@ -3200,37 +3471,48 @@ async def research_match_respond_request(params: RespondRequestInput, ctx: Conte
         return json.dumps({"error": f"Request already {request['status']}."})
 
     new_status = "accepted" if params.accept else "rejected"
-    db.execute("""
-        UPDATE collaboration_requests
-        SET status = ?, responded_at = datetime('now')
-        WHERE id = ?
-    """, (new_status, params.request_id))
+    now_iso = datetime.now(timezone.utc).isoformat()
 
     result = {"status": new_status, "request_id": params.request_id}
 
     if params.accept:
-        # Create team
         team_id = str(uuid.uuid4())
         team_name = f"team-{team_id[:8]}"
-        db.execute(
-            "INSERT INTO teams (id, name, license_type) VALUES (?, ?, 'joint-equal')",
-            (team_id, team_name)
-        )
-        db.execute(
-            "INSERT INTO team_members (team_id, user_id, role) VALUES (?, ?, 'co-lead')",
-            (team_id, user["id"])
-        )
-        db.execute(
-            "INSERT INTO team_members (team_id, user_id, role) VALUES (?, ?, 'co-lead')",
-            (team_id, request["requester_id"])
-        )
 
-        # Audit log: team license generated
-        _write_audit_log(db, team_id, user["id"], "license_generated",
+        if datastore:
+            await datastore.update_request_status(params.request_id, new_status, now_iso)
+            await datastore.create_team_with_members(
+                team={"id": team_id, "name": team_name, "license_type": "joint-equal", "created_at": now_iso},
+                members=[
+                    {"team_id": team_id, "user_id": user["id"], "role": "co-lead", "joined_at": now_iso},
+                    {"team_id": team_id, "user_id": request["requester_id"], "role": "co-lead", "joined_at": now_iso},
+                ],
+            )
+        else:
+            db.execute("""
+                UPDATE collaboration_requests
+                SET status = ?, responded_at = datetime('now')
+                WHERE id = ?
+            """, (new_status, params.request_id))
+            db.execute(
+                "INSERT INTO teams (id, name, license_type) VALUES (?, ?, 'joint-equal')",
+                (team_id, team_name)
+            )
+            db.execute(
+                "INSERT INTO team_members (team_id, user_id, role) VALUES (?, ?, 'co-lead')",
+                (team_id, user["id"])
+            )
+            db.execute(
+                "INSERT INTO team_members (team_id, user_id, role) VALUES (?, ?, 'co-lead')",
+                (team_id, request["requester_id"])
+            )
+
+        await _write_audit_log(datastore or db, team_id, user["id"], "license_generated",
                          resource_ref=team_id,
                          details={"license_type": "joint-equal",
                                   "members": [user["id"], request["requester_id"]]})
-        db.commit()
+        if db:
+            db.commit()
 
         result["team"] = {
             "team_id": team_id,
@@ -3249,7 +3531,15 @@ async def research_match_respond_request(params: RespondRequestInput, ctx: Conte
             ),
         }
     else:
-        db.commit()
+        if datastore:
+            await datastore.update_request_status(params.request_id, new_status, now_iso)
+        else:
+            db.execute("""
+                UPDATE collaboration_requests
+                SET status = ?, responded_at = datetime('now')
+                WHERE id = ?
+            """, (new_status, params.request_id))
+            db.commit()
         result["message"] = "Request rejected."
 
     return json.dumps(result, indent=2)
@@ -3296,24 +3586,31 @@ async def research_match_rate_user(params: RateUserInput, ctx: Context = None) -
              their rating of you and updated reputation scores
     """
     db = _get_db(ctx)
+    datastore = _get_datastore(ctx)
     reputation_engine = _get_reputation(ctx)
-    user = _get_current_user(db)
+    user = await _get_current_user(db, datastore=datastore, user_email_hash=_get_user_email_hash(ctx))
     if not user:
         return json.dumps({"error": "No registered user found."})
 
     # Verify the rater is a member of the team
-    membership = db.execute(
-        "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
-        (params.team_id, user["id"])
-    ).fetchone()
+    if datastore:
+        membership = await datastore.get_team_member(params.team_id, user["id"])
+    else:
+        membership = db.execute(
+            "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
+            (params.team_id, user["id"])
+        ).fetchone()
     if not membership:
         return json.dumps({"error": "You are not a member of this team."})
 
     # Verify the rated user is also a member
-    rated_membership = db.execute(
-        "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
-        (params.team_id, params.rated_user_id)
-    ).fetchone()
+    if datastore:
+        rated_membership = await datastore.get_team_member(params.team_id, params.rated_user_id)
+    else:
+        rated_membership = db.execute(
+            "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
+            (params.team_id, params.rated_user_id)
+        ).fetchone()
     if not rated_membership:
         return json.dumps({"error": "The rated user is not a member of this team."})
 
@@ -3322,30 +3619,43 @@ async def research_match_rate_user(params: RateUserInput, ctx: Context = None) -
         return json.dumps({"error": "You cannot rate yourself."})
 
     # Check if already rated
-    existing = db.execute(
-        "SELECT id FROM ratings WHERE team_id = ? AND rater_id = ? AND rated_id = ?",
-        (params.team_id, user["id"], params.rated_user_id)
-    ).fetchone()
+    if datastore:
+        existing = await datastore.get_rating(params.team_id, user["id"], params.rated_user_id)
+    else:
+        existing = db.execute(
+            "SELECT id FROM ratings WHERE team_id = ? AND rater_id = ? AND rated_id = ?",
+            (params.team_id, user["id"], params.rated_user_id)
+        ).fetchone()
     if existing:
         return json.dumps({"error": "You have already rated this user for this team. Ratings cannot be modified to prevent gaming."})
 
     # Check for abuse patterns
-    abuse = reputation_engine.detect_abuse_patterns(user["id"])
+    abuse = await reputation_engine.detect_abuse_patterns(user["id"])
     abuse_warning = ""
     if abuse["abuse_detected"]:
         abuse_warning = f" Warning: Your rating patterns show {', '.join(abuse['flags'])}. Continued abuse may affect your own reputation."
 
     # Submit rating
     rating_id = str(uuid.uuid4())
-    db.execute("""
-        INSERT INTO ratings (id, team_id, rater_id, rated_id, honesty, quality, effort, comment)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (rating_id, params.team_id, user["id"], params.rated_user_id,
-          params.honesty, params.quality, params.effort, params.comment))
-    db.commit()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    if datastore:
+        await datastore.insert_rating({
+            "id": rating_id, "team_id": params.team_id,
+            "rater_id": user["id"], "rated_id": params.rated_user_id,
+            "honesty": params.honesty, "quality": params.quality,
+            "effort": params.effort, "comment": params.comment,
+            "is_revealed": False, "created_at": now_iso,
+        })
+    else:
+        db.execute("""
+            INSERT INTO ratings (id, team_id, rater_id, rated_id, honesty, quality, effort, comment)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (rating_id, params.team_id, user["id"], params.rated_user_id,
+              params.honesty, params.quality, params.effort, params.comment))
+        db.commit()
 
     # Check if both have rated each other
-    both_rated = reputation_engine.check_both_rated(
+    both_rated = await reputation_engine.check_both_rated(
         params.team_id, user["id"], params.rated_user_id
     )
 
@@ -3358,15 +3668,18 @@ async def research_match_rate_user(params: RateUserInput, ctx: Context = None) -
 
     if both_rated:
         # Reveal ratings and update reputations
-        reputation_engine.reveal_ratings(params.team_id)
-        reputation_engine.update_user_reputation(params.rated_user_id)
-        reputation_engine.update_user_reputation(user["id"])
+        await reputation_engine.reveal_ratings(params.team_id)
+        await reputation_engine.update_user_reputation(params.rated_user_id)
+        await reputation_engine.update_user_reputation(user["id"])
 
         # Get the other person's rating of you
-        their_rating = db.execute(
-            "SELECT * FROM ratings WHERE team_id = ? AND rater_id = ? AND rated_id = ?",
-            (params.team_id, params.rated_user_id, user["id"])
-        ).fetchone()
+        if datastore:
+            their_rating = await datastore.get_rating(params.team_id, params.rated_user_id, user["id"])
+        else:
+            their_rating = db.execute(
+                "SELECT * FROM ratings WHERE team_id = ? AND rater_id = ? AND rated_id = ?",
+                (params.team_id, params.rated_user_id, user["id"])
+            ).fetchone()
 
         if their_rating:
             their_rating = dict(their_rating)
@@ -3462,17 +3775,35 @@ async def research_match_analyze_work(ctx: Context = None) -> str:
 logger = logging.getLogger("research_match")
 
 
-def _cold_search_internal(db: sqlite3.Connection, query: str, limit: int) -> List[Dict]:
+async def _cold_search_internal(db: Optional[sqlite3.Connection], query: str, limit: int,
+                                 datastore: Optional[DataStore] = None) -> List[Dict]:
     """Search the internal database for public research commits matching a query.
     Returns basic info only: domain, subdomain, problem, hypothesis, solidity."""
     keywords = query.lower().split()
     if not keywords:
         return []
 
-    # Build a LIKE filter across multiple columns
+    if datastore:
+        # Use DataStore (Algolia in Firestore mode, Firestore fallback otherwise)
+        recs = await datastore.search_commits_by_keywords(keywords[:5], limit)
+        return [
+            {
+                "source": "internal",
+                "pseudonym": r.get("pseudonym", ""),
+                "domain": r.get("domain", ""),
+                "subdomain": r.get("subdomain", ""),
+                "problem": r.get("problem", ""),
+                "hypothesis": r.get("hypothesis", ""),
+                "solidity": r.get("overall_solidity", "unknown"),
+                "date": r.get("created_at", ""),
+            }
+            for r in recs
+        ]
+
+    # SQLite fallback: LIKE queries
     conditions = []
     params = []
-    for kw in keywords[:5]:  # Limit to 5 keywords
+    for kw in keywords[:5]:
         pattern = f"%{kw}%"
         conditions.append(
             "(LOWER(domain) LIKE ? OR LOWER(subdomain) LIKE ? "
@@ -3564,7 +3895,8 @@ async def research_match_cold_search(params: ColdSearchInput, ctx: Context = Non
     # always valuable — there could be 1000 useful projects out there even
     # when the internal DB has matches.
     db = _get_db(ctx)
-    internal_results = _cold_search_internal(db, query, limit)
+    datastore = _get_datastore(ctx)
+    internal_results = await _cold_search_internal(db, query, limit, datastore=datastore)
     github_results = _cold_search_github(query, limit)
 
     total = len(internal_results) + len(github_results)
@@ -3777,23 +4109,30 @@ async def research_match_needs_create(params: NeedsCreateInput, ctx: Context = N
         str: JSON with ticket_id, remaining slots, and next_step guidance
     """
     db = _get_db(ctx)
-    user = _get_current_user(db)
+    datastore = _get_datastore(ctx)
+    user = await _get_current_user(db, datastore=datastore, user_email_hash=_get_user_email_hash(ctx))
     if not user:
         return json.dumps({"error": "No registered user found. Use research_match_register first."})
 
     # Verify user is a member of the team
-    membership = db.execute(
-        "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
-        (params.team_id, user["id"])
-    ).fetchone()
+    if datastore:
+        membership = await datastore.get_team_member(params.team_id, user["id"])
+    else:
+        membership = db.execute(
+            "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
+            (params.team_id, user["id"])
+        ).fetchone()
     if not membership:
         return json.dumps({"error": "You are not a member of this team."})
 
     # Check open ticket limit
-    open_count = db.execute(
-        "SELECT COUNT(*) as c FROM team_tickets WHERE team_id = ? AND author_id = ? AND status IN ('open', 'in_progress')",
-        (params.team_id, user["id"])
-    ).fetchone()["c"]
+    if datastore:
+        open_count = await datastore.count_open_tickets_by_user(params.team_id, user["id"])
+    else:
+        open_count = db.execute(
+            "SELECT COUNT(*) as c FROM team_tickets WHERE team_id = ? AND author_id = ? AND status IN ('open', 'in_progress')",
+            (params.team_id, user["id"])
+        ).fetchone()["c"]
     if open_count >= MAX_OPEN_TICKETS_PER_USER_PER_TEAM:
         return json.dumps({
             "error": f"You already have {open_count} open tickets in this team (max {MAX_OPEN_TICKETS_PER_USER_PER_TEAM}). "
@@ -3801,17 +4140,27 @@ async def research_match_needs_create(params: NeedsCreateInput, ctx: Context = N
         })
 
     ticket_id = str(uuid.uuid4())
-    db.execute(
-        """INSERT INTO team_tickets (id, team_id, author_id, type, area, title, description, priority)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (ticket_id, params.team_id, user["id"], params.type, params.area,
-         params.title, params.description, params.priority)
-    )
+    now_iso = datetime.now(timezone.utc).isoformat()
+    if datastore:
+        await datastore.insert_ticket({
+            "id": ticket_id, "team_id": params.team_id, "author_id": user["id"],
+            "type": params.type, "area": params.area, "title": params.title,
+            "description": params.description, "priority": params.priority,
+            "status": "open", "created_at": now_iso,
+        })
+    else:
+        db.execute(
+            """INSERT INTO team_tickets (id, team_id, author_id, type, area, title, description, priority)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (ticket_id, params.team_id, user["id"], params.type, params.area,
+             params.title, params.description, params.priority)
+        )
 
-    _write_audit_log(db, params.team_id, user["id"], "ticket_created",
+    await _write_audit_log(datastore or db, params.team_id, user["id"], "ticket_created",
                      resource_ref=ticket_id,
                      details={"type": params.type, "area": params.area, "priority": params.priority})
-    db.commit()
+    if db:
+        db.commit()
 
     remaining_slots = MAX_OPEN_TICKETS_PER_USER_PER_TEAM - open_count - 1
     return json.dumps({
@@ -3861,50 +4210,66 @@ async def research_match_needs_list(params: NeedsListInput, ctx: Context = None)
         str: JSON with summary counts and ticket list
     """
     db = _get_db(ctx)
-    user = _get_current_user(db)
+    datastore = _get_datastore(ctx)
+    user = await _get_current_user(db, datastore=datastore, user_email_hash=_get_user_email_hash(ctx))
     if not user:
         return json.dumps({"error": "No registered user found. Use research_match_register first."})
 
-    membership = db.execute(
-        "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
-        (params.team_id, user["id"])
-    ).fetchone()
+    if datastore:
+        membership = await datastore.get_team_member(params.team_id, user["id"])
+    else:
+        membership = db.execute(
+            "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
+            (params.team_id, user["id"])
+        ).fetchone()
     if not membership:
         return json.dumps({"error": "You are not a member of this team."})
 
-    # Build query with optional filters
-    query = "SELECT t.*, u.pseudonym as author_pseudonym FROM team_tickets t JOIN users u ON t.author_id = u.id WHERE t.team_id = ?"
-    query_params: list = [params.team_id]
+    if datastore:
+        filters = {}
+        if params.status:
+            filters["status"] = params.status
+        if params.area:
+            filters["area"] = params.area
+        if params.type:
+            filters["type"] = params.type
+        rows = await datastore.list_tickets(params.team_id, **filters)
+        summary_raw = await datastore.count_tickets_by_status(params.team_id)
+        summary = summary_raw
+    else:
+        # Build query with optional filters
+        query = "SELECT t.*, u.pseudonym as author_pseudonym FROM team_tickets t JOIN users u ON t.author_id = u.id WHERE t.team_id = ?"
+        query_params: list = [params.team_id]
 
-    if params.status:
-        query += " AND t.status = ?"
-        query_params.append(params.status)
-    if params.area:
-        query += " AND t.area = ?"
-        query_params.append(params.area)
-    if params.type:
-        query += " AND t.type = ?"
-        query_params.append(params.type)
+        if params.status:
+            query += " AND t.status = ?"
+            query_params.append(params.status)
+        if params.area:
+            query += " AND t.area = ?"
+            query_params.append(params.area)
+        if params.type:
+            query += " AND t.type = ?"
+            query_params.append(params.type)
 
-    # Order by priority (critical > important > nice_to_have), then by date
-    query += """
-        ORDER BY
-            CASE t.priority
-                WHEN 'critical' THEN 1
-                WHEN 'important' THEN 2
-                WHEN 'nice_to_have' THEN 3
-            END,
-            t.created_at DESC
-    """
+        # Order by priority (critical > important > nice_to_have), then by date
+        query += """
+            ORDER BY
+                CASE t.priority
+                    WHEN 'critical' THEN 1
+                    WHEN 'important' THEN 2
+                    WHEN 'nice_to_have' THEN 3
+                END,
+                t.created_at DESC
+        """
 
-    rows = db.execute(query, query_params).fetchall()
+        rows = db.execute(query, query_params).fetchall()
 
-    # Build summary counts
-    all_tickets = db.execute(
-        "SELECT status, COUNT(*) as c FROM team_tickets WHERE team_id = ? GROUP BY status",
-        (params.team_id,)
-    ).fetchall()
-    summary = {dict(r)["status"]: dict(r)["c"] for r in all_tickets}
+        # Build summary counts
+        all_tickets = db.execute(
+            "SELECT status, COUNT(*) as c FROM team_tickets WHERE team_id = ? GROUP BY status",
+            (params.team_id,)
+        ).fetchall()
+        summary = {dict(r)["status"]: dict(r)["c"] for r in all_tickets}
 
     tickets = []
     for r in rows:
@@ -3917,14 +4282,18 @@ async def research_match_needs_list(params: NeedsListInput, ctx: Context = None)
             "description": rd["description"],
             "priority": rd["priority"],
             "status": rd["status"],
-            "author": rd["author_pseudonym"],
+            "author": rd.get("author_pseudonym", rd.get("pseudonym", "")),
             "created_at": rd["created_at"],
-            "updated_at": rd["updated_at"],
+            "updated_at": rd.get("updated_at"),
         }
-        if rd["resolved_by"]:
-            resolver = db.execute("SELECT pseudonym FROM users WHERE id = ?", (rd["resolved_by"],)).fetchone()
-            ticket["resolved_by"] = resolver["pseudonym"] if resolver else rd["resolved_by"]
-            ticket["resolved_at"] = rd["resolved_at"]
+        if rd.get("resolved_by"):
+            if datastore:
+                resolver = await datastore.get_user_by_id(rd["resolved_by"])
+                ticket["resolved_by"] = resolver["pseudonym"] if resolver else rd["resolved_by"]
+            else:
+                resolver = db.execute("SELECT pseudonym FROM users WHERE id = ?", (rd["resolved_by"],)).fetchone()
+                ticket["resolved_by"] = resolver["pseudonym"] if resolver else rd["resolved_by"]
+            ticket["resolved_at"] = rd.get("resolved_at")
         tickets.append(ticket)
 
     return json.dumps({
@@ -3973,36 +4342,50 @@ async def research_match_needs_resolve(params: NeedsResolveInput, ctx: Context =
         str: JSON with resolution status and reputation impact if applicable
     """
     db = _get_db(ctx)
-    user = _get_current_user(db)
+    datastore = _get_datastore(ctx)
+    user = await _get_current_user(db, datastore=datastore, user_email_hash=_get_user_email_hash(ctx))
     if not user:
         return json.dumps({"error": "No registered user found. Use research_match_register first."})
 
-    ticket = db.execute("SELECT * FROM team_tickets WHERE id = ?", (params.ticket_id,)).fetchone()
+    if datastore:
+        ticket = await datastore.get_ticket_by_id(params.ticket_id)
+    else:
+        ticket = db.execute("SELECT * FROM team_tickets WHERE id = ?", (params.ticket_id,)).fetchone()
     if not ticket:
         return json.dumps({"error": "Ticket not found."})
     ticket = dict(ticket)
 
     # Verify user is a member of the ticket's team
-    membership = db.execute(
-        "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
-        (ticket["team_id"], user["id"])
-    ).fetchone()
+    if datastore:
+        membership = await datastore.get_team_member(ticket["team_id"], user["id"])
+    else:
+        membership = db.execute(
+            "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
+            (ticket["team_id"], user["id"])
+        ).fetchone()
     if not membership:
         return json.dumps({"error": "You are not a member of this team."})
 
     if ticket["status"] in ("resolved", "wont_fix"):
         return json.dumps({"error": f"Ticket already {ticket['status']}. Cannot resolve again."})
 
+    now_iso = datetime.now(timezone.utc).isoformat()
+
     # Update ticket
-    db.execute(
-        """UPDATE team_tickets
-           SET status = ?, resolved_by = ?, resolved_at = datetime('now'), updated_at = datetime('now')
-           WHERE id = ?""",
-        (params.resolution, user["id"], params.ticket_id)
-    )
+    if datastore:
+        await datastore.update_ticket_status(
+            ticket["team_id"], params.ticket_id,
+            status=params.resolution, resolved_by=user["id"], resolved_at=now_iso)
+    else:
+        db.execute(
+            """UPDATE team_tickets
+               SET status = ?, resolved_by = ?, resolved_at = datetime('now'), updated_at = datetime('now')
+               WHERE id = ?""",
+            (params.resolution, user["id"], params.ticket_id)
+        )
 
     # Audit log
-    _write_audit_log(db, ticket["team_id"], user["id"], "ticket_resolved",
+    await _write_audit_log(datastore or db, ticket["team_id"], user["id"], "ticket_resolved",
                      resource_ref=params.ticket_id,
                      details={"resolution": params.resolution,
                               "note": params.resolution_note,
@@ -4014,38 +4397,56 @@ async def research_match_needs_resolve(params: NeedsResolveInput, ctx: Context =
     if (params.resolution == "resolved"
             and ticket["type"] in ("need_help", "question")
             and ticket["author_id"] != user["id"]):
-        # Apply effort boost via exponential smoothing
-        current = db.execute(
-            "SELECT running_effort FROM users WHERE id = ?", (user["id"],)
-        ).fetchone()
-        if current and current["running_effort"] is not None:
-            new_effort = min(5.0, current["running_effort"] + TICKET_EFFORT_BONUS * REPUTATION_ALPHA)
-            db.execute("UPDATE users SET running_effort = ? WHERE id = ?", (new_effort, user["id"]))
+        if datastore:
+            current_user = await datastore.get_user_by_id(user["id"])
+            if current_user and current_user.get("running_effort") is not None:
+                new_effort = min(5.0, current_user["running_effort"] + TICKET_EFFORT_BONUS * REPUTATION_ALPHA)
+                await datastore.update_user_running_effort(user["id"], new_effort)
+        else:
+            current = db.execute(
+                "SELECT running_effort FROM users WHERE id = ?", (user["id"],)
+            ).fetchone()
+            if current and current["running_effort"] is not None:
+                new_effort = min(5.0, current["running_effort"] + TICKET_EFFORT_BONUS * REPUTATION_ALPHA)
+                db.execute("UPDATE users SET running_effort = ? WHERE id = ?", (new_effort, user["id"]))
         effort_boosted = True
 
     # NEED-03: Recalculate license after ticket resolution (only if bilateral reveals exist)
     license_update = None
     if params.resolution == "resolved":
-        lic = _compute_license(db, ticket["team_id"])
-        current_type = db.execute("SELECT license_type FROM teams WHERE id = ?",
-                                  (ticket["team_id"],)).fetchone()["license_type"]
+        lic = await _compute_license(db, ticket["team_id"], datastore=datastore)
+        if datastore:
+            team_data = await datastore.get_team_by_id(ticket["team_id"])
+            current_type = team_data["license_type"] if team_data else "joint-equal"
+        else:
+            current_type = db.execute("SELECT license_type FROM teams WHERE id = ?",
+                                      (ticket["team_id"],)).fetchone()["license_type"]
         if lic["license_type"] != current_type:
-            db.execute("UPDATE teams SET license_type = ?, license_updated_at = datetime('now') WHERE id = ?",
-                       (lic["license_type"], ticket["team_id"]))
-            for m_row in db.execute(
-                "SELECT tm.user_id, u.pseudonym FROM team_members tm JOIN users u ON tm.user_id = u.id WHERE tm.team_id = ?",
-                (ticket["team_id"],)
-            ).fetchall():
-                pct = lic["contribution_split"].get(m_row["pseudonym"], 0)
-                db.execute("UPDATE team_members SET contribution_percentage = ? WHERE team_id = ? AND user_id = ?",
-                           (pct, ticket["team_id"], m_row["user_id"]))
-            _write_audit_log(db, ticket["team_id"], user["id"], "license_generated",
+            if datastore:
+                await datastore.update_team_license(ticket["team_id"], lic["license_type"], now_iso)
+                members_list = await datastore.get_team_member_pseudonyms(ticket["team_id"])
+                for m_row in members_list:
+                    m_row = dict(m_row)
+                    pct = lic["contribution_split"].get(m_row["pseudonym"], 0)
+                    await datastore.update_member_contribution(ticket["team_id"], m_row["user_id"], pct)
+            else:
+                db.execute("UPDATE teams SET license_type = ?, license_updated_at = datetime('now') WHERE id = ?",
+                           (lic["license_type"], ticket["team_id"]))
+                for m_row in db.execute(
+                    "SELECT tm.user_id, u.pseudonym FROM team_members tm JOIN users u ON tm.user_id = u.id WHERE tm.team_id = ?",
+                    (ticket["team_id"],)
+                ).fetchall():
+                    pct = lic["contribution_split"].get(m_row["pseudonym"], 0)
+                    db.execute("UPDATE team_members SET contribution_percentage = ? WHERE team_id = ? AND user_id = ?",
+                               (pct, ticket["team_id"], m_row["user_id"]))
+            await _write_audit_log(datastore or db, ticket["team_id"], user["id"], "license_generated",
                              resource_ref=ticket["team_id"],
                              details={"old_type": current_type, "new_type": lic["license_type"],
                                       "trigger": "ticket_resolved"})
         license_update = {"license_type": lic["license_type"], "changed": lic["license_type"] != current_type}
 
-    db.commit()
+    if db:
+        db.commit()
 
     result = {
         "status": "ok",
@@ -4101,15 +4502,19 @@ async def research_match_reveal_request(params: RevealRequestInput, ctx: Context
         str: JSON with consent_id and status, or error
     """
     db = _get_db(ctx)
-    user = _get_current_user(db)
+    datastore = _get_datastore(ctx)
+    user = await _get_current_user(db, datastore=datastore, user_email_hash=_get_user_email_hash(ctx))
     if not user:
         return json.dumps({"error": "No registered user found. Use research_match_register first."})
 
     # Verify requester is team member
-    membership = db.execute(
-        "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
-        (params.team_id, user["id"])
-    ).fetchone()
+    if datastore:
+        membership = await datastore.get_team_member(params.team_id, user["id"])
+    else:
+        membership = db.execute(
+            "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
+            (params.team_id, user["id"])
+        ).fetchone()
     if not membership:
         return json.dumps({"error": "You are not a member of this team."})
 
@@ -4118,28 +4523,38 @@ async def research_match_reveal_request(params: RevealRequestInput, ctx: Context
         return json.dumps({"error": "Cannot request reveal of your own commit. You already have access to your own work."})
 
     # Verify target is team member
-    target_membership = db.execute(
-        "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
-        (params.team_id, params.target_user_id)
-    ).fetchone()
+    if datastore:
+        target_membership = await datastore.get_team_member(params.team_id, params.target_user_id)
+    else:
+        target_membership = db.execute(
+            "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
+            (params.team_id, params.target_user_id)
+        ).fetchone()
     if not target_membership:
         return json.dumps({"error": "Target user is not a member of this team."})
 
     # Verify target has at least one commit
-    target_commit = db.execute(
-        "SELECT id FROM research_commits WHERE user_id = ? ORDER BY version DESC LIMIT 1",
-        (params.target_user_id,)
-    ).fetchone()
+    if datastore:
+        target_commit = await datastore.get_latest_commit_by_user(params.target_user_id)
+    else:
+        target_commit = db.execute(
+            "SELECT id FROM research_commits WHERE user_id = ? ORDER BY version DESC LIMIT 1",
+            (params.target_user_id,)
+        ).fetchone()
     if not target_commit:
         return json.dumps({"error": "Target user has no Research Commits yet. They must use research_match_submit_commit first."})
     commit_id = target_commit["id"]
 
     # Check for existing pending consent
-    existing_pending = db.execute(
-        """SELECT id FROM reveal_consents
-           WHERE team_id = ? AND level = 3 AND requester_id = ? AND resource_ref = ? AND status = 'pending'""",
-        (params.team_id, user["id"], commit_id)
-    ).fetchone()
+    if datastore:
+        existing_pending = await datastore.find_reveal_consent(
+            params.team_id, user["id"], commit_id, status="pending")
+    else:
+        existing_pending = db.execute(
+            """SELECT id FROM reveal_consents
+               WHERE team_id = ? AND level = 3 AND requester_id = ? AND resource_ref = ? AND status = 'pending'""",
+            (params.team_id, user["id"], commit_id)
+        ).fetchone()
     if existing_pending:
         return json.dumps({
             "status": "already_pending",
@@ -4148,11 +4563,15 @@ async def research_match_reveal_request(params: RevealRequestInput, ctx: Context
         })
 
     # Check for already approved
-    existing_approved = db.execute(
-        """SELECT id FROM reveal_consents
-           WHERE team_id = ? AND level = 3 AND requester_id = ? AND resource_ref = ? AND status = 'approved'""",
-        (params.team_id, user["id"], commit_id)
-    ).fetchone()
+    if datastore:
+        existing_approved = await datastore.find_reveal_consent(
+            params.team_id, user["id"], commit_id, status="approved")
+    else:
+        existing_approved = db.execute(
+            """SELECT id FROM reveal_consents
+               WHERE team_id = ? AND level = 3 AND requester_id = ? AND resource_ref = ? AND status = 'approved'""",
+            (params.team_id, user["id"], commit_id)
+        ).fetchone()
     if existing_approved:
         return json.dumps({
             "status": "already_approved",
@@ -4161,28 +4580,44 @@ async def research_match_reveal_request(params: RevealRequestInput, ctx: Context
         })
 
     # Check pending limit
-    pending_count = db.execute(
-        "SELECT COUNT(*) as c FROM reveal_consents WHERE team_id = ? AND status = 'pending'",
-        (params.team_id,)
-    ).fetchone()["c"]
+    if datastore:
+        pending_count = await datastore.count_pending_reveals(params.team_id)
+    else:
+        pending_count = db.execute(
+            "SELECT COUNT(*) as c FROM reveal_consents WHERE team_id = ? AND status = 'pending'",
+            (params.team_id,)
+        ).fetchone()["c"]
     if pending_count >= MAX_PENDING_REVEALS_PER_TEAM:
         return json.dumps({"error": f"Too many pending reveal requests for this team (max {MAX_PENDING_REVEALS_PER_TEAM}). Resolve existing requests first."})
 
     # Create consent
     consent_id = str(uuid.uuid4())
-    db.execute(
-        """INSERT INTO reveal_consents (id, team_id, level, requester_id, approver_id, resource_type, resource_ref)
-           VALUES (?, ?, 3, ?, ?, 'commit', ?)""",
-        (consent_id, params.team_id, user["id"], params.target_user_id, commit_id)
-    )
+    now_iso = datetime.now(timezone.utc).isoformat()
+    if datastore:
+        await datastore.insert_reveal_consent({
+            "id": consent_id, "team_id": params.team_id, "level": 3,
+            "requester_id": user["id"], "approver_id": params.target_user_id,
+            "resource_type": "commit", "resource_ref": commit_id,
+            "status": "pending", "created_at": now_iso,
+        })
+    else:
+        db.execute(
+            """INSERT INTO reveal_consents (id, team_id, level, requester_id, approver_id, resource_type, resource_ref)
+               VALUES (?, ?, 3, ?, ?, 'commit', ?)""",
+            (consent_id, params.team_id, user["id"], params.target_user_id, commit_id)
+        )
 
-    _write_audit_log(db, params.team_id, user["id"], "reveal_requested",
+    await _write_audit_log(datastore or db, params.team_id, user["id"], "reveal_requested",
                      resource_ref=commit_id,
                      details={"level": 3, "target_user_id": params.target_user_id})
-    db.commit()
+    if db:
+        db.commit()
 
     # Get target pseudonym for the response
-    target_user = db.execute("SELECT pseudonym FROM users WHERE id = ?", (params.target_user_id,)).fetchone()
+    if datastore:
+        target_user = await datastore.get_user_by_id(params.target_user_id)
+    else:
+        target_user = db.execute("SELECT pseudonym FROM users WHERE id = ?", (params.target_user_id,)).fetchone()
 
     return json.dumps({
         "status": "pending",
@@ -4228,11 +4663,15 @@ async def research_match_reveal_respond(params: RevealRespondInput, ctx: Context
         str: JSON with result and guidance
     """
     db = _get_db(ctx)
-    user = _get_current_user(db)
+    datastore = _get_datastore(ctx)
+    user = await _get_current_user(db, datastore=datastore, user_email_hash=_get_user_email_hash(ctx))
     if not user:
         return json.dumps({"error": "No registered user found. Use research_match_register first."})
 
-    consent = db.execute("SELECT * FROM reveal_consents WHERE id = ?", (params.consent_id,)).fetchone()
+    if datastore:
+        consent = await datastore.get_reveal_consent_by_id(params.consent_id)
+    else:
+        consent = db.execute("SELECT * FROM reveal_consents WHERE id = ?", (params.consent_id,)).fetchone()
     if not consent:
         return json.dumps({"error": "Consent not found."})
     consent = dict(consent)
@@ -4250,13 +4689,19 @@ async def research_match_reveal_respond(params: RevealRespondInput, ctx: Context
         })
 
     new_status = "approved" if params.approve else "denied"
-    db.execute(
-        "UPDATE reveal_consents SET status = ?, resolved_at = datetime('now') WHERE id = ?",
-        (new_status, params.consent_id)
-    )
+    now_iso = datetime.now(timezone.utc).isoformat()
+    if datastore:
+        await datastore.update_reveal_consent_status(
+            params.consent_id, new_status,
+            team_id=consent["team_id"], resolved_at=now_iso)
+    else:
+        db.execute(
+            "UPDATE reveal_consents SET status = ?, resolved_at = datetime('now') WHERE id = ?",
+            (new_status, params.consent_id)
+        )
 
     action = "reveal_approved" if params.approve else "reveal_denied"
-    _write_audit_log(db, consent["team_id"], user["id"], action,
+    await _write_audit_log(datastore or db, consent["team_id"], user["id"], action,
                      resource_ref=consent["resource_ref"],
                      details={"consent_id": params.consent_id, "level": consent["level"],
                               "requester_id": consent["requester_id"]})
@@ -4264,29 +4709,44 @@ async def research_match_reveal_respond(params: RevealRespondInput, ctx: Context
     # NEED-03: Recalculate license after reveal approval
     license_update = None
     if params.approve:
-        lic = _compute_license(db, consent["team_id"])
-        current_type = db.execute("SELECT license_type FROM teams WHERE id = ?",
-                                  (consent["team_id"],)).fetchone()["license_type"]
+        lic = await _compute_license(db, consent["team_id"], datastore=datastore)
+        if datastore:
+            team_data = await datastore.get_team_by_id(consent["team_id"])
+            current_type = team_data["license_type"] if team_data else "joint-equal"
+        else:
+            current_type = db.execute("SELECT license_type FROM teams WHERE id = ?",
+                                      (consent["team_id"],)).fetchone()["license_type"]
         if lic["license_type"] != current_type:
-            db.execute("UPDATE teams SET license_type = ?, license_updated_at = datetime('now') WHERE id = ?",
-                       (lic["license_type"], consent["team_id"]))
-            # Update contribution percentages
-            for m_row in db.execute(
-                "SELECT tm.user_id, u.pseudonym FROM team_members tm JOIN users u ON tm.user_id = u.id WHERE tm.team_id = ?",
-                (consent["team_id"],)
-            ).fetchall():
-                pct = lic["contribution_split"].get(m_row["pseudonym"], 0)
-                db.execute("UPDATE team_members SET contribution_percentage = ? WHERE team_id = ? AND user_id = ?",
-                           (pct, consent["team_id"], m_row["user_id"]))
-            _write_audit_log(db, consent["team_id"], user["id"], "license_generated",
+            if datastore:
+                await datastore.update_team_license(consent["team_id"], lic["license_type"], now_iso)
+                members_list = await datastore.get_team_member_pseudonyms(consent["team_id"])
+                for m_row in members_list:
+                    m_row = dict(m_row)
+                    pct = lic["contribution_split"].get(m_row["pseudonym"], 0)
+                    await datastore.update_member_contribution(consent["team_id"], m_row["user_id"], pct)
+            else:
+                db.execute("UPDATE teams SET license_type = ?, license_updated_at = datetime('now') WHERE id = ?",
+                           (lic["license_type"], consent["team_id"]))
+                for m_row in db.execute(
+                    "SELECT tm.user_id, u.pseudonym FROM team_members tm JOIN users u ON tm.user_id = u.id WHERE tm.team_id = ?",
+                    (consent["team_id"],)
+                ).fetchall():
+                    pct = lic["contribution_split"].get(m_row["pseudonym"], 0)
+                    db.execute("UPDATE team_members SET contribution_percentage = ? WHERE team_id = ? AND user_id = ?",
+                               (pct, consent["team_id"], m_row["user_id"]))
+            await _write_audit_log(datastore or db, consent["team_id"], user["id"], "license_generated",
                              resource_ref=consent["team_id"],
                              details={"old_type": current_type, "new_type": lic["license_type"],
                                       "trigger": "reveal_approved"})
         license_update = {"license_type": lic["license_type"], "changed": lic["license_type"] != current_type}
 
-    db.commit()
+    if db:
+        db.commit()
 
-    requester = db.execute("SELECT pseudonym FROM users WHERE id = ?", (consent["requester_id"],)).fetchone()
+    if datastore:
+        requester = await datastore.get_user_by_id(consent["requester_id"])
+    else:
+        requester = db.execute("SELECT pseudonym FROM users WHERE id = ?", (consent["requester_id"],)).fetchone()
 
     result = {
         "status": "ok",
@@ -4343,28 +4803,34 @@ async def research_match_reveal_status(params: RevealStatusInput, ctx: Context =
         str: JSON with consents, reveal_matrix, and revealed content where applicable
     """
     db = _get_db(ctx)
-    user = _get_current_user(db)
+    datastore = _get_datastore(ctx)
+    user = await _get_current_user(db, datastore=datastore, user_email_hash=_get_user_email_hash(ctx))
     if not user:
         return json.dumps({"error": "No registered user found. Use research_match_register first."})
 
     # Verify membership
-    membership = db.execute(
-        "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
-        (params.team_id, user["id"])
-    ).fetchone()
+    if datastore:
+        membership = await datastore.get_team_member(params.team_id, user["id"])
+    else:
+        membership = db.execute(
+            "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
+            (params.team_id, user["id"])
+        ).fetchone()
     if not membership:
         return json.dumps({"error": "You are not a member of this team."})
 
-    # Fetch all consents for this team with pseudonyms
-    consents_rows = db.execute(
-        """SELECT rc.*, u_req.pseudonym AS requester_pseudonym, u_app.pseudonym AS approver_pseudonym
-           FROM reveal_consents rc
-           JOIN users u_req ON rc.requester_id = u_req.id
-           JOIN users u_app ON rc.approver_id = u_app.id
-           WHERE rc.team_id = ?
-           ORDER BY rc.created_at DESC""",
-        (params.team_id,)
-    ).fetchall()
+    if datastore:
+        consents_rows = await datastore.get_reveal_consents_with_pseudonyms(params.team_id)
+    else:
+        consents_rows = db.execute(
+            """SELECT rc.*, u_req.pseudonym AS requester_pseudonym, u_app.pseudonym AS approver_pseudonym
+               FROM reveal_consents rc
+               JOIN users u_req ON rc.requester_id = u_req.id
+               JOIN users u_app ON rc.approver_id = u_app.id
+               WHERE rc.team_id = ?
+               ORDER BY rc.created_at DESC""",
+            (params.team_id,)
+        ).fetchall()
 
     consents = []
     summary = {"pending": 0, "approved": 0, "denied": 0}
@@ -4376,84 +4842,94 @@ async def research_match_reveal_status(params: RevealStatusInput, ctx: Context =
         consent_info = {
             "consent_id": r["id"],
             "level": r["level"],
-            "requester_pseudonym": r["requester_pseudonym"],
-            "approver_pseudonym": r["approver_pseudonym"],
-            "resource_type": r["resource_type"],
+            "requester_pseudonym": r.get("requester_pseudonym", ""),
+            "approver_pseudonym": r.get("approver_pseudonym", ""),
+            "resource_type": r.get("resource_type", ""),
             "status": r["status"],
-            "created_at": r["created_at"],
-            "resolved_at": r["resolved_at"],
+            "created_at": r.get("created_at", ""),
+            "resolved_at": r.get("resolved_at"),
         }
 
         # If approved and current user is the requester, include full commit content
-        if r["status"] == "approved" and r["requester_id"] == user["id"] and r["resource_ref"]:
-            commit = db.execute(
-                "SELECT * FROM research_commits WHERE id = ?", (r["resource_ref"],)
-            ).fetchone()
+        if r["status"] == "approved" and r["requester_id"] == user["id"] and r.get("resource_ref"):
+            if datastore:
+                commit = await datastore.get_commit_by_id(r["resource_ref"])
+            else:
+                commit = db.execute(
+                    "SELECT * FROM research_commits WHERE id = ?", (r["resource_ref"],)
+                ).fetchone()
             if commit:
                 c = dict(commit)
                 consent_info["revealed_content"] = {
                     "commit_id": c["id"],
                     "version": c["version"],
                     "domain": c["domain"],
-                    "subdomain": c["subdomain"],
+                    "subdomain": c.get("subdomain"),
                     "problem": c["problem"],
-                    "hypothesis": c["hypothesis"],
-                    "theoretical_framework": c["theoretical_framework"],
-                    "demonstrations_summary": c["demonstrations_summary"],
-                    "demo_types": json.loads(c["demo_types"] or "[]"),
-                    "code_languages": json.loads(c["code_languages"] or "[]"),
-                    "adhoc_summary": c["adhoc_summary"],
-                    "adhoc_connections": json.loads(c["adhoc_connections"] or "[]"),
-                    "cherry_picking": json.loads(c["cherry_picking"] or "[]"),
-                    "solidity_levels": json.loads(c["solidity_levels"] or "{}"),
-                    "overall_solidity": c["overall_solidity"],
-                    "ot_score": c["ot_score"],
-                    "ofc_score": c["ofc_score"],
-                    "ot_breakdown": json.loads(c["ot_breakdown"] or "{}"),
-                    "ofc_breakdown": json.loads(c["ofc_breakdown"] or "{}"),
-                    "solidity_impact": json.loads(c["solidity_impact"] or "{}"),
+                    "hypothesis": c.get("hypothesis"),
+                    "theoretical_framework": c.get("theoretical_framework"),
+                    "demonstrations_summary": c.get("demonstrations_summary"),
+                    "demo_types": json.loads(c.get("demo_types") or "[]"),
+                    "code_languages": json.loads(c.get("code_languages") or "[]"),
+                    "adhoc_summary": c.get("adhoc_summary"),
+                    "adhoc_connections": json.loads(c.get("adhoc_connections") or "[]"),
+                    "cherry_picking": json.loads(c.get("cherry_picking") or "[]"),
+                    "solidity_levels": json.loads(c.get("solidity_levels") or "{}"),
+                    "overall_solidity": c.get("overall_solidity"),
+                    "ot_score": c.get("ot_score"),
+                    "ofc_score": c.get("ofc_score"),
+                    "ot_breakdown": json.loads(c.get("ot_breakdown") or "{}"),
+                    "ofc_breakdown": json.loads(c.get("ofc_breakdown") or "{}"),
+                    "solidity_impact": json.loads(c.get("solidity_impact") or "{}"),
                 }
 
         consents.append(consent_info)
 
     # Build reveal matrix
-    members = db.execute(
-        """SELECT tm.user_id, u.pseudonym
-           FROM team_members tm JOIN users u ON tm.user_id = u.id
-           WHERE tm.team_id = ?""",
-        (params.team_id,)
-    ).fetchall()
+    if datastore:
+        members = await datastore.get_team_member_pseudonyms(params.team_id)
+    else:
+        members = db.execute(
+            """SELECT tm.user_id, u.pseudonym
+               FROM team_members tm JOIN users u ON tm.user_id = u.id
+               WHERE tm.team_id = ?""",
+            (params.team_id,)
+        ).fetchall()
 
     reveal_matrix = []
     for member in members:
         m = dict(member)
-        # Who can see this member's commits (approved consents where member is approver)
-        visible_to = db.execute(
-            """SELECT u.pseudonym FROM reveal_consents rc
-               JOIN users u ON rc.requester_id = u.id
-               WHERE rc.team_id = ? AND rc.approver_id = ? AND rc.status = 'approved' AND rc.level = 3""",
-            (params.team_id, m["user_id"])
-        ).fetchall()
-
-        # Whose commits this member can see (approved consents where member is requester)
-        can_see = db.execute(
-            """SELECT u.pseudonym FROM reveal_consents rc
-               JOIN users u ON rc.approver_id = u.id
-               WHERE rc.team_id = ? AND rc.requester_id = ? AND rc.status = 'approved' AND rc.level = 3""",
-            (params.team_id, m["user_id"])
-        ).fetchall()
+        if datastore:
+            visible_to = await datastore.get_approved_reveal_targets(params.team_id, m["user_id"], direction="approver")
+            can_see = await datastore.get_approved_reveal_targets(params.team_id, m["user_id"], direction="requester")
+        else:
+            visible_to = db.execute(
+                """SELECT u.pseudonym FROM reveal_consents rc
+                   JOIN users u ON rc.requester_id = u.id
+                   WHERE rc.team_id = ? AND rc.approver_id = ? AND rc.status = 'approved' AND rc.level = 3""",
+                (params.team_id, m["user_id"])
+            ).fetchall()
+            can_see = db.execute(
+                """SELECT u.pseudonym FROM reveal_consents rc
+                   JOIN users u ON rc.approver_id = u.id
+                   WHERE rc.team_id = ? AND rc.requester_id = ? AND rc.status = 'approved' AND rc.level = 3""",
+                (params.team_id, m["user_id"])
+            ).fetchall()
 
         reveal_matrix.append({
             "pseudonym": m["pseudonym"],
-            "commit_visible_to": [r["pseudonym"] for r in visible_to],
-            "can_see_commits_of": [r["pseudonym"] for r in can_see],
+            "commit_visible_to": [dict(r)["pseudonym"] if not isinstance(r, str) else r for r in visible_to],
+            "can_see_commits_of": [dict(r)["pseudonym"] if not isinstance(r, str) else r for r in can_see],
         })
 
     # Count shared files for Level 4 context
-    shared_files_count = db.execute(
-        "SELECT COUNT(*) as c FROM shared_files WHERE team_id = ?",
-        (params.team_id,)
-    ).fetchone()["c"]
+    if datastore:
+        shared_files_count = await datastore.count_shared_files(params.team_id)
+    else:
+        shared_files_count = db.execute(
+            "SELECT COUNT(*) as c FROM shared_files WHERE team_id = ?",
+            (params.team_id,)
+        ).fetchone()["c"]
 
     result = {
         "team_id": params.team_id,
@@ -4508,66 +4984,84 @@ async def research_match_team_license(params: TeamLicenseInput, ctx: Context = N
         str: JSON with license type, contribution split, rationale, terms, and history
     """
     db = _get_db(ctx)
-    user = _get_current_user(db)
+    datastore = _get_datastore(ctx)
+    user = await _get_current_user(db, datastore=datastore, user_email_hash=_get_user_email_hash(ctx))
     if not user:
         return json.dumps({"error": "No registered user found. Use research_match_register first."})
 
     # Verify membership
-    membership = db.execute(
-        "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
-        (params.team_id, user["id"])
-    ).fetchone()
+    if datastore:
+        membership = await datastore.get_team_member(params.team_id, user["id"])
+    else:
+        membership = db.execute(
+            "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
+            (params.team_id, user["id"])
+        ).fetchone()
     if not membership:
         return json.dumps({"error": "You are not a member of this team."})
 
     # Compute current license
-    license_info = _compute_license(db, params.team_id)
+    license_info = await _compute_license(db, params.team_id, datastore=datastore)
 
     # Check if license changed from stored value
-    team = db.execute("SELECT license_type, license_updated_at FROM teams WHERE id = ?",
-                      (params.team_id,)).fetchone()
+    if datastore:
+        team = await datastore.get_team_by_id(params.team_id)
+    else:
+        team = db.execute("SELECT license_type, license_updated_at FROM teams WHERE id = ?",
+                          (params.team_id,)).fetchone()
     if not team:
         return json.dumps({"error": "Team not found."})
 
     current_type = team["license_type"]
     changed = license_info["license_type"] != current_type
+    now_iso = datetime.now(timezone.utc).isoformat()
 
     if changed:
-        # Update team license
-        db.execute(
-            "UPDATE teams SET license_type = ?, license_updated_at = datetime('now') WHERE id = ?",
-            (license_info["license_type"], params.team_id)
-        )
-        # Update contribution percentages for each member
-        for member_row in db.execute(
-            "SELECT tm.user_id, u.pseudonym FROM team_members tm JOIN users u ON tm.user_id = u.id WHERE tm.team_id = ?",
-            (params.team_id,)
-        ).fetchall():
-            pseudo = member_row["pseudonym"]
-            pct = license_info["contribution_split"].get(pseudo, 0)
+        if datastore:
+            await datastore.update_team_license(params.team_id, license_info["license_type"], now_iso)
+            members_list = await datastore.get_team_member_pseudonyms(params.team_id)
+            for member_row in members_list:
+                member_row = dict(member_row)
+                pseudo = member_row["pseudonym"]
+                pct = license_info["contribution_split"].get(pseudo, 0)
+                await datastore.update_member_contribution(params.team_id, member_row["user_id"], pct)
+        else:
             db.execute(
-                "UPDATE team_members SET contribution_percentage = ? WHERE team_id = ? AND user_id = ?",
-                (pct, params.team_id, member_row["user_id"])
+                "UPDATE teams SET license_type = ?, license_updated_at = datetime('now') WHERE id = ?",
+                (license_info["license_type"], params.team_id)
             )
-        # Audit log
-        _write_audit_log(db, params.team_id, user["id"], "license_generated",
+            for member_row in db.execute(
+                "SELECT tm.user_id, u.pseudonym FROM team_members tm JOIN users u ON tm.user_id = u.id WHERE tm.team_id = ?",
+                (params.team_id,)
+            ).fetchall():
+                pseudo = member_row["pseudonym"]
+                pct = license_info["contribution_split"].get(pseudo, 0)
+                db.execute(
+                    "UPDATE team_members SET contribution_percentage = ? WHERE team_id = ? AND user_id = ?",
+                    (pct, params.team_id, member_row["user_id"])
+                )
+        await _write_audit_log(datastore or db, params.team_id, user["id"], "license_generated",
                          resource_ref=params.team_id,
                          details={"old_type": current_type,
                                   "new_type": license_info["license_type"],
                                   "trigger": "team_license_tool"})
-        db.commit()
+        if db:
+            db.commit()
 
     # Fetch license change history
-    history = db.execute(
-        """SELECT details, created_at FROM audit_log
-           WHERE team_id = ? AND action = 'license_generated'
-           ORDER BY created_at DESC LIMIT 10""",
-        (params.team_id,)
-    ).fetchall()
+    if datastore:
+        history = await datastore.get_audit_entries(params.team_id, action="license_generated", limit=10)
+    else:
+        history = db.execute(
+            """SELECT details, created_at FROM audit_log
+               WHERE team_id = ? AND action = 'license_generated'
+               ORDER BY created_at DESC LIMIT 10""",
+            (params.team_id,)
+        ).fetchall()
     change_history = []
     for h in history:
         hd = dict(h)
-        details = json.loads(hd["details"]) if hd["details"] else {}
+        details = json.loads(hd["details"]) if isinstance(hd.get("details"), str) else (hd.get("details") or {})
         change_history.append({
             "timestamp": hd["created_at"],
             "old_type": details.get("old_type"),
@@ -4592,10 +5086,13 @@ async def research_match_team_license(params: TeamLicenseInput, ctx: Context = N
         result["change_history"] = change_history
 
     # Contract info
-    contracts_count = db.execute(
-        "SELECT COUNT(*) as c FROM collaboration_contracts WHERE team_id = ? AND status = 'confirmed'",
-        (params.team_id,)
-    ).fetchone()["c"]
+    if datastore:
+        contracts_count = await datastore.count_confirmed_contracts_for_team(params.team_id)
+    else:
+        contracts_count = db.execute(
+            "SELECT COUNT(*) as c FROM collaboration_contracts WHERE team_id = ? AND status = 'confirmed'",
+            (params.team_id,)
+        ).fetchone()["c"]
     result["contracts_count"] = contracts_count
     result["contract_tip"] = (
         "Use research_match_export_contract to generate a git-verifiable contract "
@@ -4647,35 +5144,46 @@ async def research_match_share_file(params: ShareFileInput, ctx: Context = None)
         str: JSON with status, file_id, and next steps
     """
     db = _get_db(ctx)
-    user = _get_current_user(db)
+    datastore = _get_datastore(ctx)
+    user = await _get_current_user(db, datastore=datastore, user_email_hash=_get_user_email_hash(ctx))
     if not user:
         return json.dumps({"error": "No registered user found. Use research_match_register first."})
 
     # Verify membership
-    membership = db.execute(
-        "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
-        (params.team_id, user["id"])
-    ).fetchone()
+    if datastore:
+        membership = await datastore.get_team_member(params.team_id, user["id"])
+    else:
+        membership = db.execute(
+            "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
+            (params.team_id, user["id"])
+        ).fetchone()
     if not membership:
         return json.dumps({"error": "You are not a member of this team."})
 
     # Bilateral Level 3 gate: both members must have approved reveals in EACH direction
-    members = db.execute(
-        "SELECT user_id FROM team_members WHERE team_id = ?",
-        (params.team_id,)
-    ).fetchall()
-    member_ids = [m["user_id"] for m in members]
+    if datastore:
+        member_ids = await datastore.get_team_member_ids(params.team_id)
+    else:
+        members_raw = db.execute(
+            "SELECT user_id FROM team_members WHERE team_id = ?",
+            (params.team_id,)
+        ).fetchall()
+        member_ids = [m["user_id"] for m in members_raw]
 
     for m_id in member_ids:
         other_ids = [o for o in member_ids if o != m_id]
         for other_id in other_ids:
-            # m_id approved a reveal for other_id (other_id requested, m_id approved)
-            consent = db.execute(
-                """SELECT id FROM reveal_consents
-                   WHERE team_id = ? AND level = 3 AND requester_id = ? AND approver_id = ?
-                   AND status = 'approved'""",
-                (params.team_id, other_id, m_id)
-            ).fetchone()
+            if datastore:
+                consent = await datastore.find_reveal_consent(
+                    params.team_id, other_id, resource_ref=None,
+                    status="approved", approver_id=m_id)
+            else:
+                consent = db.execute(
+                    """SELECT id FROM reveal_consents
+                       WHERE team_id = ? AND level = 3 AND requester_id = ? AND approver_id = ?
+                       AND status = 'approved'""",
+                    (params.team_id, other_id, m_id)
+                ).fetchone()
             if not consent:
                 return json.dumps({
                     "error": "Bilateral Level 3 reveals required. Both members must have approved reveals in both directions.",
@@ -4684,15 +5192,17 @@ async def research_match_share_file(params: ShareFileInput, ctx: Context = None)
 
     # Re-sharing detection (MAD mechanism)
     if params.file_hash:
-        violation = _check_resharing_violation(db, user["id"], params.file_hash)
+        violation = await _check_resharing_violation(datastore or db, user["id"], params.file_hash)
         if violation:
             # Penalty: tank honesty score
-            db.execute(
-                "UPDATE users SET running_honesty = ?, avg_honesty = ? WHERE id = ?",
-                (RESHARING_PENALTY_HONESTY, RESHARING_PENALTY_HONESTY, user["id"])
-            )
-            # Audit: record violation
-            _write_audit_log(db, params.team_id, user["id"], "violation_detected",
+            if datastore:
+                await datastore.update_user_honesty_penalty(user["id"], RESHARING_PENALTY_HONESTY)
+            else:
+                db.execute(
+                    "UPDATE users SET running_honesty = ?, avg_honesty = ? WHERE id = ?",
+                    (RESHARING_PENALTY_HONESTY, RESHARING_PENALTY_HONESTY, user["id"])
+                )
+            await _write_audit_log(datastore or db, params.team_id, user["id"], "violation_detected",
                              resource_ref=violation["original_file_id"],
                              details={
                                  "type": "resharing",
@@ -4701,7 +5211,8 @@ async def research_match_share_file(params: ShareFileInput, ctx: Context = None)
                                  "origin_user_id": violation["origin_user_id"],
                                  "attempted_file_path": params.file_path,
                              })
-            db.commit()
+            if db:
+                db.commit()
             return json.dumps({
                 "error": "RE-SHARING VIOLATION DETECTED.",
                 "violation": {
@@ -4714,10 +5225,13 @@ async def research_match_share_file(params: ShareFileInput, ctx: Context = None)
             })
 
     # Check file limit
-    file_count = db.execute(
-        "SELECT COUNT(*) as c FROM shared_files WHERE team_id = ?",
-        (params.team_id,)
-    ).fetchone()["c"]
+    if datastore:
+        file_count = await datastore.count_shared_files(params.team_id)
+    else:
+        file_count = db.execute(
+            "SELECT COUNT(*) as c FROM shared_files WHERE team_id = ?",
+            (params.team_id,)
+        ).fetchone()["c"]
     if file_count >= MAX_SHARED_FILES_PER_TEAM:
         return json.dumps({
             "error": f"File limit reached ({MAX_SHARED_FILES_PER_TEAM} files per team).",
@@ -4725,10 +5239,13 @@ async def research_match_share_file(params: ShareFileInput, ctx: Context = None)
         })
 
     # Dedup: check (team_id, shared_by, file_path)
-    existing = db.execute(
-        "SELECT id FROM shared_files WHERE team_id = ? AND shared_by = ? AND file_path = ?",
-        (params.team_id, user["id"], params.file_path)
-    ).fetchone()
+    if datastore:
+        existing = await datastore.find_shared_file(params.team_id, user["id"], params.file_path)
+    else:
+        existing = db.execute(
+            "SELECT id FROM shared_files WHERE team_id = ? AND shared_by = ? AND file_path = ?",
+            (params.team_id, user["id"], params.file_path)
+        ).fetchone()
     if existing:
         return json.dumps({
             "status": "already_shared",
@@ -4740,20 +5257,29 @@ async def research_match_share_file(params: ShareFileInput, ctx: Context = None)
 
     # Insert new file record
     file_id = str(uuid.uuid4())
-    db.execute(
-        """INSERT INTO shared_files (id, team_id, shared_by, file_path, file_hash, description, origin_user_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (file_id, params.team_id, user["id"], params.file_path,
-         params.file_hash, params.description, user["id"])
-    )
+    now_iso = datetime.now(timezone.utc).isoformat()
+    if datastore:
+        await datastore.insert_shared_file({
+            "id": file_id, "team_id": params.team_id,
+            "shared_by": user["id"], "file_path": params.file_path,
+            "file_hash": params.file_hash, "description": params.description,
+            "origin_user_id": user["id"], "shared_at": now_iso,
+        })
+    else:
+        db.execute(
+            """INSERT INTO shared_files (id, team_id, shared_by, file_path, file_hash, description, origin_user_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (file_id, params.team_id, user["id"], params.file_path,
+             params.file_hash, params.description, user["id"])
+        )
 
-    # Audit log
-    _write_audit_log(db, params.team_id, user["id"], "file_shared",
+    await _write_audit_log(datastore or db, params.team_id, user["id"], "file_shared",
                      resource_ref=file_id,
                      details={"file_path": params.file_path,
                               "file_hash": params.file_hash,
                               "description": params.description})
-    db.commit()
+    if db:
+        db.commit()
 
     return json.dumps({
         "status": "ok",
@@ -4797,50 +5323,58 @@ async def research_match_shared_files(params: SharedFilesInput, ctx: Context = N
         str: JSON with files list, by_member summary, and tips
     """
     db = _get_db(ctx)
-    user = _get_current_user(db)
+    datastore = _get_datastore(ctx)
+    user = await _get_current_user(db, datastore=datastore, user_email_hash=_get_user_email_hash(ctx))
     if not user:
         return json.dumps({"error": "No registered user found. Use research_match_register first."})
 
     # Verify membership
-    membership = db.execute(
-        "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
-        (params.team_id, user["id"])
-    ).fetchone()
+    if datastore:
+        membership = await datastore.get_team_member(params.team_id, user["id"])
+    else:
+        membership = db.execute(
+            "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
+            (params.team_id, user["id"])
+        ).fetchone()
     if not membership:
         return json.dumps({"error": "You are not a member of this team."})
 
     # Fetch shared files with pseudonyms
-    rows = db.execute(
-        """SELECT sf.*, u.pseudonym AS shared_by_pseudonym
-           FROM shared_files sf
-           JOIN users u ON sf.shared_by = u.id
-           WHERE sf.team_id = ?
-           ORDER BY sf.shared_at DESC""",
-        (params.team_id,)
-    ).fetchall()
+    if datastore:
+        rows = await datastore.get_shared_files_with_pseudonyms(params.team_id)
+    else:
+        rows = db.execute(
+            """SELECT sf.*, u.pseudonym AS shared_by_pseudonym
+               FROM shared_files sf
+               JOIN users u ON sf.shared_by = u.id
+               WHERE sf.team_id = ?
+               ORDER BY sf.shared_at DESC""",
+            (params.team_id,)
+        ).fetchall()
 
     files = []
     by_member = {}
     for row in rows:
         r = dict(row)
-        pseudo = r["shared_by_pseudonym"]
+        pseudo = r.get("shared_by_pseudonym", r.get("pseudonym", ""))
         by_member[pseudo] = by_member.get(pseudo, 0) + 1
         files.append({
             "file_id": r["id"],
             "file_path": r["file_path"],
-            "file_hash": r["file_hash"],
-            "description": r["description"],
+            "file_hash": r.get("file_hash"),
+            "description": r.get("description"),
             "shared_by": pseudo,
             "is_yours": r["shared_by"] == user["id"],
-            "shared_at": r["shared_at"],
+            "shared_at": r.get("shared_at"),
         })
 
     # Audit log for file access (only if there are files)
     if files:
-        _write_audit_log(db, params.team_id, user["id"], "file_accessed",
+        await _write_audit_log(datastore or db, params.team_id, user["id"], "file_accessed",
                          resource_ref=params.team_id,
                          details={"file_count": len(files)})
-        db.commit()
+        if db:
+            db.commit()
 
     result = {
         "team_id": params.team_id,
@@ -4889,39 +5423,47 @@ async def research_match_audit_log(params: AuditLogInput, ctx: Context = None) -
         str: JSON with audit entries and filtering guidance
     """
     db = _get_db(ctx)
-    user = _get_current_user(db)
+    datastore = _get_datastore(ctx)
+    user = await _get_current_user(db, datastore=datastore, user_email_hash=_get_user_email_hash(ctx))
     if not user:
         return json.dumps({"error": "No registered user found. Use research_match_register first."})
 
     # Verify membership
-    membership = db.execute(
-        "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
-        (params.team_id, user["id"])
-    ).fetchone()
+    if datastore:
+        membership = await datastore.get_team_member(params.team_id, user["id"])
+    else:
+        membership = db.execute(
+            "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
+            (params.team_id, user["id"])
+        ).fetchone()
     if not membership:
         return json.dumps({"error": "You are not a member of this team."})
 
     # Build query
-    if params.action_filter:
-        rows = db.execute(
-            """SELECT al.*, u.pseudonym AS actor_pseudonym
-               FROM audit_log al
-               JOIN users u ON al.actor_id = u.id
-               WHERE al.team_id = ? AND al.action = ?
-               ORDER BY al.created_at DESC
-               LIMIT ?""",
-            (params.team_id, params.action_filter, params.limit)
-        ).fetchall()
+    if datastore:
+        rows = await datastore.get_audit_entries(
+            params.team_id, action=params.action_filter, limit=params.limit)
     else:
-        rows = db.execute(
-            """SELECT al.*, u.pseudonym AS actor_pseudonym
-               FROM audit_log al
-               JOIN users u ON al.actor_id = u.id
-               WHERE al.team_id = ?
-               ORDER BY al.created_at DESC
-               LIMIT ?""",
-            (params.team_id, params.limit)
-        ).fetchall()
+        if params.action_filter:
+            rows = db.execute(
+                """SELECT al.*, u.pseudonym AS actor_pseudonym
+                   FROM audit_log al
+                   JOIN users u ON al.actor_id = u.id
+                   WHERE al.team_id = ? AND al.action = ?
+                   ORDER BY al.created_at DESC
+                   LIMIT ?""",
+                (params.team_id, params.action_filter, params.limit)
+            ).fetchall()
+        else:
+            rows = db.execute(
+                """SELECT al.*, u.pseudonym AS actor_pseudonym
+                   FROM audit_log al
+                   JOIN users u ON al.actor_id = u.id
+                   WHERE al.team_id = ?
+                   ORDER BY al.created_at DESC
+                   LIMIT ?""",
+                (params.team_id, params.limit)
+            ).fetchall()
 
     entries = []
     for row in rows:
@@ -5252,19 +5794,15 @@ async def research_match_prepare_commit(params: PrepareCommitInput, ctx: Context
 
             # Map to SubmitCommitInput and submit
             db = _get_db(ctx)
+            datastore = _get_datastore(ctx)
             evaluator = _get_evaluator(ctx)
-            user = _get_current_user(db)
+            user = await _get_current_user(db, datastore=datastore, user_email_hash=_get_user_email_hash(ctx))
             if not user:
                 return json.dumps({
                     "error": "No registered user found. Please register first with research_match_register.",
                 })
 
             user_id = user["id"]
-            last = db.execute(
-                "SELECT MAX(version) as v FROM research_commits WHERE user_id = ?",
-                (user_id,)
-            ).fetchone()
-            version = (last["v"] or 0) + 1
 
             # Build commit data — machine fields override narrative
             sa = narrative.solidity_assessment
@@ -5293,34 +5831,66 @@ async def research_match_prepare_commit(params: PrepareCommitInput, ctx: Context
             }
 
             content_hash = _hash_content(commit_data)
-            scores = evaluator.evaluate_commit(commit_data, user_id)
+            scores = await evaluator.evaluate_commit(commit_data, user_id)
             commit_id = str(uuid.uuid4())
+            now_iso = datetime.now(timezone.utc).isoformat()
 
-            db.execute("""
-                INSERT INTO research_commits
-                (id, user_id, version, domain, subdomain, problem, hypothesis,
-                 theoretical_framework, demonstrations_summary, demo_types,
-                 code_languages, adhoc_summary, adhoc_connections, cherry_picking,
-                 solidity_levels, overall_solidity,
-                 content_hash, ot_score, ofc_score, ot_breakdown, ofc_breakdown,
-                 solidity_impact)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                commit_id, user_id, version,
-                narrative.domain, narrative.subdomain, narrative.problem,
-                narrative.hypothesis, narrative.theoretical_framework,
-                narrative.demonstrations_summary,
-                json.dumps(commit_data["demo_types"]),
-                json.dumps(commit_data["code_languages"]),
-                narrative.adhoc_summary, json.dumps(narrative.adhoc_connections),
-                json.dumps(narrative.cherry_picking),
-                json.dumps(solidity_dict), overall_sol,
-                content_hash,
-                scores["ot_score"], scores["ofc_score"],
-                json.dumps(scores["ot_breakdown"]), json.dumps(scores["ofc_breakdown"]),
-                json.dumps(scores["solidity_impact"]),
-            ))
-            db.commit()
+            if datastore:
+                version = await datastore.get_next_commit_version(user_id)
+                prev = await datastore.get_latest_commit_by_user(user_id)
+                prev_id = prev["id"] if prev else None
+                commit_record = {
+                    "id": commit_id, "user_id": user_id, "version": version,
+                    "domain": narrative.domain, "subdomain": narrative.subdomain,
+                    "problem": narrative.problem, "hypothesis": narrative.hypothesis,
+                    "theoretical_framework": narrative.theoretical_framework,
+                    "demonstrations_summary": narrative.demonstrations_summary,
+                    "demo_types": json.dumps(commit_data["demo_types"]),
+                    "code_languages": json.dumps(commit_data["code_languages"]),
+                    "adhoc_summary": narrative.adhoc_summary,
+                    "adhoc_connections": json.dumps(narrative.adhoc_connections),
+                    "cherry_picking": json.dumps(narrative.cherry_picking),
+                    "solidity_levels": json.dumps(solidity_dict),
+                    "overall_solidity": overall_sol,
+                    "content_hash": content_hash,
+                    "ot_score": scores["ot_score"], "ofc_score": scores["ofc_score"],
+                    "ot_breakdown": json.dumps(scores["ot_breakdown"]),
+                    "ofc_breakdown": json.dumps(scores["ofc_breakdown"]),
+                    "solidity_impact": json.dumps(scores["solidity_impact"]),
+                    "is_latest": True, "created_at": now_iso,
+                }
+                await datastore.submit_commit_and_mark_latest(commit_record, previous_commit_id=prev_id)
+            else:
+                last = db.execute(
+                    "SELECT MAX(version) as v FROM research_commits WHERE user_id = ?",
+                    (user_id,)
+                ).fetchone()
+                version = (last["v"] or 0) + 1
+                db.execute("""
+                    INSERT INTO research_commits
+                    (id, user_id, version, domain, subdomain, problem, hypothesis,
+                     theoretical_framework, demonstrations_summary, demo_types,
+                     code_languages, adhoc_summary, adhoc_connections, cherry_picking,
+                     solidity_levels, overall_solidity,
+                     content_hash, ot_score, ofc_score, ot_breakdown, ofc_breakdown,
+                     solidity_impact)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    commit_id, user_id, version,
+                    narrative.domain, narrative.subdomain, narrative.problem,
+                    narrative.hypothesis, narrative.theoretical_framework,
+                    narrative.demonstrations_summary,
+                    json.dumps(commit_data["demo_types"]),
+                    json.dumps(commit_data["code_languages"]),
+                    narrative.adhoc_summary, json.dumps(narrative.adhoc_connections),
+                    json.dumps(narrative.cherry_picking),
+                    json.dumps(solidity_dict), overall_sol,
+                    content_hash,
+                    scores["ot_score"], scores["ofc_score"],
+                    json.dumps(scores["ot_breakdown"]), json.dumps(scores["ofc_breakdown"]),
+                    json.dumps(scores["solidity_impact"]),
+                ))
+                db.commit()
 
             return json.dumps({
                 "status": "submitted",
@@ -5396,63 +5966,79 @@ async def research_match_export_contract(params: ExportContractInput, ctx: Conte
              suggested_path, instructions, and status
     """
     db = _get_db(ctx)
-    user = _get_current_user(db)
+    datastore = _get_datastore(ctx)
+    user = await _get_current_user(db, datastore=datastore, user_email_hash=_get_user_email_hash(ctx))
     if not user:
         return json.dumps({"error": "No registered user found. Use research_match_register first."})
 
     # Verify membership
-    membership = db.execute(
-        "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
-        (params.team_id, user["id"])
-    ).fetchone()
+    if datastore:
+        membership = await datastore.get_team_member(params.team_id, user["id"])
+    else:
+        membership = db.execute(
+            "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
+            (params.team_id, user["id"])
+        ).fetchone()
     if not membership:
         return json.dumps({"error": "You are not a member of this team."})
 
     # Compute current license
-    license_info = _compute_license(db, params.team_id)
+    license_info = await _compute_license(db, params.team_id, datastore=datastore)
 
-    # Get next contract version
-    last_version = db.execute(
-        "SELECT MAX(contract_version) as v FROM collaboration_contracts WHERE team_id = ?",
-        (params.team_id,)
-    ).fetchone()
-    contract_version = (last_version["v"] or 0) + 1
+    if datastore:
+        contract_version = await datastore.get_next_contract_version(params.team_id)
+        await datastore.supersede_pending_contracts(params.team_id)
+        content = await _generate_contract_content(db, params.team_id, license_info, contract_version, datastore=datastore)
+        content_hash = hashlib.sha256(content.encode()).hexdigest()
+        contract_id = str(uuid.uuid4())
+        team_data = await datastore.get_team_by_id(params.team_id)
+        team_short = (team_data["name"] if team_data else params.team_id[:8]).replace(" ", "_")
+        now_iso = datetime.now(timezone.utc).isoformat()
+        await datastore.insert_contract({
+            "id": contract_id, "team_id": params.team_id,
+            "contract_version": contract_version,
+            "license_type": license_info["license_type"],
+            "contribution_split": json.dumps(license_info.get("contribution_split", {})),
+            "contract_content": content, "content_hash": content_hash,
+            "generated_by": user["id"], "status": "pending",
+            "created_at": now_iso,
+        })
+    else:
+        last_version = db.execute(
+            "SELECT MAX(contract_version) as v FROM collaboration_contracts WHERE team_id = ?",
+            (params.team_id,)
+        ).fetchone()
+        contract_version = (last_version["v"] or 0) + 1
+        db.execute(
+            """UPDATE collaboration_contracts
+               SET status = 'superseded'
+               WHERE team_id = ? AND status IN ('pending', 'partial')""",
+            (params.team_id,)
+        )
+        content = await _generate_contract_content(db, params.team_id, license_info, contract_version, datastore=datastore)
+        content_hash = hashlib.sha256(content.encode()).hexdigest()
+        contract_id = str(uuid.uuid4())
+        team = db.execute("SELECT name FROM teams WHERE id = ?", (params.team_id,)).fetchone()
+        team_short = (team["name"] if team else params.team_id[:8]).replace(" ", "_")
+        db.execute(
+            """INSERT INTO collaboration_contracts
+               (id, team_id, contract_version, license_type, contribution_split,
+                contract_content, content_hash, generated_by, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')""",
+            (contract_id, params.team_id, contract_version,
+             license_info["license_type"],
+             json.dumps(license_info.get("contribution_split", {})),
+             content, content_hash, user["id"])
+        )
 
-    # Supersede previous pending/partial contracts
-    db.execute(
-        """UPDATE collaboration_contracts
-           SET status = 'superseded'
-           WHERE team_id = ? AND status IN ('pending', 'partial')""",
-        (params.team_id,)
-    )
-
-    # Generate contract content
-    content = _generate_contract_content(db, params.team_id, license_info, contract_version)
-    content_hash = hashlib.sha256(content.encode()).hexdigest()
-
-    contract_id = str(uuid.uuid4())
-    team = db.execute("SELECT name FROM teams WHERE id = ?", (params.team_id,)).fetchone()
-    team_short = (team["name"] if team else params.team_id[:8]).replace(" ", "_")
-
-    db.execute(
-        """INSERT INTO collaboration_contracts
-           (id, team_id, contract_version, license_type, contribution_split,
-            contract_content, content_hash, generated_by, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')""",
-        (contract_id, params.team_id, contract_version,
-         license_info["license_type"],
-         json.dumps(license_info.get("contribution_split", {})),
-         content, content_hash, user["id"])
-    )
-
-    # Audit log
-    _write_audit_log(db, params.team_id, user["id"], "license_generated",
+    await _write_audit_log(datastore or db, params.team_id, user["id"], "license_generated",
                      resource_ref=contract_id,
                      details={"trigger": "contract_generated",
                               "contract_version": contract_version,
                               "license_type": license_info["license_type"],
                               "content_hash": content_hash})
-    db.commit()
+    if db:
+        db.commit()
 
     suggested_path = f"{CONTRACT_DIR_NAME}/{CONTRACT_FILE_PREFIX}{team_short}.md"
 
@@ -5503,23 +6089,30 @@ async def research_match_confirm_contract(params: ConfirmContractInput, ctx: Con
         str: JSON with contract_id, status, your/partner confirmations, message
     """
     db = _get_db(ctx)
-    user = _get_current_user(db)
+    datastore = _get_datastore(ctx)
+    user = await _get_current_user(db, datastore=datastore, user_email_hash=_get_user_email_hash(ctx))
     if not user:
         return json.dumps({"error": "No registered user found. Use research_match_register first."})
 
     # Verify membership
-    membership = db.execute(
-        "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
-        (params.team_id, user["id"])
-    ).fetchone()
+    if datastore:
+        membership = await datastore.get_team_member(params.team_id, user["id"])
+    else:
+        membership = db.execute(
+            "SELECT * FROM team_members WHERE team_id = ? AND user_id = ?",
+            (params.team_id, user["id"])
+        ).fetchone()
     if not membership:
         return json.dumps({"error": "You are not a member of this team."})
 
     # Fetch contract
-    contract = db.execute(
-        "SELECT * FROM collaboration_contracts WHERE id = ? AND team_id = ?",
-        (params.contract_id, params.team_id)
-    ).fetchone()
+    if datastore:
+        contract = await datastore.get_contract(params.contract_id, params.team_id)
+    else:
+        contract = db.execute(
+            "SELECT * FROM collaboration_contracts WHERE id = ? AND team_id = ?",
+            (params.contract_id, params.team_id)
+        ).fetchone()
     if not contract:
         return json.dumps({"error": "Contract not found for this team."})
 
@@ -5535,59 +6128,63 @@ async def research_match_confirm_contract(params: ConfirmContractInput, ctx: Con
     user_id = user["id"]
 
     # Determine slot (A or B)
-    if contract["confirmation_a_user_id"] is None:
-        # Slot A is free — take it
+    if contract.get("confirmation_a_user_id") is None:
         slot = "a"
     elif contract["confirmation_a_user_id"] == user_id:
-        # Idempotent update to slot A
         slot = "a"
     else:
-        # Slot A taken by someone else — use slot B
         slot = "b"
 
-    # Update the slot
-    if slot == "a":
-        db.execute(
-            """UPDATE collaboration_contracts
-               SET confirmation_a_user_id = ?, confirmation_a_git_hash = ?,
-                   confirmation_a_repo_url = ?, confirmation_a_at = ?
-               WHERE id = ?""",
-            (user_id, params.git_commit_hash, params.repo_url, now, params.contract_id)
-        )
+    if datastore:
+        await datastore.update_contract_confirmation(
+            params.contract_id, slot, user_id,
+            params.git_commit_hash, params.repo_url, now)
+        updated = await datastore.get_contract(params.contract_id, params.team_id)
+        updated = dict(updated)
     else:
-        db.execute(
-            """UPDATE collaboration_contracts
-               SET confirmation_b_user_id = ?, confirmation_b_git_hash = ?,
-                   confirmation_b_repo_url = ?, confirmation_b_at = ?
-               WHERE id = ?""",
-            (user_id, params.git_commit_hash, params.repo_url, now, params.contract_id)
-        )
-
-    # Re-read to check both slots
-    updated = dict(db.execute(
-        "SELECT * FROM collaboration_contracts WHERE id = ?",
-        (params.contract_id,)
-    ).fetchone())
+        if slot == "a":
+            db.execute(
+                """UPDATE collaboration_contracts
+                   SET confirmation_a_user_id = ?, confirmation_a_git_hash = ?,
+                       confirmation_a_repo_url = ?, confirmation_a_at = ?
+                   WHERE id = ?""",
+                (user_id, params.git_commit_hash, params.repo_url, now, params.contract_id)
+            )
+        else:
+            db.execute(
+                """UPDATE collaboration_contracts
+                   SET confirmation_b_user_id = ?, confirmation_b_git_hash = ?,
+                       confirmation_b_repo_url = ?, confirmation_b_at = ?
+                   WHERE id = ?""",
+                (user_id, params.git_commit_hash, params.repo_url, now, params.contract_id)
+            )
+        updated = dict(db.execute(
+            "SELECT * FROM collaboration_contracts WHERE id = ?",
+            (params.contract_id,)
+        ).fetchone())
 
     both_confirmed = (
-        updated["confirmation_a_user_id"] is not None and
-        updated["confirmation_b_user_id"] is not None
+        updated.get("confirmation_a_user_id") is not None and
+        updated.get("confirmation_b_user_id") is not None
     )
     new_status = "confirmed" if both_confirmed else "partial"
 
-    db.execute(
-        "UPDATE collaboration_contracts SET status = ? WHERE id = ?",
-        (new_status, params.contract_id)
-    )
+    if datastore:
+        await datastore.update_contract_status(params.contract_id, new_status)
+    else:
+        db.execute(
+            "UPDATE collaboration_contracts SET status = ? WHERE id = ?",
+            (new_status, params.contract_id)
+        )
 
-    # Audit log
-    _write_audit_log(db, params.team_id, user_id, "license_generated",
+    await _write_audit_log(datastore or db, params.team_id, user_id, "license_generated",
                      resource_ref=params.contract_id,
                      details={"trigger": "contract_confirmed",
                               "slot": slot,
                               "git_commit_hash": params.git_commit_hash,
                               "new_status": new_status})
-    db.commit()
+    if db:
+        db.commit()
 
     your_confirmation = {
         "user_id": user_id,

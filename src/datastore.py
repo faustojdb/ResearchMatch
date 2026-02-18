@@ -258,8 +258,11 @@ class DataStore(abc.ABC):
         ...
 
     @abc.abstractmethod
-    async def update_request_status(self, request_id: str, status: str) -> None:
-        """UPDATE collaboration_requests SET status=?, responded_at=now() WHERE id=?"""
+    async def update_request_status(
+        self, request_id: str, status: str, responded_at: Optional[str] = None
+    ) -> None:
+        """UPDATE collaboration_requests SET status=?, responded_at=now() WHERE id=?
+        If responded_at is provided, use it instead of now()."""
         ...
 
     @abc.abstractmethod
@@ -308,8 +311,11 @@ class DataStore(abc.ABC):
         ...
 
     @abc.abstractmethod
-    async def update_team_license(self, team_id: str, license_type: str) -> None:
-        """UPDATE teams SET license_type=?, license_updated_at=now() WHERE id=?"""
+    async def update_team_license(
+        self, team_id: str, license_type: str, updated_at: Optional[str] = None
+    ) -> None:
+        """UPDATE teams SET license_type=?, license_updated_at=now() WHERE id=?
+        If updated_at is provided, use it instead of now()."""
         ...
 
     @abc.abstractmethod
@@ -553,8 +559,12 @@ class DataStore(abc.ABC):
         ...
 
     @abc.abstractmethod
-    async def update_reveal_consent_status(self, consent_id: str, status: str) -> None:
-        """UPDATE reveal_consents SET status=?, resolved_at=now() WHERE id=?"""
+    async def update_reveal_consent_status(
+        self, consent_id: str, status: str,
+        team_id: Optional[str] = None, resolved_at: Optional[str] = None
+    ) -> None:
+        """UPDATE reveal_consents SET status=?, resolved_at=now() WHERE id=?
+        team_id and resolved_at are optional hints (used by server for consistency)."""
         ...
 
     # =================================================================
@@ -596,8 +606,10 @@ class DataStore(abc.ABC):
         ...
 
     @abc.abstractmethod
-    async def count_shared_files(self) -> int:
-        """SELECT COUNT(*) FROM shared_files"""
+    async def count_shared_files(self, team_id: Optional[str] = None) -> int:
+        """SELECT COUNT(*) FROM shared_files.
+        If team_id is provided, counts only files in that team
+        (delegates to count_shared_files_in_team)."""
         ...
 
     # =================================================================
@@ -746,10 +758,19 @@ class DataStore(abc.ABC):
 
     @abc.abstractmethod
     async def create_team_with_members(
-        self, team_id: str, team_name: str, license_type: str,
-        member_user_ids: list[str], role: str = "co-lead"
+        self,
+        team_id: str = "",
+        team_name: str = "",
+        license_type: str = "joint-equal",
+        member_user_ids: Optional[list[str]] = None,
+        role: str = "co-lead",
+        *,
+        team: Optional[Record] = None,
+        members: Optional[list[Record]] = None,
     ) -> None:
         """Atomically create a team + insert all members.
+        Accepts either positional args (team_id, team_name, etc.) OR
+        dict-based kwargs (team={...}, members=[{...}]).
         In SQLite: sequential inserts in same transaction.
         In Firestore: batch write."""
         ...
@@ -763,3 +784,149 @@ class DataStore(abc.ABC):
         In Firestore: batch write setting is_latest=false on old, true on new.
         Also syncs to Algolia if available."""
         ...
+
+    # =================================================================
+    # CONVENIENCE ALIASES
+    # =================================================================
+    # Concrete (non-abstract) methods that delegate to canonical abstract
+    # methods above. These bridge naming differences between the server
+    # code and the protocol without duplicating implementation.
+
+    # -- Team Members --
+    async def get_team_member(self, team_id: str, user_id: str) -> Optional[Record]:
+        """Alias for get_team_membership."""
+        return await self.get_team_membership(team_id, user_id)
+
+    # -- Teams --
+    async def get_teams_for_user(self, user_id: str) -> list[Record]:
+        """Alias for get_teams_by_user."""
+        return await self.get_teams_by_user(user_id)
+
+    # -- Commits --
+    async def get_commits_by_user(self, user_id: str) -> list[Record]:
+        """Alias for get_all_commits_by_user."""
+        return await self.get_all_commits_by_user(user_id)
+
+    async def get_next_commit_version(self, user_id: str) -> int:
+        """Returns max_commit_version + 1."""
+        return (await self.get_max_commit_version(user_id)) + 1
+
+    # -- Contracts --
+    async def get_next_contract_version(self, team_id: str) -> int:
+        """Returns max_contract_version + 1."""
+        return (await self.get_max_contract_version(team_id)) + 1
+
+    async def get_contract(self, contract_id: str, team_id: str) -> Optional[Record]:
+        """Alias for get_contract_by_id_and_team."""
+        return await self.get_contract_by_id_and_team(contract_id, team_id)
+
+    async def update_contract_confirmation(
+        self, contract_id: str, slot: str, user_id: str,
+        git_hash: str, repo_url: str, confirmed_at: str
+    ) -> None:
+        """Unified contract confirmation — dispatches to slot a or b."""
+        if slot == "a":
+            await self.update_contract_confirmation_a(
+                contract_id, user_id, git_hash, repo_url, confirmed_at)
+        else:
+            await self.update_contract_confirmation_b(
+                contract_id, user_id, git_hash, repo_url, confirmed_at)
+
+    # -- Collaboration Requests --
+    async def create_collaboration_request(self, data: Record) -> None:
+        """Dict-based wrapper for insert_collaboration_request."""
+        await self.insert_collaboration_request(
+            request_id=data["id"],
+            match_id=data["match_id"],
+            requester_id=data["requester_id"],
+            recipient_id=data["recipient_id"],
+            message=data.get("message", ""),
+        )
+
+    async def get_incoming_requests_with_details(self, recipient_id: str) -> list[Record]:
+        """Alias for get_incoming_requests (Firestore version already joins details)."""
+        return await self.get_incoming_requests(recipient_id)
+
+    async def get_outgoing_requests_with_details(self, requester_id: str) -> list[Record]:
+        """Alias for get_outgoing_requests (Firestore version already joins details)."""
+        return await self.get_outgoing_requests(requester_id)
+
+    # -- Tickets --
+    async def list_tickets(
+        self, team_id: str, status: Optional[str] = None,
+        area: Optional[str] = None, ticket_type: Optional[str] = None
+    ) -> list[Record]:
+        """Alias for list_tickets_with_filters."""
+        return await self.list_tickets_with_filters(
+            team_id, status=status, area=area, ticket_type=ticket_type)
+
+    async def count_open_tickets_by_user(self, team_id: str, user_id: str) -> int:
+        """Alias for count_open_tickets_by_author."""
+        return await self.count_open_tickets_by_author(team_id, user_id)
+
+    async def count_tickets_by_status(self, team_id: str) -> list[Record]:
+        """Alias for get_ticket_status_summary."""
+        return await self.get_ticket_status_summary(team_id)
+
+    async def update_ticket_status(
+        self, team_id: str, ticket_id: str,
+        status: str = "resolved", resolved_by: str = "",
+        resolved_at: str = ""
+    ) -> None:
+        """Enhanced resolve_ticket with team_id and timestamp."""
+        await self.resolve_ticket(ticket_id, resolved_by, status)
+
+    # -- Reveal Consents --
+    async def find_reveal_consent(
+        self, team_id: str, requester_id: str, resource_ref: str,
+        status: str = "pending", approver_id: Optional[str] = None
+    ) -> Optional[Record]:
+        """Unified finder: dispatches to pending/approved/pair variants."""
+        if status == "pending":
+            return await self.find_pending_reveal(team_id, requester_id, resource_ref)
+        elif status == "approved" and approver_id:
+            return await self.find_approved_reveal_for_pair(team_id, requester_id, approver_id)
+        elif status == "approved":
+            return await self.find_approved_reveal(team_id, requester_id, resource_ref)
+        return None
+
+    async def get_reveal_consents_with_pseudonyms(self, team_id: str) -> list[Record]:
+        """Alias for get_team_consents_with_pseudonyms."""
+        return await self.get_team_consents_with_pseudonyms(team_id)
+
+    async def get_approved_reveal_targets(
+        self, team_id: str, user_id: str, direction: str = "approver"
+    ) -> list[str]:
+        """Unified reveal direction query. direction='approver' means who can see
+        user's commits; direction='requester' means whose commits user can see."""
+        if direction == "approver":
+            return await self.get_reveal_visible_to(team_id, user_id)
+        else:
+            return await self.get_reveal_can_see(team_id, user_id)
+
+    # -- Shared Files --
+    async def find_shared_file(
+        self, team_id: str, shared_by: str, file_path: str
+    ) -> Optional[Record]:
+        """Alias for find_shared_file_by_path."""
+        return await self.find_shared_file_by_path(team_id, shared_by, file_path)
+
+    async def get_shared_files_with_pseudonyms(self, team_id: str) -> list[Record]:
+        """Alias for list_shared_files_with_pseudonyms."""
+        return await self.list_shared_files_with_pseudonyms(team_id)
+
+    # -- Audit --
+    async def get_audit_entries(
+        self, team_id: str, action: Optional[str] = None, limit: int = 100
+    ) -> list[Record]:
+        """Unified audit query: if action is provided, filters; otherwise returns all."""
+        if action:
+            return await self.list_audit_entries_filtered(team_id, action, limit)
+        return await self.list_audit_entries(team_id, limit)
+
+    # -- Users --
+    async def update_user_honesty_penalty(
+        self, user_id: str, penalty_value: float
+    ) -> None:
+        """Simplified penalty: sets both running_honesty and avg_honesty to penalty_value."""
+        await self.penalize_user_honesty(user_id, penalty_value, penalty_value)
