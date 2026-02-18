@@ -124,7 +124,7 @@ def _log_tool_call(func):
 # =============================================================================
 
 DB_PATH = os.environ.get("RESEARCH_MATCH_DB") or "research_match.db"
-SERVER_VERSION = "2.8.0-contracts"
+SERVER_VERSION = "3.0.0"
 
 # Scoring weights for Theoretical Originality (OT)
 OT_WEIGHTS = {
