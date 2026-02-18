@@ -41,3 +41,7 @@ research_refs/
 # Ad-hoc test scripts
 test_whatsapp_*.py
 test_deep_search_real.py
+
+# Production credentials (NEVER commit)
+firebase-credentials.json
+.env

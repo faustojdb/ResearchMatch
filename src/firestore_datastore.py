@@ -355,30 +355,23 @@ class FirestoreDataStore(DataStore):
         # Try Algolia first (fast full-text search)
         if self._algolia:
             try:
-                from algoliasearch.search.models.search_method_params import SearchMethodParams  # type: ignore
-                from algoliasearch.search.models.search_for_hits import SearchForHits  # type: ignore
-                resp = self._algolia.search(
-                    search_method_params=SearchMethodParams(
-                        requests=[SearchForHits(
-                            index_name=self._algolia_index,
-                            query=query,
-                            hits_per_page=limit,
-                        )]
-                    )
+                resp = self._algolia.search_single_index(
+                    self._algolia_index,
+                    {"query": query, "hitsPerPage": limit},
                 )
-                hits = resp.results[0].hits if resp.results else []
-                return [
-                    {
-                        "domain": h.get("domain", ""),
-                        "subdomain": h.get("subdomain", ""),
-                        "problem": h.get("problem", ""),
-                        "hypothesis": h.get("hypothesis", ""),
-                        "overall_solidity": h.get("overall_solidity", ""),
-                        "created_at": h.get("created_at_timestamp", ""),
-                        "pseudonym": h.get("pseudonym", ""),
-                    }
-                    for h in hits
-                ]
+                results = []
+                for hit in (resp.hits or []):
+                    d = hit.to_dict() if hasattr(hit, "to_dict") else hit
+                    results.append({
+                        "domain": d.get("domain", ""),
+                        "subdomain": d.get("subdomain", ""),
+                        "problem": d.get("problem", ""),
+                        "hypothesis": d.get("hypothesis", ""),
+                        "overall_solidity": d.get("overall_solidity", ""),
+                        "created_at": d.get("created_at_timestamp", ""),
+                        "pseudonym": d.get("pseudonym", ""),
+                    })
+                return results
             except Exception as e:
                 logger.warning("Algolia search failed, falling back to Firestore: %s", e)
 
