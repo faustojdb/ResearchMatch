@@ -1740,8 +1740,9 @@ async def app_lifespan(app):
     global _server_start_time
     _server_start_time = datetime.now(timezone.utc).isoformat()
 
-    # Determine backend: Firestore if GOOGLE_APPLICATION_CREDENTIALS is set, else SQLite
-    use_firestore = bool(os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"))
+    # Determine backend: Firestore if explicitly set or GOOGLE_APPLICATION_CREDENTIALS exists
+    backend_env = os.environ.get("RESEARCH_MATCH_BACKEND", "").lower()
+    use_firestore = backend_env == "firestore" or bool(os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"))
 
     if use_firestore:
         from .firestore_datastore import FirestoreDataStore
@@ -1784,7 +1785,8 @@ mcp = FastMCP("research_match_mcp", lifespan=app_lifespan)
 
 def _health_stats() -> Dict[str, Any]:
     """Gather health statistics from the database."""
-    use_firestore = bool(os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"))
+    backend_env = os.environ.get("RESEARCH_MATCH_BACKEND", "").lower()
+    use_firestore = backend_env == "firestore" or bool(os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"))
     if use_firestore:
         # Firestore mode — return basic stats without DB queries
         return {
@@ -6227,16 +6229,29 @@ async def research_match_confirm_contract(params: ConfirmContractInput, ctx: Con
 
 def main():
     """Entry point for `uv run research-match` and direct execution."""
-    # Ensure DB schema exists before server starts (lifespan only runs on MCP connect)
-    _boot_db = init_database(DB_PATH)
-    _boot_db.close()
-    _logger.info("Database initialized at %s", DB_PATH)
+    backend_env = os.environ.get("RESEARCH_MATCH_BACKEND", "").lower()
+    use_firestore = backend_env == "firestore" or bool(os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"))
 
+    if not use_firestore:
+        # SQLite mode: ensure DB schema exists before server starts
+        _boot_db = init_database(DB_PATH)
+        _boot_db.close()
+        _logger.info("Database initialized at %s", DB_PATH)
+    else:
+        _logger.info("Firestore mode — skipping SQLite init")
+
+    # Determine transport: --http flag or PORT env var (Cloud Run)
+    port_env = os.environ.get("PORT")
     if "--http" in sys.argv:
         port_idx = sys.argv.index("--http") + 1
         port = int(sys.argv[port_idx]) if port_idx < len(sys.argv) else 8000
         mcp.settings.port = port
         _logger.info("Starting streamable-http on port %d", port)
+        mcp.run(transport="streamable-http")
+    elif port_env:
+        # Cloud Run: PORT env var set automatically
+        mcp.settings.port = int(port_env)
+        _logger.info("Starting streamable-http on port %s (Cloud Run)", port_env)
         mcp.run(transport="streamable-http")
     else:
         mcp.run()
