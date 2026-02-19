@@ -1,0 +1,35 @@
+Business Source License 1.1
+License text copyright (c) 2017 MariaDB Corporation Ab, All Rights Reserved.
+“Business Source License” is a trademark of MariaDB Corporation Ab.
+Parameters
+Licensor:             Fausto Jose Di Bacco
+Licensed Work:        ResearchMatch
+The Licensed Work is (c) 2026 Fausto Jose Di Bacco
+Additional Use Grant: You may not use the Licensed Work for any commercial purpose,
+including but not limited to selling, leasing, or providing the
+Licensed Work as a service (SaaS) to third parties.
+Change Date:          February 18, 2031
+Change License:       Apache License, Version 2.0
+Terms
+The Licensor hereby grants you the right to copy, modify, create derivative works,
+redistribute, and make non-production use of the Licensed Work. The Licensor
+may make an Additional Use Grant, above, permitting limited production use.
+Effective on the Change Date, or the fifth anniversary of the first publicly
+available distribution of a specific version of the Licensed Work under this
+License, whichever is earlier, the Licensor hereby grants you rights under
+the terms of the Change License, and the rights granted in the paragraph
+above terminate.
+If your use of the Licensed Work does not comply with the requirements
+currently in effect as described in this License, you must purchase a
+commercial license from the Licensor, its affiliated entities, or authorized
+resellers, or you must refrain from using the Licensed Work.
+All copies of the original and modified Licensed Work, and all copies that
+are distributed or otherwise made available, must include this License,
+any Additional Use Grant, and the copyright and trademark notices.
+This Business Source License Version 1.1 (the “License”) is not an open
+source license. You may not use this file except in compliance with the
+License. You may obtain a copy of the License at
+https://mariadb.com/bsl11/.
+Software distributed under the License is distributed on an “AS IS” basis,
+WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
+for the specific language governing rights and limitations under the License.
