@@ -22,15 +22,23 @@
       "command": "uv",
       "args": ["run", "--directory", "${__dirname}", "research-match"],
       "env": {
-        "RESEARCH_MATCH_DB": "${user_config.database_path}"
+        "RESEARCH_MATCH_DB": "${user_config.database_path}",
+        "RESEARCH_MATCH_BACKEND": "${user_config.backend}"
       }
     }
   },
   "user_config": {
+    "backend": {
+      "type": "string",
+      "title": "Backend",
+      "description": "Database backend: 'sqlite' for local storage or 'firestore' for cloud (requires Google Application Credentials).",
+      "required": false,
+      "default": "sqlite"
+    },
     "database_path": {
       "type": "string",
       "title": "Database Path",
-      "description": "Path to the SQLite database file. Leave empty to use the default (research_match.db in the extension directory).",
+      "description": "Path to the SQLite database file (only used with sqlite backend). Leave empty to use the default.",
       "required": false,
       "default": ""
     }

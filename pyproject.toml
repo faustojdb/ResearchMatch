@@ -23,7 +23,7 @@ dependencies = [
 ]
 
 [project.scripts]
-research-match = "research_match_server:main"
+research-match = "src.research_match_server:main"
 
 [build-system]
 requires = ["hatchling"]
