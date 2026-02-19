@@ -1282,6 +1282,56 @@ class FirestoreDataStore(DataStore):
         self._contracts_ref().document(contract_id).update({"status": status})
 
     # =================================================================
+    # GITHUB CONNECTIONS (embedded in users/{user_id}.github_connection)
+    # =================================================================
+
+    async def get_github_connection(self, user_id: str) -> Optional[Record]:
+        doc = self._users_ref().document(user_id).get(
+            field_paths=["github_connection"]
+        )
+        if doc.exists:
+            data = doc.to_dict()
+            if data and data.get("github_connection"):
+                conn = dict(data["github_connection"])
+                conn["user_id"] = user_id
+                return conn
+        return None
+
+    async def upsert_github_connection(
+        self, user_id: str, github_username: str,
+        installation_id: int, authorized_repos: list[str]
+    ) -> None:
+        self._users_ref().document(user_id).update({
+            "github_connection": {
+                "github_username": github_username,
+                "installation_id": installation_id,
+                "authorized_repos": authorized_repos,
+                "connected_at": _now_iso(),
+            }
+        })
+
+    async def delete_github_connection(self, user_id: str) -> None:
+        self._users_ref().document(user_id).update({
+            "github_connection": None,
+        })
+
+    async def get_github_connections_for_team(self, team_id: str) -> list[Record]:
+        member_ids = await self.get_team_member_ids(team_id)
+        results = []
+        for uid in member_ids:
+            conn = await self.get_github_connection(uid)
+            if conn:
+                results.append(conn)
+        return results
+
+    async def update_github_authorized_repos(
+        self, user_id: str, authorized_repos: list[str]
+    ) -> None:
+        self._users_ref().document(user_id).update({
+            "github_connection.authorized_repos": authorized_repos,
+        })
+
+    # =================================================================
     # UTILITY
     # =================================================================
 

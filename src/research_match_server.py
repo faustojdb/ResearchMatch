@@ -501,7 +501,9 @@ def init_database(db_path: str) -> sqlite3.Connection:
                 'reveal_requested', 'reveal_approved', 'reveal_denied',
                 'file_shared', 'file_accessed',
                 'ticket_created', 'ticket_updated', 'ticket_resolved',
-                'license_generated', 'violation_detected'
+                'license_generated', 'violation_detected',
+                'github_connected', 'github_disconnected',
+                'repo_access_granted', 'repo_access_revoked'
             )),
             resource_ref TEXT,
             details TEXT,
@@ -530,6 +532,15 @@ def init_database(db_path: str) -> sqlite3.Connection:
             status TEXT NOT NULL DEFAULT 'pending'
                 CHECK(status IN ('pending', 'partial', 'confirmed', 'superseded')),
             UNIQUE(team_id, contract_version)
+        );
+
+        -- GitHub connections (GitHub App integration)
+        CREATE TABLE IF NOT EXISTS github_connections (
+            user_id TEXT PRIMARY KEY REFERENCES users(id),
+            github_username TEXT NOT NULL,
+            installation_id INTEGER NOT NULL,
+            authorized_repos TEXT,
+            connected_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
         -- Original indexes
@@ -1727,6 +1738,35 @@ class AuditLogInput(BaseModel):
     limit: int = Field(50, ge=1, le=200, description="Max entries to return")
 
 
+class ConnectGitHubInput(BaseModel):
+    """Input for connecting a GitHub account via GitHub App."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    github_username: str = Field(
+        ..., min_length=1, max_length=39,
+        description="Your GitHub username")
+
+    @field_validator("github_username")
+    @classmethod
+    def validate_github_username(cls, v: str) -> str:
+        import re
+        if not re.match(r'^[a-zA-Z0-9](?:[a-zA-Z0-9]|-(?=[a-zA-Z0-9])){0,38}$', v):
+            raise ValueError(
+                "Invalid GitHub username. Must start with alphanumeric, "
+                "contain only alphanumeric or hyphens, max 39 chars."
+            )
+        return v
+
+
+class DisconnectGitHubInput(BaseModel):
+    """Input for disconnecting GitHub account."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    confirm: bool = Field(
+        ..., description="Must be true to confirm disconnection. "
+        "This will revoke all repo access granted through Research Match.")
+
+
 # =============================================================================
 # LIFESPAN & SERVER INITIALIZATION
 # =============================================================================
@@ -1765,11 +1805,18 @@ async def app_lifespan(app):
     evaluator = OriginalityEvaluator(db=db, embeddings=embeddings, datastore=datastore)
     matcher = MatchingEngine(db=db, embeddings=embeddings, datastore=datastore)
     reputation = ReputationEngine(db=db, datastore=datastore)
+
+    # GitHub App client (optional — graceful degradation if not configured)
+    from .github_client import GitHubAppClient
+    github_client = GitHubAppClient()
+
     yield {
         "db": db, "datastore": datastore, "evaluator": evaluator,
         "matcher": matcher, "reputation": reputation,
         "embeddings": embeddings, "user_email_hash": user_email_hash,
+        "github_client": github_client,
     }
+    github_client.close()
     if db:
         db.close()
     if datastore:
@@ -1874,6 +1921,14 @@ def _get_matcher(ctx) -> MatchingEngine:
 def _get_reputation(ctx) -> ReputationEngine:
     return ctx.request_context.lifespan_context["reputation"]
 
+def _get_github_client(ctx):
+    """Get GitHubAppClient from lifespan context. Returns None if not configured."""
+    from .github_client import GitHubAppClient
+    client = ctx.request_context.lifespan_context.get("github_client")
+    if client and client.is_configured:
+        return client
+    return None
+
 # Per-session user identity map (session_id → email_hash)
 # Used by Cloud Run multi-user mode where env var is not per-user
 _session_user_map: Dict[str, str] = {}
@@ -1975,6 +2030,52 @@ def _reputation_badge(score: float, total_ratings: int) -> str:
         return f"🚩 Low ({score:.0f}/100, {total_ratings} ratings)"
 
 
+async def _get_revealed_ratings_with_pseudonyms(
+    db, datastore, user_id: str, limit: int = 10
+) -> list:
+    """Fetch revealed ratings for a user, resolving rater pseudonyms.
+
+    Returns list of dicts with: rater, honesty, quality, effort, date, and optional comment.
+    Only includes ratings where is_revealed is truthy (both parties have rated).
+    """
+    if datastore:
+        ratings = await datastore.get_ratings_received_desc(user_id)
+    else:
+        ratings = db.execute(
+            "SELECT * FROM ratings WHERE rated_id = ? ORDER BY created_at DESC",
+            (user_id,)
+        ).fetchall()
+
+    result = []
+    for r in ratings:
+        r = dict(r)
+        if not r.get("is_revealed"):
+            continue
+        # Resolve rater pseudonym
+        if datastore:
+            rater_pseudonym = await datastore.get_user_pseudonym(r["rater_id"])
+        else:
+            row = db.execute(
+                "SELECT pseudonym FROM users WHERE id = ?", (r["rater_id"],)
+            ).fetchone()
+            rater_pseudonym = row["pseudonym"] if row else "Unknown"
+
+        entry = {
+            "rater": rater_pseudonym or "Unknown",
+            "honesty": r["honesty"],
+            "quality": r["quality"],
+            "effort": r["effort"],
+            "date": r.get("created_at", ""),
+        }
+        if r.get("comment"):
+            entry["comment"] = r["comment"]
+        result.append(entry)
+        if len(result) >= limit:
+            break
+
+    return result
+
+
 async def _write_audit_log(db_or_ds, team_id: str, actor_id: str,
                            action: str, resource_ref: str = None, details: dict = None) -> str:
     """Write an immutable entry to the audit log. Returns the log entry ID.
@@ -1993,6 +2094,158 @@ async def _write_audit_log(db_or_ds, team_id: str, actor_id: str,
             (log_id, team_id, actor_id, action, resource_ref, details_str)
         )
     return log_id
+
+
+async def _grant_bilateral_repo_access(db_or_ds, github_client, team_id: str,
+                                        triggering_user_id: str) -> dict:
+    """Grant bilateral read-only repo access between team members via GitHub App.
+
+    For each member with a GitHub connection, adds the other member as a
+    pull-only collaborator on their authorized repos (max 5 per member).
+
+    Returns summary dict with grants list and any errors.
+    """
+    from .github_client import MAX_REPOS_PER_GRANT
+
+    if not github_client or not github_client.is_configured:
+        return {"skipped": True, "reason": "GitHub App not configured"}
+
+    # Get GitHub connections for team members
+    if isinstance(db_or_ds, DataStore):
+        connections = await db_or_ds.get_github_connections_for_team(team_id)
+    else:
+        member_ids = []
+        rows = db_or_ds.execute(
+            "SELECT user_id FROM team_members WHERE team_id = ?", (team_id,)
+        ).fetchall()
+        for r in rows:
+            member_ids.append(r["user_id"])
+        connections = []
+        for uid in member_ids:
+            row = db_or_ds.execute(
+                "SELECT * FROM github_connections WHERE user_id = ?", (uid,)
+            ).fetchone()
+            if row:
+                conn = dict(row)
+                conn["authorized_repos"] = json.loads(conn.get("authorized_repos") or "[]")
+                connections.append(conn)
+
+    if len(connections) < 2:
+        return {
+            "skipped": True,
+            "reason": "Both team members must connect GitHub first",
+            "connected_count": len(connections),
+        }
+
+    grants = []
+    errors = []
+    for owner_conn in connections:
+        # Find the other member
+        other_conns = [c for c in connections if c["user_id"] != owner_conn["user_id"]]
+        if not other_conns:
+            continue
+        other_conn = other_conns[0]
+
+        repos = (owner_conn.get("authorized_repos") or [])[:MAX_REPOS_PER_GRANT]
+        for repo in repos:
+            try:
+                result = github_client.add_collaborator(
+                    owner_conn["installation_id"],
+                    repo,
+                    other_conn["github_username"],
+                    permission="pull",
+                )
+                grants.append({
+                    "repo": repo,
+                    "granted_to": other_conn["github_username"],
+                    "status": result["status"],
+                })
+            except Exception as e:
+                errors.append({
+                    "repo": repo,
+                    "granted_to": other_conn["github_username"],
+                    "error": str(e),
+                })
+
+    # Audit log
+    if grants:
+        await _write_audit_log(
+            db_or_ds, team_id, triggering_user_id, "repo_access_granted",
+            details={"grants": grants, "errors": errors},
+        )
+
+    return {"grants": grants, "errors": errors, "skipped": False}
+
+
+async def _revoke_bilateral_repo_access(db_or_ds, github_client, team_id: str,
+                                         triggering_user_id: str) -> dict:
+    """Revoke bilateral repo access between team members.
+
+    Removes collaborator access in both directions for all authorized repos.
+    Returns summary dict.
+    """
+    from .github_client import MAX_REPOS_PER_GRANT
+
+    if not github_client or not github_client.is_configured:
+        return {"skipped": True, "reason": "GitHub App not configured"}
+
+    if isinstance(db_or_ds, DataStore):
+        connections = await db_or_ds.get_github_connections_for_team(team_id)
+    else:
+        member_ids = []
+        rows = db_or_ds.execute(
+            "SELECT user_id FROM team_members WHERE team_id = ?", (team_id,)
+        ).fetchall()
+        for r in rows:
+            member_ids.append(r["user_id"])
+        connections = []
+        for uid in member_ids:
+            row = db_or_ds.execute(
+                "SELECT * FROM github_connections WHERE user_id = ?", (uid,)
+            ).fetchone()
+            if row:
+                conn = dict(row)
+                conn["authorized_repos"] = json.loads(conn.get("authorized_repos") or "[]")
+                connections.append(conn)
+
+    if len(connections) < 2:
+        return {"skipped": True, "reason": "Not enough GitHub connections to revoke"}
+
+    revocations = []
+    errors = []
+    for owner_conn in connections:
+        other_conns = [c for c in connections if c["user_id"] != owner_conn["user_id"]]
+        if not other_conns:
+            continue
+        other_conn = other_conns[0]
+
+        repos = (owner_conn.get("authorized_repos") or [])[:MAX_REPOS_PER_GRANT]
+        for repo in repos:
+            try:
+                result = github_client.remove_collaborator(
+                    owner_conn["installation_id"],
+                    repo,
+                    other_conn["github_username"],
+                )
+                revocations.append({
+                    "repo": repo,
+                    "revoked_from": other_conn["github_username"],
+                    "status": result["status"],
+                })
+            except Exception as e:
+                errors.append({
+                    "repo": repo,
+                    "revoked_from": other_conn["github_username"],
+                    "error": str(e),
+                })
+
+    if revocations:
+        await _write_audit_log(
+            db_or_ds, team_id, triggering_user_id, "repo_access_revoked",
+            details={"revocations": revocations, "errors": errors},
+        )
+
+    return {"revocations": revocations, "errors": errors, "skipped": False}
 
 
 async def _check_resharing_violation(db_or_ds, user_id: str,
@@ -3119,7 +3372,12 @@ async def research_match_my_profile(ctx: Context = None) -> str:
     # Get reputation details
     rep = await reputation_engine.calculate_reputation(user["id"])
 
-    return json.dumps({
+    # Get rating history with comments (only revealed ratings)
+    rating_history = await _get_revealed_ratings_with_pseudonyms(
+        db, datastore, user["id"], limit=10
+    )
+
+    profile = {
         "pseudonym": user["pseudonym"],
         "reputation": {
             "badge": _reputation_badge(rep["reputation_score"], rep["total_ratings"]),
@@ -3148,7 +3406,12 @@ async def research_match_my_profile(ctx: Context = None) -> str:
             "ofc_breakdown": ofc_breakdown,
         },
         "teams": [dict(t) for t in teams],
-    }, indent=2)
+    }
+
+    if rating_history:
+        profile["rating_history"] = rating_history
+
+    return json.dumps(profile, indent=2)
 
 
 @mcp.tool(
@@ -3250,9 +3513,10 @@ async def research_match_find_collaborators(params: FindCollaboratorsInput, ctx:
         db.commit()
         your_profile_str = f"OT: {dict(db.execute('SELECT ot_score, ofc_score FROM research_commits WHERE user_id = ? ORDER BY version DESC LIMIT 1', (user['id'],)).fetchone())}"
 
-    return json.dumps({
-        "your_profile": your_profile_str,
-        "candidates": [{
+    # Build candidates with recent reviews
+    candidates = []
+    for m in matches:
+        candidate = {
             "pseudonym": m["candidate_pseudonym"],
             "user_id": m["candidate_user_id"],
             "semaphore": f"{_semaphore_emoji(m['semaphore'])} {m['semaphore'].upper()}",
@@ -3270,7 +3534,18 @@ async def research_match_find_collaborators(params: FindCollaboratorsInput, ctx:
                 m.get("candidate_total_ratings", 0)
             ),
             "solidity": m.get("candidate_solidity", "unknown"),
-        } for m in matches],
+        }
+        # Add recent reviews (revealed ratings with comments)
+        reviews = await _get_revealed_ratings_with_pseudonyms(
+            db, datastore, m["candidate_user_id"], limit=3
+        )
+        if reviews:
+            candidate["recent_reviews"] = reviews
+        candidates.append(candidate)
+
+    return json.dumps({
+        "your_profile": your_profile_str,
+        "candidates": candidates,
         "total_found": len(matches),
     }, indent=2)
 
@@ -3724,6 +3999,27 @@ async def research_match_rate_user(params: RateUserInput, ctx: Context = None) -
             }
 
         result["message"] = "Both team members have rated. Ratings are now revealed and reputations updated."
+
+        # GitHub App hook: auto-revoke repo access if both ratings average < 2.0
+        if their_rating:
+            avg_your = (params.honesty + params.quality + params.effort) / 3.0
+            avg_theirs = (their_rating["honesty"] + their_rating["quality"] + their_rating["effort"]) / 3.0
+            if avg_your < 2.0 and avg_theirs < 2.0:
+                github_client = _get_github_client(ctx)
+                if github_client:
+                    try:
+                        revoke_result = await _revoke_bilateral_repo_access(
+                            datastore or db, github_client, params.team_id, user["id"])
+                        if not revoke_result.get("skipped"):
+                            result["github_access_revoked"] = True
+                            result["message"] += (
+                                " WARNING: Both ratings averaged below 2.0 — "
+                                "repo access has been automatically revoked for safety."
+                            )
+                            if db:
+                                db.commit()
+                    except Exception as e:
+                        _logger.warning("GitHub auto-revoke failed for team %s: %s", params.team_id, e)
     else:
         result["message"] = f"Rating submitted anonymously. It will be revealed when the other team member also rates.{abuse_warning}"
 
@@ -6237,13 +6533,27 @@ async def research_match_confirm_contract(params: ConfirmContractInput, ctx: Con
             "confirmed_at": updated[f"confirmation_{partner_slot}_at"],
         }
 
+    # GitHub App hook: auto-grant bilateral repo access on contract confirmation
+    github_access = None
+    if new_status == "confirmed":
+        github_client = _get_github_client(ctx)
+        if github_client:
+            try:
+                github_access = await _grant_bilateral_repo_access(
+                    datastore or db, github_client, params.team_id, user_id)
+                if db:
+                    db.commit()
+            except Exception as e:
+                _logger.warning("GitHub auto-grant failed for team %s: %s", params.team_id, e)
+                github_access = {"error": str(e)}
+
     message = (
         "Contract CONFIRMED — both parties have committed the contract to their repos."
         if new_status == "confirmed"
         else "Your confirmation recorded. Waiting for your partner to confirm."
     )
 
-    return json.dumps({
+    result = {
         "status": new_status,
         "contract_id": params.contract_id,
         "contract_version": updated["contract_version"],
@@ -6251,6 +6561,264 @@ async def research_match_confirm_contract(params: ConfirmContractInput, ctx: Con
         "your_confirmation": your_confirmation,
         "partner_confirmation": partner_confirmation,
         "message": message,
+    }
+    if github_access and not github_access.get("skipped"):
+        result["github_access"] = github_access
+
+    return json.dumps(result, indent=2)
+
+
+# =============================================================================
+# GITHUB APP INTEGRATION (tools #25-26)
+# =============================================================================
+
+@mcp.tool(
+    name="research_match_connect_github",
+    description=(
+        "Connect your GitHub account to Research Match via GitHub App. "
+        "FLOW: (1) Call with your github_username. If the App is not installed, "
+        "you'll get an install URL — install it in your browser, then call again. "
+        "(2) On second call, the server verifies your installation and stores your "
+        "connection. Your authorized repos will be used for bilateral read-only "
+        "access when contracts are confirmed. Already connected? Calling again "
+        "refreshes your repo list. Use research_match_disconnect_github to remove."
+    ),
+    annotations={
+        "title": "Connect GitHub Account",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
+@_log_tool_call
+async def research_match_connect_github(params: ConnectGitHubInput, ctx: Context = None) -> str:
+    """Connect a GitHub account via GitHub App installation.
+
+    Args:
+        params (ConnectGitHubInput): Connection data:
+            - github_username (str, required): GitHub username to connect
+
+    Returns:
+        str: JSON with connection status, authorized repos, or install URL
+    """
+    db = _get_db(ctx)
+    datastore = _get_datastore(ctx)
+    github_client = _get_github_client(ctx)
+    user = await _get_current_user(db, datastore=datastore, user_email_hash=_get_user_email_hash(ctx))
+    if not user:
+        return json.dumps({"error": "No registered user found. Use research_match_register first."})
+
+    if not github_client:
+        # Graceful degradation — GitHub App not configured on server
+        from .github_client import GitHubAppClient
+        fallback = GitHubAppClient()
+        return json.dumps({
+            "error": "GitHub App integration is not configured on this server.",
+            "hint": "The server admin needs to set GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY.",
+        })
+
+    # Check if App is installed for this user
+    installation = github_client.find_installation_for_user(params.github_username)
+
+    if not installation:
+        install_url = github_client.get_installation_url()
+        return json.dumps({
+            "status": "install_required",
+            "message": (
+                f"The Research Match GitHub App is not installed for '{params.github_username}'. "
+                f"Please install it at the URL below, select the repos you want to share, "
+                f"then call this tool again with the same username."
+            ),
+            "install_url": install_url,
+            "github_username": params.github_username,
+        }, indent=2)
+
+    # App is installed — get accessible repos
+    installation_id = installation["id"]
+    try:
+        repos = github_client.get_installation_repos(installation_id)
+    except Exception as e:
+        return json.dumps({
+            "error": f"Failed to list repos for installation: {e}",
+            "installation_id": installation_id,
+        })
+
+    repo_names = [r["full_name"] for r in repos]
+
+    # Store/update connection
+    if datastore:
+        await datastore.upsert_github_connection(
+            user["id"], params.github_username, installation_id, repo_names)
+    else:
+        db.execute(
+            """INSERT OR REPLACE INTO github_connections
+               (user_id, github_username, installation_id, authorized_repos, connected_at)
+               VALUES (?, ?, ?, ?, datetime('now'))""",
+            (user["id"], params.github_username, installation_id, json.dumps(repo_names))
+        )
+        db.commit()
+
+    # Check if user has any teams with confirmed contracts — auto-grant if so
+    github_access_results = []
+    if datastore:
+        teams = await datastore.get_teams_by_user(user["id"])
+    else:
+        teams = db.execute(
+            """SELECT t.* FROM teams t JOIN team_members tm ON t.id = tm.team_id
+               WHERE tm.user_id = ?""",
+            (user["id"],)
+        ).fetchall()
+
+    for team in teams:
+        team = dict(team)
+        # Check if there's a confirmed contract
+        if datastore:
+            confirmed_count = await datastore.count_confirmed_contracts_for_team(team["id"])
+        else:
+            confirmed_count = db.execute(
+                "SELECT COUNT(*) as c FROM collaboration_contracts WHERE team_id = ? AND status = 'confirmed'",
+                (team["id"],)
+            ).fetchone()["c"]
+
+        if confirmed_count > 0:
+            result = await _grant_bilateral_repo_access(
+                datastore or db, github_client, team["id"], user["id"])
+            if not result.get("skipped"):
+                github_access_results.append({
+                    "team_id": team["id"],
+                    "grants": result.get("grants", []),
+                })
+
+    # Audit log for all teams
+    if datastore:
+        teams_for_audit = await datastore.get_teams_by_user(user["id"])
+    else:
+        teams_for_audit = teams
+
+    for team in teams_for_audit:
+        team = dict(team)
+        await _write_audit_log(
+            datastore or db, team["id"], user["id"], "github_connected",
+            details={"github_username": params.github_username, "repos_count": len(repo_names)},
+        )
+    if db:
+        db.commit()
+
+    return json.dumps({
+        "status": "connected",
+        "github_username": params.github_username,
+        "installation_id": installation_id,
+        "authorized_repos": repo_names,
+        "repos_count": len(repo_names),
+        "auto_granted_access": github_access_results if github_access_results else None,
+        "message": (
+            f"GitHub account '{params.github_username}' connected with {len(repo_names)} repo(s). "
+            f"When a collaboration contract is confirmed, your partner will get read-only access "
+            f"to these repos (and vice versa)."
+        ),
+    }, indent=2)
+
+
+@mcp.tool(
+    name="research_match_disconnect_github",
+    description=(
+        "Disconnect your GitHub account from Research Match. "
+        "REQUIRES confirm=true. This will: (1) Revoke all repo access granted "
+        "through Research Match in ALL your teams. (2) Remove your GitHub "
+        "connection from the system. This does NOT uninstall the GitHub App — "
+        "you can do that from GitHub Settings if desired."
+    ),
+    annotations={
+        "title": "Disconnect GitHub Account",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+)
+@_log_tool_call
+async def research_match_disconnect_github(params: DisconnectGitHubInput, ctx: Context = None) -> str:
+    """Disconnect GitHub account and revoke all repo access.
+
+    Args:
+        params (DisconnectGitHubInput): Disconnection data:
+            - confirm (bool, required): Must be true to proceed
+
+    Returns:
+        str: JSON with disconnection status and revocation summary
+    """
+    if not params.confirm:
+        return json.dumps({
+            "error": "You must set confirm=true to disconnect your GitHub account. "
+                     "This will revoke all repo access granted through Research Match."
+        })
+
+    db = _get_db(ctx)
+    datastore = _get_datastore(ctx)
+    github_client = _get_github_client(ctx)
+    user = await _get_current_user(db, datastore=datastore, user_email_hash=_get_user_email_hash(ctx))
+    if not user:
+        return json.dumps({"error": "No registered user found."})
+
+    # Check if connected
+    if datastore:
+        connection = await datastore.get_github_connection(user["id"])
+    else:
+        connection = db.execute(
+            "SELECT * FROM github_connections WHERE user_id = ?", (user["id"],)
+        ).fetchone()
+        if connection:
+            connection = dict(connection)
+
+    if not connection:
+        return json.dumps({"error": "No GitHub account connected."})
+
+    github_username = connection.get("github_username", "")
+
+    # Revoke access in all teams
+    revocation_results = []
+    if datastore:
+        teams = await datastore.get_teams_by_user(user["id"])
+    else:
+        teams = db.execute(
+            """SELECT t.* FROM teams t JOIN team_members tm ON t.id = tm.team_id
+               WHERE tm.user_id = ?""",
+            (user["id"],)
+        ).fetchall()
+
+    for team in teams:
+        team = dict(team)
+        if github_client:
+            result = await _revoke_bilateral_repo_access(
+                datastore or db, github_client, team["id"], user["id"])
+            if not result.get("skipped"):
+                revocation_results.append({
+                    "team_id": team["id"],
+                    "revocations": result.get("revocations", []),
+                })
+
+        await _write_audit_log(
+            datastore or db, team["id"], user["id"], "github_disconnected",
+            details={"github_username": github_username},
+        )
+
+    # Delete connection
+    if datastore:
+        await datastore.delete_github_connection(user["id"])
+    else:
+        db.execute("DELETE FROM github_connections WHERE user_id = ?", (user["id"],))
+        db.commit()
+
+    return json.dumps({
+        "status": "disconnected",
+        "github_username": github_username,
+        "revocations": revocation_results,
+        "message": (
+            f"GitHub account '{github_username}' disconnected. "
+            f"All repo access granted through Research Match has been revoked. "
+            f"To uninstall the GitHub App entirely, visit GitHub Settings > Applications."
+        ),
     }, indent=2)
 
 

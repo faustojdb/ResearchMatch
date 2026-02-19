@@ -731,6 +731,48 @@ class DataStore(abc.ABC):
         ...
 
     # =================================================================
+    # GITHUB CONNECTIONS (5 methods)
+    # =================================================================
+
+    @abc.abstractmethod
+    async def get_github_connection(self, user_id: str) -> Optional[Record]:
+        """Get GitHub connection info for a user.
+        Returns dict with github_username, installation_id, authorized_repos, connected_at
+        or None if not connected."""
+        ...
+
+    @abc.abstractmethod
+    async def upsert_github_connection(
+        self, user_id: str, github_username: str,
+        installation_id: int, authorized_repos: list[str]
+    ) -> None:
+        """Create or update a user's GitHub connection.
+        In Firestore: embedded in users/{user_id}.github_connection
+        In SQLite: INSERT OR REPLACE into github_connections table."""
+        ...
+
+    @abc.abstractmethod
+    async def delete_github_connection(self, user_id: str) -> None:
+        """Remove a user's GitHub connection.
+        In Firestore: set github_connection field to None.
+        In SQLite: DELETE from github_connections."""
+        ...
+
+    @abc.abstractmethod
+    async def get_github_connections_for_team(self, team_id: str) -> list[Record]:
+        """Get GitHub connections for all members of a team.
+        Returns list of dicts with user_id, github_username, installation_id, authorized_repos.
+        Only includes members who have a GitHub connection."""
+        ...
+
+    @abc.abstractmethod
+    async def update_github_authorized_repos(
+        self, user_id: str, authorized_repos: list[str]
+    ) -> None:
+        """Update only the authorized_repos list for a user's GitHub connection."""
+        ...
+
+    # =================================================================
     # UTILITY (1 method)
     # =================================================================
 

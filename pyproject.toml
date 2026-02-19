@@ -20,6 +20,8 @@ dependencies = [
     "firebase-admin>=6.0.0",
     "google-cloud-firestore>=2.16.0",
     "algoliasearch>=4.0.0",
+    "PyJWT>=2.0.0",
+    "cryptography>=3.4",
 ]
 
 [project.scripts]
