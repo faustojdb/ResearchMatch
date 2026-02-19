@@ -2843,6 +2843,9 @@ async def _compute_license(db: Optional[sqlite3.Connection], team_id: str,
         "REQUIRED FIELDS: email (str, user's email — will be SHA-256 hashed, NEVER stored in plain text). "
         "OPTIONAL FIELDS: pseudonym (str, display name — auto-generated if omitted). "
         "WARNING: Do NOT send 'name' — the field is called 'pseudonym'. Do NOT send 'domain' or any other extra field. "
+        "IMPORTANT: You MUST explicitly ask the user for their email before calling this tool. "
+        "Do NOT use emails from session context, account info, or any other source without the user typing it. "
+        "Ask: 'What email would you like to register with? It will be SHA-256 hashed and never stored in plain text.' "
         "If the user is already registered (same email), returns existing profile (idempotent). "
         "NEXT: guide user to research_match_analyze_work or research_match_submit_commit."
     ),
