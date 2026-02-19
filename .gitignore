@@ -44,4 +44,5 @@ test_deep_search_real.py
 
 # Production credentials (NEVER commit)
 firebase-credentials.json
+*.pem
 .env
