@@ -2817,10 +2817,12 @@ async def _compute_license(db: Optional[sqlite3.Connection], team_id: str,
     name="research_match_register",
     description=(
         "STEP 1 OF THE RESEARCH MATCH FLOW — Call this tool FIRST before any other research_match tool. "
-        "Registers the user with a pseudonymous identity. The email is hashed with SHA-256 and NEVER stored in plain text. "
-        "If the user is already registered (same email), returns existing profile. "
-        "After registration, guide the user to submit a Research Commit using research_match_analyze_work or research_match_submit_commit. "
-        "Example flow: register → analyze_work → submit_commit → find_collaborators → send_request."
+        "Registers the user with a pseudonymous identity. "
+        "REQUIRED FIELDS: email (str, user's email — will be SHA-256 hashed, NEVER stored in plain text). "
+        "OPTIONAL FIELDS: pseudonym (str, display name — auto-generated if omitted). "
+        "WARNING: Do NOT send 'name' — the field is called 'pseudonym'. Do NOT send 'domain' or any other extra field. "
+        "If the user is already registered (same email), returns existing profile (idempotent). "
+        "NEXT: guide user to research_match_analyze_work or research_match_submit_commit."
     ),
     annotations={
         "title": "Register on Research Match",
