@@ -6249,9 +6249,15 @@ def main():
         _logger.info("Starting streamable-http on port %d", port)
         mcp.run(transport="streamable-http")
     elif port_env:
-        # Cloud Run: PORT env var set automatically
+        # Cloud Run: PORT env var set automatically, bind to 0.0.0.0
+        from mcp.server.transport_security import TransportSecuritySettings
+
+        mcp.settings.host = "0.0.0.0"
         mcp.settings.port = int(port_env)
-        _logger.info("Starting streamable-http on port %s (Cloud Run)", port_env)
+        mcp.settings.transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=False,
+        )
+        _logger.info("Starting streamable-http on 0.0.0.0:%s (Cloud Run)", port_env)
         mcp.run(transport="streamable-http")
     else:
         mcp.run()
