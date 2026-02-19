@@ -1,0 +1,59 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+
+# Secrets
+*.pem
+firebase-credentials.json
+.env
+
+# Project-specific (not needed in bundle)
+research_refs/
+sessions/
+tests/
+PLAN_*.md
+Dockerfile
+docker-compose.yml
+firebase.json
+firestore.indexes.json
+firestore.rules
+.firebaserc
+.github/
+
+# Old releases and artifacts
+*.dxt
+*.zip
+*.mcpb
+
+# Test files
+test_*.py
+analyze_repo.py
+build_alpha.sh
+
+# Lock files
+uv.lock
+
+# Config files not needed in bundle
+.claude/
+.claude-plugin/
+.mcp.json
+.dockerignore
+commands/
+skills/
+requirements.txt
+
+# IDE
+.vscode/
+.idea/
