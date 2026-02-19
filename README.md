@@ -36,30 +36,43 @@ Research Match helps researchers, scientists, developers, and independent theori
 
 Research Match runs as a remote MCP server on Google Cloud Run. No local installation required.
 
-**Step 1:** Locate your Claude Desktop configuration file:
+#### Option A: Settings > Connectors (Recommended)
 
-| OS | Path |
-|----|------|
+1. Open Claude Desktop
+2. Go to **Settings > Connectors**
+3. Add the server URL: `https://research-match-77626397872.us-central1.run.app/mcp/`
+4. Restart Claude Desktop — you should see 24 Research Match tools available
+
+#### Option B: npx mcp-remote (Alternative)
+
+If the Connectors option is not available in your version, you can use `mcp-remote` as a bridge. This requires [Node.js](https://nodejs.org/) installed.
+
+Add this to your `claude_desktop_config.json`:
+
+| OS | Config file path |
+|----|------------------|
 | macOS | `~/Library/Application Support/Claude/claude_desktop_config.json` |
 | Windows | `%APPDATA%\Claude\claude_desktop_config.json` |
-
-**Step 2:** Add the Research Match server to the `mcpServers` section:
 
 ```json
 {
   "mcpServers": {
     "research-match": {
-      "url": "https://research-match-77626397872.us-central1.run.app/mcp/"
+      "command": "npx",
+      "args": [
+        "mcp-remote",
+        "https://research-match-77626397872.us-central1.run.app/mcp/"
+      ]
     }
   }
 }
 ```
 
-If you already have other MCP servers configured, just add the `"research-match"` entry inside the existing `mcpServers` object.
+Restart Claude Desktop after saving.
 
-**Step 3:** Restart Claude Desktop. You should see 24 Research Match tools available.
+#### Getting Started
 
-**Step 4:** Start by saying: *"Register me on Research Match"* — Claude will call the register tool and guide you through the flow.
+Once connected, start by saying: *"Register me on Research Match"* — Claude will call the register tool and guide you through the flow.
 
 ### For Claude Code (CLI)
 
