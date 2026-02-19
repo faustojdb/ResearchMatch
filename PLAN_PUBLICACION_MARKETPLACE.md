@@ -2,9 +2,11 @@
 
 ## Estado actual
 - **Research Match v3.1.0** desplegado en Cloud Run (26 tools, GitHub App)
-- DXT v3.1.0 generado (`research-match-3.1.0.dxt`)
+- **MCPB v3.1.0 generado** (`research-match-3.1.0.mcpb` — 96KB, 13 archivos)
+- DXT v3.1.0 generado (`research-match-3.1.0.dxt` — legacy)
 - Release publicada en GitHub: https://github.com/faustojdb/ResearchMatch/releases/tag/v3.1.0
 - GitHub App registrada: https://github.com/apps/research-match-collaborator
+- `.mcpbignore` configurado para excluir archivos innecesarios del bundle
 
 ---
 
@@ -136,8 +138,10 @@ Si el marketplace tarda o rechaza, hay canales alternativos:
 - [x] Cloud Run desplegado y verificado
 - [x] Health endpoint funcional
 - [x] GitHub App registrada y testeada
-- [ ] Generar .mcpb con `mcpb pack` (reemplaza .dxt manual)
-- [ ] Test en Windows con Claude Desktop
+- [x] Generar .mcpb con `mcpb pack` (96KB, 13 archivos, validado)
+- [x] `.mcpbignore` configurado y commiteado
+- [x] `.mcpb` subido a release v3.1.0 en GitHub
+- [x] Test en Windows con Claude Desktop (instalado via doble-click)
 - [ ] Test en macOS con Claude Desktop
 - [ ] Enviar formulario de submission
 - [ ] PR a awesome-claude-dxt y MCPStar/awesome-dxt-mcp
