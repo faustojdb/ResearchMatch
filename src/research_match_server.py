@@ -1874,7 +1874,29 @@ def _get_matcher(ctx) -> MatchingEngine:
 def _get_reputation(ctx) -> ReputationEngine:
     return ctx.request_context.lifespan_context["reputation"]
 
+# Per-session user identity map (session_id → email_hash)
+# Used by Cloud Run multi-user mode where env var is not per-user
+_session_user_map: Dict[str, str] = {}
+
+def _get_session_id(ctx) -> str:
+    """Extract MCP session ID from context."""
+    try:
+        return ctx.request_context.session.id
+    except Exception:
+        return ""
+
+def _set_session_user(ctx, email_hash: str):
+    """Store user identity for this MCP session."""
+    session_id = _get_session_id(ctx)
+    if session_id and email_hash:
+        _session_user_map[session_id] = email_hash
+
 def _get_user_email_hash(ctx) -> str:
+    # 1. Try per-session lookup (Cloud Run multi-user)
+    session_id = _get_session_id(ctx)
+    if session_id and session_id in _session_user_map:
+        return _session_user_map[session_id]
+    # 2. Fall back to env var (local/DXT single-user)
     return ctx.request_context.lifespan_context.get("user_email_hash", "")
 
 async def _get_or_create_user(db: Optional[sqlite3.Connection], email: str,
@@ -2848,6 +2870,10 @@ async def research_match_register(params: RegisterInput, ctx: Context = None) ->
     db = _get_db(ctx)
     datastore = _get_datastore(ctx)
     user_id = await _get_or_create_user(db, params.email, params.pseudonym, datastore=datastore)
+
+    # Store user identity in session for multi-user mode (Cloud Run)
+    email_hash = hashlib.sha256(params.email.lower().strip().encode()).hexdigest()
+    _set_session_user(ctx, email_hash)
 
     if datastore:
         user = await datastore.get_user_by_id(user_id)
