@@ -15,7 +15,7 @@ Research Match helps researchers, scientists, developers, and independent theori
 
 ## Features
 
-- **24 MCP Tools** covering the full research collaboration lifecycle
+- **26 MCP Tools** covering the full research collaboration lifecycle
 - **Dual-Axis Originality Scoring** with solidity multipliers (proven, functional, speculative, adhoc)
 - **Bilateral Matching** with perspective-aware reasoning — each side sees gains from their viewpoint
 - **Privacy by Design** — pseudonymous identities, SHA-256 hashed emails, progressive disclosure
@@ -25,6 +25,7 @@ Research Match helps researchers, scientists, developers, and independent theori
 - **Automatic Licensing** — 5-rule system (joint-equal, advisory-only, joint-weighted, time-limited)
 - **File Sharing Registry** — metadata-only sharing with MAD re-sharing detection
 - **Git-Verifiable Contracts** — bilateral confirmation with git commit hash verification
+- **GitHub App Integration** — automatic bilateral read-only repo access on contract confirmation
 - **Immutable Audit Log** — full audit trail viewer
 - **Cold Search** — free search across internal DB and GitHub, no registration required
 - **Deep Repository Analysis** — analyze any public GitHub repo for originality scoring
@@ -41,7 +42,7 @@ Research Match runs as a remote MCP server on Google Cloud Run. No local install
 1. Open Claude Desktop
 2. Go to **Settings > Connectors**
 3. Add the server URL: `https://research-match-77626397872.us-central1.run.app/mcp/`
-4. Restart Claude Desktop — you should see 24 Research Match tools available
+4. Restart Claude Desktop — you should see 26 Research Match tools available
 
 #### Option B: npx mcp-remote (Alternative)
 
@@ -122,13 +123,15 @@ This starts the server in stdio mode. Set `RESEARCH_MATCH_DB` to customize the d
 | 22 | `audit_log` | View the immutable audit trail |
 | 23 | `export_contract` | Export a git-verifiable contract |
 | 24 | `confirm_contract` | Confirm a contract with a git hash |
+| 25 | `connect_github` | Connect GitHub account via GitHub App |
+| 26 | `disconnect_github` | Disconnect GitHub and revoke repo access |
 
 ## Typical Flow
 
 ```
 register → submit_commit → find_collaborators → send_request → inbox
     → respond_request → reveal_request → reveal_respond → team_license
-    → share_file → export_contract → confirm_contract
+    → share_file → export_contract → confirm_contract → connect_github
 ```
 
 ## Requirements
@@ -143,6 +146,7 @@ register → submit_commit → find_collaborators → send_request → inbox
 - **Database**: Firebase Firestore (production) / SQLite (local development)
 - **Search**: Algolia for cold search indexing
 - **Embeddings**: sentence-transformers (all-MiniLM-L6-v2) with Jaccard fallback
+- **GitHub Integration**: GitHub App for bilateral repo access (PyJWT + httpx)
 - **Hosting**: Google Cloud Run (streamable-http transport)
 
 ## License
