@@ -1352,6 +1352,29 @@ class FirestoreDataStore(DataStore):
             return 0.0
 
     # =================================================================
+    # BUG REPORTS (top-level collection: bug_reports)
+    # =================================================================
+
+    def _bug_reports_ref(self):
+        return self.db.collection("bug_reports")
+
+    async def insert_bug_report(self, report: Record) -> None:
+        report_id = report.get("id", "")
+        data = {k: v for k, v in report.items() if k != "id"}
+        if "created_at" not in data:
+            data["created_at"] = _now_iso()
+        self._bug_reports_ref().document(report_id).set(data)
+
+    async def list_bug_reports(self, limit: int = 50) -> list[Record]:
+        docs = list(
+            self._bug_reports_ref()
+            .order_by("created_at", direction=firestore.Query.DESCENDING)
+            .limit(limit)
+            .stream()
+        )
+        return [_doc_to_record(d) for d in docs]
+
+    # =================================================================
     # HEALTH / STATS
     # =================================================================
 

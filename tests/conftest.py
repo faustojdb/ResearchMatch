@@ -52,6 +52,7 @@ async def _clear_emulator(store: FirestoreDataStore) -> None:
         "collaboration_requests",
         "teams",
         "collaboration_contracts",
+        "bug_reports",
     ]
     for coll_name in top_level_collections:
         coll_ref = store.db.collection(coll_name)

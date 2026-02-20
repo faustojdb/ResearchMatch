@@ -974,3 +974,75 @@ class TestUtility:
         stats = await ds.health_stats()
         assert stats["users"] == 1
         assert stats["teams"] == 1
+
+
+# =====================================================================
+# BUG REPORTS (3 tests)
+# =====================================================================
+
+
+class TestBugReports:
+    async def test_insert_and_list_bug_report(self, ds: FirestoreDataStore):
+        report_id = _uid()
+        await ds.insert_bug_report({
+            "id": report_id,
+            "reporter_id": "anonymous",
+            "tool_name": "research_match_register",
+            "error_message": "Registration fails with empty email",
+            "severity": "high",
+            "steps_to_reproduce": "Call register with email=''",
+            "server_version": "3.2.0",
+        })
+        reports = await ds.list_bug_reports()
+        assert len(reports) == 1
+        assert reports[0]["id"] == report_id
+        assert reports[0]["severity"] == "high"
+        assert reports[0]["reporter_id"] == "anonymous"
+        assert reports[0]["server_version"] == "3.2.0"
+
+    async def test_list_bug_reports_ordered(self, ds: FirestoreDataStore):
+        """Reports should be returned newest-first (created_at DESC)."""
+        rid1 = _uid()
+        rid2 = _uid()
+        # Insert with explicit timestamps to guarantee order
+        ts_old = "2025-01-01T00:00:00+00:00"
+        ts_new = "2026-01-01T00:00:00+00:00"
+        await ds.insert_bug_report({
+            "id": rid1,
+            "reporter_id": "anonymous",
+            "tool_name": None,
+            "error_message": "Old bug report for ordering test",
+            "severity": "low",
+            "steps_to_reproduce": None,
+            "server_version": "3.2.0",
+            "created_at": ts_old,
+        })
+        await ds.insert_bug_report({
+            "id": rid2,
+            "reporter_id": "anonymous",
+            "tool_name": None,
+            "error_message": "New bug report for ordering test",
+            "severity": "medium",
+            "steps_to_reproduce": None,
+            "server_version": "3.2.0",
+            "created_at": ts_new,
+        })
+        reports = await ds.list_bug_reports()
+        assert len(reports) == 2
+        assert reports[0]["id"] == rid2  # newer first
+        assert reports[1]["id"] == rid1
+
+    async def test_list_bug_reports_limit(self, ds: FirestoreDataStore):
+        """Limit parameter should cap the number of returned reports."""
+        for _ in range(5):
+            await ds.insert_bug_report({
+                "id": _uid(),
+                "reporter_id": "anonymous",
+                "tool_name": None,
+                "error_message": "Bulk bug report for limit test",
+                "severity": "low",
+                "steps_to_reproduce": None,
+                "server_version": "3.2.0",
+            })
+        reports = await ds.list_bug_reports(limit=3)
+        assert len(reports) == 3

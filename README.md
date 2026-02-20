@@ -15,7 +15,7 @@ Research Match helps researchers, scientists, developers, and independent theori
 
 ## Features
 
-- **26 MCP Tools** covering the full research collaboration lifecycle
+- **27 MCP Tools** covering the full research collaboration lifecycle
 - **Dual-Axis Originality Scoring** with solidity multipliers (proven, functional, speculative, adhoc)
 - **Bilateral Matching** with perspective-aware reasoning — each side sees gains from their viewpoint
 - **Privacy by Design** — pseudonymous identities, SHA-256 hashed emails, progressive disclosure
@@ -30,6 +30,7 @@ Research Match helps researchers, scientists, developers, and independent theori
 - **Cold Search** — free search across internal DB and GitHub, no registration required
 - **Deep Repository Analysis** — analyze any public GitHub repo for originality scoring
 - **Universal Proforma** — 3-mode workflow (extract/validate/submit) for structured commits
+- **Beta Bug Reporting** — built-in bug reporting tool, works without registration
 
 ## Installation
 
@@ -42,7 +43,7 @@ Research Match runs as a remote MCP server on Google Cloud Run. No local install
 1. Open Claude Desktop
 2. Go to **Settings > Connectors**
 3. Add the server URL: `https://research-match-77626397872.us-central1.run.app/mcp/`
-4. Restart Claude Desktop — you should see 26 Research Match tools available
+4. Restart Claude Desktop — you should see 27 Research Match tools available
 
 #### Option B: npx mcp-remote (Alternative)
 
@@ -125,13 +126,85 @@ This starts the server in stdio mode. Set `RESEARCH_MATCH_DB` to customize the d
 | 24 | `confirm_contract` | Confirm a contract with a git hash |
 | 25 | `connect_github` | Connect GitHub account via GitHub App |
 | 26 | `disconnect_github` | Disconnect GitHub and revoke repo access |
+| 27 | `report_bug` | Report a bug — works without registration |
+
+## Examples
+
+### Example 1: Register and Submit Research
+
+**User prompt**: *"Register me on Research Match with my email researcher@university.edu, then help me submit my work on federated learning for healthcare."*
+
+**What happens**:
+1. Claude calls `register` with the email (SHA-256 hashed, never stored in plain text)
+2. Claude calls `analyze_work` to get the Research Commit template
+3. Claude helps the user fill in the structured fields (domain, hypothesis, methodology, solidity level)
+4. Claude calls `submit_commit` — the AI evaluates originality and returns scores like:
+   - Theoretical Originality: 72.5% (functional solidity)
+   - Formal-Computational Originality: 65.8% (functional solidity)
+
+**Expected output** (from `submit_commit`):
+```json
+{
+  "status": "submitted",
+  "version": 1,
+  "scores": {
+    "ot_score": 72.5,
+    "ofc_score": 65.8,
+    "overall_solidity": "functional"
+  },
+  "next_step": "Use find_collaborators to discover complementary researchers"
+}
+```
+
+### Example 2: Free Cold Search (No Registration)
+
+**User prompt**: *"Search Research Match for anyone working on quantum error correction."*
+
+**What happens**: Claude calls `cold_search` with keywords `["quantum", "error", "correction"]`. This tool requires no registration — anyone can search.
+
+**Expected output** (from `cold_search`):
+```json
+{
+  "query": "quantum error correction",
+  "results": [
+    {
+      "pseudonym": "QuantumCat-7x",
+      "domain": "quantum computing",
+      "subdomain": "error correction",
+      "hypothesis": "Surface codes with adaptive decoders reduce logical error rates by 40%",
+      "ot_score": 78.2,
+      "ofc_score": 81.5
+    }
+  ],
+  "total_results": 1,
+  "source": "algolia"
+}
+```
+
+### Example 3: Report a Bug (No Registration Required)
+
+**User prompt**: *"The cold_search tool returned an empty result when I searched for 'machine learning'. Can you report this bug?"*
+
+**What happens**: Claude calls `report_bug` with the error details. This works even if the user is not registered.
+
+**Expected output** (from `report_bug`):
+```json
+{
+  "status": "reported",
+  "report_id": "a1b2c3d4-...",
+  "severity": "medium",
+  "server_version": "3.2.0",
+  "reporter": "anonymous",
+  "message": "Bug report received (severity: medium). Report ID: a1b2c3d4-.... Thank you for helping improve Research Match!"
+}
+```
 
 ## Typical Flow
 
 ```
-register → submit_commit → find_collaborators → send_request → inbox
-    → respond_request → reveal_request → reveal_respond → team_license
-    → share_file → export_contract → confirm_contract → connect_github
+register -> submit_commit -> find_collaborators -> send_request -> inbox
+    -> respond_request -> reveal_request -> reveal_respond -> team_license
+    -> share_file -> export_contract -> confirm_contract -> connect_github
 ```
 
 ## Requirements
@@ -148,6 +221,18 @@ register → submit_commit → find_collaborators → send_request → inbox
 - **Embeddings**: sentence-transformers (all-MiniLM-L6-v2) with Jaccard fallback
 - **GitHub Integration**: GitHub App for bilateral repo access (PyJWT + httpx)
 - **Hosting**: Google Cloud Run (streamable-http transport)
+
+## Privacy Policy
+
+See [PRIVACY_POLICY.md](PRIVACY_POLICY.md) for the full privacy policy.
+
+**Summary**: Research Match hashes your email with SHA-256 (never stores plain text), uses pseudonymous identities, and shares research data only through bilateral consent. No advertising, no data sales, no tracking. Data is stored in Google Cloud Firestore (encrypted at rest and in transit). See the full policy for details on data collection, usage, retention, and your rights.
+
+## Support
+
+- **Issues**: [github.com/faustojdb/ResearchMatch/issues](https://github.com/faustojdb/ResearchMatch/issues)
+- **Bug reports**: Use the built-in `report_bug` tool directly from Claude Desktop or Claude Code
+- **Developer**: [github.com/faustojdb](https://github.com/faustojdb)
 
 ## License
 

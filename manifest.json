@@ -1,8 +1,8 @@
 {
   "manifest_version": "0.4",
   "name": "research-match",
-  "version": "3.1.0",
-  "description": "MCP server with 26 tools that connects isolated researchers via AI originality scoring, bilateral matching, collaboration contracts, GitHub App integration, and privacy-first knowledge sharing.",
+  "version": "3.2.0",
+  "description": "MCP server with 27 tools that connects isolated researchers via AI originality scoring, bilateral matching, collaboration contracts, GitHub App integration, and privacy-first knowledge sharing.",
   "long_description": "Research Match is an MCP server that helps researchers find complementary collaborators while protecting intellectual property. It uses AI-powered originality scoring on two independent axes (Theoretical Originality and Formal-Computational Originality) and bilateral matching with a semaphore system (GREEN/YELLOW/RED) that shows each researcher what they gain from a potential collaboration.\n\n**KEY FEATURES (v3.0.0)**\n- **AI Originality Scoring**: Dual-axis evaluation (OT/OFC) with solidity multipliers (proven, functional, speculative, adhoc, cherry_picked)\n- **Bilateral Matching**: Complementarity-based matching with perspective-aware reasoning — each side sees gains from their own viewpoint\n- **Privacy by Design**: Emails are SHA-256 hashed, pseudonymous identities, no raw content shared until collaboration is accepted\n- **Reputation System**: Anti-retaliation ratings (anonymous until both rate), exponential smoothing, honesty-weighted\n- **Cold Search**: Free search across internal DB and GitHub — no registration required\n- **Deep Repository Analysis**: Clone and analyze any GitHub repo for originality scoring (stateless)\n- **Universal Project Proforma**: 3-mode workflow (extract/validate/submit) for structured research commits\n- **Collaboration Tickets**: Structured need_help/question/bug/suggestion tickets replacing free chat\n- **Bilateral Reveal System**: Consent-based progressive disclosure of research commit content\n- **Automatic Licensing**: 5-rule system (joint-equal, advisory-only, joint-weighted, time-limited)\n- **File Sharing Registry**: Metadata-only file sharing with MAD re-sharing detection\n- **Immutable Audit Log**: Full audit trail with viewer tool\n- **Git-Verifiable Contracts**: Bilateral confirmation with git commit hash verification\n- **GitHub App Integration**: Automatic bilateral read-only repo access on contract confirmation\n- **Semantic Similarity**: sentence-transformers embeddings with Jaccard fallback\n\n**MINIMUM REQUIREMENTS**\n- Python 3.12 or higher\n- UV Package Manager\nThis MCP server requires UV, a fast Python package manager.\nInstallation:\n`curl -LsSf https://astral.sh/uv/install.sh | sh`\nFor detailed installation instructions, [see the UV documentation](https://github.com/astral-sh/uv)",
   "author": {
     "name": "faustojdb",
@@ -14,6 +14,9 @@
   },
   "homepage": "https://github.com/faustojdb/ResearchMatch",
   "documentation": "https://github.com/faustojdb/ResearchMatch",
+  "privacy_policies": [
+    "https://github.com/faustojdb/ResearchMatch/blob/main/PRIVACY_POLICY.md"
+  ],
   "icon": "assets/icon.png",
   "server": {
     "type": "uv",
@@ -147,6 +150,10 @@
     {
       "name": "research_match_disconnect_github",
       "description": "Disconnect your GitHub account and revoke all repo access granted through Research Match. Requires confirm=true."
+    },
+    {
+      "name": "research_match_report_bug",
+      "description": "Report a bug or issue with Research Match. No registration required — works for any user, even anonymous. Captures tool name, error message, severity, and reproduction steps."
     }
   ],
   "tools_generated": true,

@@ -795,6 +795,21 @@ class DataStore(abc.ABC):
         ...
 
     # =================================================================
+    # BUG REPORTS (2 methods)
+    # =================================================================
+
+    @abc.abstractmethod
+    async def insert_bug_report(self, report: Record) -> None:
+        """INSERT INTO bug_reports (id, reporter_id, tool_name, error_message,
+                  severity, steps_to_reproduce, server_version) VALUES (...)"""
+        ...
+
+    @abc.abstractmethod
+    async def list_bug_reports(self, limit: int = 50) -> list[Record]:
+        """SELECT * FROM bug_reports ORDER BY created_at DESC LIMIT ?"""
+        ...
+
+    # =================================================================
     # BATCH OPERATIONS (for Firestore atomicity)
     # =================================================================
 

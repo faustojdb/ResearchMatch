@@ -124,7 +124,7 @@ def _log_tool_call(func):
 # =============================================================================
 
 DB_PATH = os.environ.get("RESEARCH_MATCH_DB") or "research_match.db"
-SERVER_VERSION = "3.1.0"
+SERVER_VERSION = "3.2.0"
 
 # Scoring weights for Theoretical Originality (OT)
 OT_WEIGHTS = {
@@ -541,6 +541,18 @@ def init_database(db_path: str) -> sqlite3.Connection:
             installation_id INTEGER NOT NULL,
             authorized_repos TEXT,
             connected_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        -- Bug reports (beta feedback — no user FK, anonymous allowed)
+        CREATE TABLE IF NOT EXISTS bug_reports (
+            id TEXT PRIMARY KEY,
+            reporter_id TEXT,
+            tool_name TEXT,
+            error_message TEXT NOT NULL,
+            severity TEXT NOT NULL DEFAULT 'medium',
+            steps_to_reproduce TEXT,
+            server_version TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
         -- Original indexes
@@ -1765,6 +1777,32 @@ class DisconnectGitHubInput(BaseModel):
     confirm: bool = Field(
         ..., description="Must be true to confirm disconnection. "
         "This will revoke all repo access granted through Research Match.")
+
+
+class ReportBugInput(BaseModel):
+    """Input for reporting a bug in Research Match."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    tool_name: Optional[str] = Field(
+        None, description="Which tool failed (e.g. 'research_match_register'). "
+        "Leave empty if the bug is not tool-specific.")
+    error_message: str = Field(
+        ..., min_length=10, max_length=2000,
+        description="What happened — describe the error or unexpected behavior.")
+    severity: str = Field(
+        "medium", description="Bug severity: low, medium, high, or critical.")
+    steps_to_reproduce: Optional[str] = Field(
+        None, max_length=2000,
+        description="Steps to reproduce the bug. Optional but very helpful.")
+
+    @field_validator("severity")
+    @classmethod
+    def validate_severity(cls, v: str) -> str:
+        allowed = ("low", "medium", "high", "critical")
+        v_lower = v.lower()
+        if v_lower not in allowed:
+            raise ValueError(f"severity must be one of {allowed}, got '{v}'")
+        return v_lower
 
 
 # =============================================================================
@@ -6818,6 +6856,100 @@ async def research_match_disconnect_github(params: DisconnectGitHubInput, ctx: C
             f"GitHub account '{github_username}' disconnected. "
             f"All repo access granted through Research Match has been revoked. "
             f"To uninstall the GitHub App entirely, visit GitHub Settings > Applications."
+        ),
+    }, indent=2)
+
+
+# =============================================================================
+# TOOL 27: report_bug — Beta feedback (no registration required)
+# =============================================================================
+
+@mcp.tool(
+    name="research_match_report_bug",
+    description=(
+        "BETA FEEDBACK — Report a bug or issue with Research Match. "
+        "NO REGISTRATION REQUIRED — works for any user, even if register is broken. "
+        "REQUIRED FIELDS: error_message (str, 10-2000 chars — describe what happened). "
+        "OPTIONAL FIELDS: tool_name (str — which tool failed), "
+        "severity (str — low/medium/high/critical, default medium), "
+        "steps_to_reproduce (str — how to trigger the bug, max 2000 chars). "
+        "The server version is captured automatically in every report. "
+        "EXAMPLE: report_bug(error_message='cold_search returns empty results for valid queries', "
+        "tool_name='research_match_cold_search', severity='high'). "
+        "Use this tool whenever you encounter unexpected errors or behavior."
+    ),
+    annotations={
+        "title": "Report a Bug",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    }
+)
+@_log_tool_call
+async def research_match_report_bug(params: ReportBugInput, ctx: Context = None) -> str:
+    """Report a bug in Research Match. Works without registration.
+
+    Args:
+        params (ReportBugInput): Bug report data:
+            - error_message (str, required): What happened (10-2000 chars)
+            - tool_name (str, optional): Which tool failed
+            - severity (str, optional): low/medium/high/critical (default: medium)
+            - steps_to_reproduce (str, optional): How to reproduce
+
+    Returns:
+        str: JSON with report confirmation and report_id
+    """
+    db = _get_db(ctx)
+    datastore = _get_datastore(ctx)
+
+    # Try to identify the reporter (best-effort, no failure if unregistered)
+    reporter_id = "anonymous"
+    try:
+        user = await _get_current_user(
+            db, datastore=datastore,
+            user_email_hash=_get_user_email_hash(ctx))
+        if user:
+            reporter_id = user["id"]
+    except Exception:
+        pass  # Anonymous is fine
+
+    report_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+
+    report = {
+        "id": report_id,
+        "reporter_id": reporter_id,
+        "tool_name": params.tool_name or None,
+        "error_message": params.error_message,
+        "severity": params.severity,
+        "steps_to_reproduce": params.steps_to_reproduce or None,
+        "server_version": SERVER_VERSION,
+        "created_at": now,
+    }
+
+    if datastore:
+        await datastore.insert_bug_report(report)
+    else:
+        db.execute(
+            """INSERT INTO bug_reports
+               (id, reporter_id, tool_name, error_message, severity,
+                steps_to_reproduce, server_version, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (report_id, reporter_id, params.tool_name, params.error_message,
+             params.severity, params.steps_to_reproduce, SERVER_VERSION, now)
+        )
+        db.commit()
+
+    return json.dumps({
+        "status": "reported",
+        "report_id": report_id,
+        "severity": params.severity,
+        "server_version": SERVER_VERSION,
+        "reporter": "registered" if reporter_id != "anonymous" else "anonymous",
+        "message": (
+            f"Bug report received (severity: {params.severity}). "
+            f"Report ID: {report_id}. Thank you for helping improve Research Match!"
         ),
     }, indent=2)
 
