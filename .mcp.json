@@ -2,7 +2,7 @@
   "mcpServers": {
     "research-match": {
       "command": "uv",
-      "args": ["--directory", ".", "run", "research-match"],
+      "args": ["--directory", "${CLAUDE_PLUGIN_ROOT}", "run", "research-match"],
       "env": {
         "RESEARCH_MATCH_DB": "research_match.db"
       }
