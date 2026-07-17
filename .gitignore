@@ -23,17 +23,16 @@ Thumbs.db
 
 # Claude local config
 .claude/
-.mcp.json
 
 # Firebase emulator logs
 firestore-debug.log
 ui-debug.log
 *-debug.log
 
-# Build artifacts
+# Build artifacts (build_alpha.sh itself is tracked — it produces these, not one of them)
 *.dxt
+*.mcpb
 *.zip
-build_alpha.sh
 
 # Reference repos (large, not committed)
 research_refs/
