@@ -38,12 +38,15 @@ the **manual steps only you can do**, and copy-paste-ready form answers.
 
 ## MANUAL STEPS — only you can do these
 
-### 1. Rotate the three credentials (defense-in-depth before going public)
+### 1. Rotate the two live credentials (defense-in-depth before going public)
 They were never committed (verified), but rotate them anyway since the repo is about to
 become public and the keys sat in the working tree. See `SECURITY.md` for the checklist:
 - [ ] Firebase service-account key (Google Cloud IAM → Service Accounts → Keys)
 - [ ] GitHub App private key (GitHub App settings → regenerate)
-- [ ] Algolia admin key (Algolia dashboard) — and issue a search-only key for read paths
+- [x] ~~Algolia admin key~~ — confirmed deleted by Algolia for inactivity (dashboard
+      shows only the default "My First Application", app `1TAPVC99Z1` no longer
+      resolves). Nothing to rotate; `cold_search` already falls back to keyword
+      matching without it. `.env` updated to comment out the dead references.
 
 ### 2. Make the GitHub repo public
 This is the single most likely original blocker — the reviewer got 404 on every URL.

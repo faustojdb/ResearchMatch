@@ -33,8 +33,12 @@ shared or the repo is ever made public, rotate all of them:
       in Google Cloud IAM → Service Accounts → Keys, generate a new one.
 - [ ] **GitHub App private key** (`*.private-key.pem`) — regenerate in the GitHub App
       settings; the old key stops minting installation tokens.
-- [ ] **Algolia admin API key** — rotate in the Algolia dashboard; issue a
-      **search-only** key for read paths.
+- [x] ~~Algolia admin API key~~ — the Algolia application (`1TAPVC99Z1`) was deleted by
+      Algolia for inactivity (verified 2026-07-17: the app's endpoint no longer resolves
+      in DNS, and the dashboard shows only the default "My First Application"). There is
+      nothing to rotate. `cold_search` runs on its keyword-matching fallback without it.
+      If full-text search is wanted later, create a fresh Algolia app and re-index —
+      prefer a **search-only** key for the read path, never the admin key.
 
 Never paste real keys into commits, plans, logs, or issue trackers.
 
