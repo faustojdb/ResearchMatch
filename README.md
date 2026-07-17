@@ -221,7 +221,9 @@ register -> submit_commit -> find_collaborators -> send_request -> inbox
 
 - **Backend**: Python + [FastMCP](https://github.com/jlowin/fastmcp) framework
 - **Database**: Firebase Firestore (production) / SQLite (local development)
-- **Search**: Algolia for cold search indexing
+- **Search**: keyword matching over Firestore/SQLite. Algolia full-text indexing is an
+  optional, currently-unconfigured enhancement — `cold_search` works fully without it.
+- **Novelty grounding**: OpenAlex (free, no key) for literature-grounded originality scoring
 - **Embeddings**: sentence-transformers (all-MiniLM-L6-v2) with Jaccard fallback
 - **GitHub Integration**: GitHub App for bilateral repo access (PyJWT + httpx)
 - **Hosting**: Google Cloud Run (streamable-http transport)

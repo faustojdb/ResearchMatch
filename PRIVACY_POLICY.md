@@ -51,7 +51,12 @@ Research Match is an MCP server that connects researchers via literature-grounde
 ## Data Storage and Security
 
 - **Production database**: Google Cloud Firestore (us-central1 region), encrypted at rest and in transit.
-- **Search index**: Algolia (for cold_search full-text search on research commits only — domain, subdomain, hypothesis fields).
+- **Search**: `cold_search` matches keywords directly against Firestore/SQLite (domain,
+  subdomain, problem, solidity fields only — never the full hypothesis text, which stays
+  gated behind bilateral reveal). No third-party search index is currently in use.
+- **Literature grounding**: originality scoring sends only your search terms (domain/topic
+  keywords) to the free OpenAlex API to find related published works — never your stored
+  research content.
 - **Local mode**: SQLite database stored locally on your machine (no cloud transmission).
 - **Access control**: Firestore security rules deny all client-side access. Data is only accessible through the server's Admin SDK.
 
