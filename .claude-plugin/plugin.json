@@ -1,7 +1,7 @@
 {
   "name": "research-match",
-  "version": "3.2.0",
-  "description": "MCP server with 27 tools that connects isolated researchers via AI originality scoring, bilateral matching, collaboration contracts, GitHub App integration, and privacy-first knowledge sharing.",
+  "version": "3.3.0",
+  "description": "MCP server with 27 tools that connects isolated researchers via literature-grounded originality scoring, bilateral matching, collaboration contracts, GitHub App integration, and privacy-first knowledge sharing.",
   "author": {
     "name": "faustojdb",
     "url": "https://github.com/faustojdb"

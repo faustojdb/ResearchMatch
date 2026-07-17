@@ -18,7 +18,7 @@ research-match
 
 ## Brief Description (1-2 sentences)
 ```
-MCP server with 27 tools that connects isolated researchers via AI originality scoring and bilateral matching. Helps researchers find complementary collaborators while protecting intellectual property through pseudonymous identities, progressive disclosure, and git-verifiable contracts.
+MCP server with 27 tools that connects isolated researchers via literature-grounded originality scoring and bilateral matching. Helps researchers find complementary collaborators while protecting intellectual property through pseudonymous identities, progressive disclosure, and git-verifiable contracts.
 ```
 
 ## Long Description / What does it do?
@@ -26,7 +26,7 @@ MCP server with 27 tools that connects isolated researchers via AI originality s
 Research Match is an MCP server for Claude Desktop that helps researchers, scientists, developers, and independent theorists find complementary collaborators while protecting intellectual property.
 
 Core capabilities:
-- AI-powered dual-axis originality scoring (Theoretical Originality + Formal-Computational Originality) with solidity multipliers
+- Literature-grounded dual-axis originality scoring (Theoretical Originality + Formal-Computational Originality) with solidity multipliers — novelty grounded in real published works via OpenAlex, no LLM
 - Bilateral matching with a semaphore system (GREEN/YELLOW/RED) showing each researcher what they gain from a potential collaboration
 - Privacy by design: emails are SHA-256 hashed (never stored in plain text), pseudonymous identities, consent-based progressive disclosure
 - Full collaboration lifecycle: tickets, reveal system, automatic licensing, file sharing registry, git-verifiable contracts
@@ -59,7 +59,7 @@ https://github.com/faustojdb/ResearchMatch
 
 ## Contact Email
 ```
-faustojdb@users.noreply.github.com
+faustojdb@gmail.com
 ```
 
 ## Support Channel
@@ -123,7 +123,7 @@ What happens:
 1. Claude calls register (email is SHA-256 hashed, never stored in plain text)
 2. Claude calls analyze_work to get the Research Commit template
 3. Claude helps fill in structured fields (domain, hypothesis, methodology, solidity)
-4. Claude calls submit_commit — AI evaluates originality
+4. Claude calls submit_commit — originality is scored (novelty grounded in published literature)
 
 Expected output from submit_commit:
 {
@@ -142,23 +142,20 @@ Expected output from submit_commit:
 ```
 User prompt: "Search Research Match for anyone working on quantum error correction."
 
-What happens: Claude calls cold_search with keywords ["quantum", "error", "correction"]. No registration required.
+What happens: Claude calls cold_search with keywords ["quantum", "error", "correction"]. No registration required. Cold search returns basic public info only — no scores, and NOT the full hypothesis text (the hypothesis is gated behind bilateral reveal / progressive disclosure).
 
 Expected output from cold_search:
 {
+  "status": "ok",
   "query": "quantum error correction",
-  "results": [
-    {
-      "pseudonym": "QuantumCat-7x",
-      "domain": "quantum computing",
-      "subdomain": "error correction",
-      "hypothesis": "Surface codes with adaptive decoders reduce logical error rates by 40%",
-      "ot_score": 78.2,
-      "ofc_score": 81.5
-    }
+  "total_results": 2,
+  "note": "Cold search is FREE — no registration needed. Register to submit your own work and find collaborators.",
+  "internal_results": [
+    {"source": "internal", "pseudonym": "QuantumCat-7x", "domain": "quantum computing", "subdomain": "error correction", "problem": "Reducing logical error rates in surface codes", "solidity": "functional", "date": "2026-02-19T10:30:00Z"}
   ],
-  "total_results": 1,
-  "source": "algolia"
+  "github_results": [
+    {"source": "github", "name": "owner/qec-toolkit", "description": "Surface code decoders and benchmarks", "url": "https://github.com/owner/qec-toolkit", "language": "Python", "stars": 128, "updated": "2026-01-15T08:00:00Z"}
+  ]
 }
 ```
 

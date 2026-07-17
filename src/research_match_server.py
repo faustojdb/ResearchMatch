@@ -13,6 +13,7 @@ Usage:
     python research_match_server.py --http 8000   # HTTP transport (remote)
 """
 
+import asyncio
 import json
 import uuid
 import hashlib
@@ -38,6 +39,7 @@ from mcp.server.fastmcp import FastMCP, Context
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 from .datastore import DataStore, Record
+from .openalex_client import OpenAlexClient
 
 
 # =============================================================================
@@ -124,7 +126,7 @@ def _log_tool_call(func):
 # =============================================================================
 
 DB_PATH = os.environ.get("RESEARCH_MATCH_DB") or "research_match.db"
-SERVER_VERSION = "3.2.0"
+SERVER_VERSION = "3.3.0"
 
 # Scoring weights for Theoretical Originality (OT)
 OT_WEIGHTS = {
@@ -238,6 +240,12 @@ LICENSE_TERMS = {
 # Embedding model
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"  # 384 dims, ~90MB, fast
 
+# Scoring engine
+SCORING_VERSION = "3.0-openalex"      # bump when the scoring pipeline changes
+OPENALEX_WORKS_PER_QUERY = 15         # prior works fetched per novelty check
+NEUTRAL_NOVELTY_SCORE = 55.0          # honest "unscored" value when no reference corpus exists
+NEUTRAL_DIVERGENCE_SCORE = 50.0       # honest "unknown divergence" when no reference corpus exists
+
 
 # =============================================================================
 # EMBEDDING ENGINE (Lazy-loaded Sentence Transformers)
@@ -308,6 +316,24 @@ class EmbeddingEngine:
         if not words_a or not words_b:
             return 0.0
         return len(words_a & words_b) / len(words_a | words_b)
+
+    def rank_similarity(self, query: str, candidates: List[str]) -> Dict[str, float]:
+        """Similarity of `query` against many `candidates` in one shot.
+
+        Encodes the query once and returns the max (nearest neighbour) and mean
+        similarity plus the count of candidates compared. Used to ground novelty
+        against a set of prior works. Falls back to Jaccard like similarity().
+        """
+        cands = [c for c in candidates if c]
+        if not query or not cands:
+            return {"max": 0.0, "avg": 0.0, "n": 0}
+        if self._ensure_model():
+            q = self._model.encode([query], normalize_embeddings=True)[0]
+            embs = self._model.encode(cands, normalize_embeddings=True)
+            sims = [max(0.0, min(1.0, float(np.dot(q, e)))) for e in embs]
+        else:
+            sims = [self._jaccard_similarity(query, c) for c in cands]
+        return {"max": max(sims), "avg": sum(sims) / len(sims), "n": len(sims)}
 
     @property
     def is_loaded(self) -> bool:
@@ -615,20 +641,32 @@ class OriginalityEvaluator:
     """
     Evaluates originality of Research Commits.
 
-    In production, this runs inside a TEE (Trusted Execution Environment).
-    For MVP, it uses heuristic analysis against the local corpus.
-    The architecture is designed so this module can be swapped for a
-    real enclave-based evaluator without changing the interface.
+    Scoring is transparent and reproducible — NOT an LLM judgement:
 
-    v2.2: Uses sentence-transformers for semantic similarity (with Jaccard fallback).
+    - Theoretical Originality (OT): novelty is grounded in the *real published
+      literature* via OpenAlex. We embed the commit's problem/hypothesis and the
+      abstracts of the most-related prior works and score how far the commit sits
+      from its nearest prior art. When no reference works are available (offline,
+      or a niche with no matches) we return an honest NEUTRAL "unscored" value
+      instead of fabricating a high number.
+    - Formal-Computational Originality (OFC): a structured self-assessment of the
+      declared demonstrations (code, data, validation). This is self-declared and
+      labelled as such; it is a starting point pending repository verification.
+
+    Solidity multipliers discount the score by the author's own declared confidence.
+
+    v3.0: literature-grounded novelty (OpenAlex) + sentence-transformers similarity
+    (Jaccard fallback). The scoring method used is recorded on every result.
     """
 
     def __init__(self, db: Optional[sqlite3.Connection] = None,
                  embeddings: Optional[EmbeddingEngine] = None,
-                 datastore: Optional[DataStore] = None):
+                 datastore: Optional[DataStore] = None,
+                 literature: Optional["OpenAlexClient"] = None):
         self.db = db
         self.datastore = datastore
         self.embeddings = embeddings or EmbeddingEngine()
+        self.literature = literature
 
     async def evaluate_commit(self, commit_data: Dict[str, Any], user_id: str) -> Dict[str, Any]:
         """Evaluate a Research Commit and return originality scores."""
@@ -639,8 +677,12 @@ class OriginalityEvaluator:
         eval_logger.debug("Evaluating commit in %s/%s, corpus size: %d",
                           commit_data["domain"], commit_data.get("subdomain", ""), len(corpus))
 
+        # Ground novelty in the real published literature (OpenAlex) + the local corpus.
+        novelty_context = await self._build_novelty_context(commit_data, corpus)
+        eval_logger.debug("Novelty context: %s", novelty_context)
+
         # Calculate Theoretical Originality (OT)
-        ot_breakdown = self._evaluate_theoretical(commit_data, corpus)
+        ot_breakdown = self._evaluate_theoretical(commit_data, corpus, novelty_context)
         ot_score = sum(
             score * OT_WEIGHTS[factor]
             for factor, score in ot_breakdown.items()
@@ -672,6 +714,13 @@ class OriginalityEvaluator:
             "ot_raw": round(ot_score, 1),
             "ofc_raw": round(ofc_score, 1),
             "solidity_impact": solidity_impact,
+            # Transparency: record exactly how novelty was grounded so scores computed
+            # under different regimes (real literature vs offline fallback) are comparable.
+            "scoring_version": SCORING_VERSION,
+            "similarity_method": self.embeddings.method,
+            "novelty_grounding": novelty_context.get("source", "none"),
+            "reference_works": novelty_context.get("n_reference", 0),
+            "ofc_basis": "self_declared",
         }
 
     def _apply_solidity(
@@ -741,42 +790,107 @@ class OriginalityEvaluator:
         rows = self.db.execute(query, params).fetchall()
         return [dict(r) for r in rows]
 
-    def _evaluate_theoretical(self, commit: Dict, corpus: List[Dict]) -> Dict[str, float]:
-        """Evaluate theoretical originality factors."""
-        corpus_size = len(corpus)
+    def _commit_query_text(self, commit: Dict) -> str:
+        """The commit's own text used to compare against prior art."""
+        parts = [
+            commit.get("problem") or "",
+            commit.get("hypothesis") or "",
+            commit.get("theoretical_framework") or "",
+        ]
+        return " ".join(p for p in parts if p).strip()
 
-        # Hypothesis novelty: compare against existing hypotheses
-        hypothesis_novelty = 75.0  # Base score
-        if commit.get("hypothesis"):
-            hyp_text = commit["hypothesis"].lower()
-            for c in corpus:
-                if c.get("hypothesis") and self._text_similarity(hyp_text, c["hypothesis"].lower()) > 0.7:
-                    hypothesis_novelty -= 15.0
-            hypothesis_novelty = max(20.0, min(100.0, hypothesis_novelty))
+    async def _build_novelty_context(self, commit: Dict, corpus: List[Dict]) -> Dict[str, Any]:
+        """Ground novelty in real prior art.
 
-        # Interdisciplinary connections
+        Compares the commit against (a) abstracts of the most-related published works
+        from OpenAlex and (b) other registered commits in the same domain. Returns the
+        nearest-neighbour and average similarity so the theoretical factors can score
+        how far the work sits from existing knowledge. Fails soft: when there is no
+        reference material at all, `has_reference` is False and callers use a neutral,
+        honestly-labelled score rather than inventing novelty.
+        """
+        query = self._commit_query_text(commit)
+        reference_texts: List[str] = []
+        source = "none"
+
+        # (a) Real published literature via OpenAlex (off the request thread).
+        if self.literature is not None and query:
+            search_terms = " ".join(
+                t for t in [commit.get("domain", ""), commit.get("subdomain", ""),
+                            commit.get("hypothesis", "") or commit.get("problem", "")] if t
+            )
+            try:
+                works = await asyncio.to_thread(
+                    self.literature.search_works, search_terms, OPENALEX_WORKS_PER_QUERY
+                )
+            except Exception as e:  # noqa: BLE001 — never let scoring crash on lookup
+                logging.getLogger("research_match.evaluator").warning("OpenAlex lookup failed: %s", e)
+                works = []
+            lit_texts = [OpenAlexClient.work_text(w) for w in works]
+            lit_texts = [t for t in lit_texts if t]
+            if lit_texts:
+                reference_texts.extend(lit_texts)
+                source = "openalex"
+
+        # (b) Other registered commits in the same domain.
+        corpus_texts = [self._commit_query_text(c) for c in corpus]
+        corpus_texts = [t for t in corpus_texts if t]
+        if corpus_texts:
+            reference_texts.extend(corpus_texts)
+            source = "openalex+corpus" if source == "openalex" else "corpus"
+
+        if not reference_texts or not query:
+            return {"has_reference": False, "source": "none", "nearest": 0.0,
+                    "avg": 0.0, "n_reference": 0}
+
+        ranked = self.embeddings.rank_similarity(query, reference_texts)
+        return {
+            "has_reference": True,
+            "source": source,
+            "nearest": ranked["max"],   # similarity to the single closest prior work (0..1)
+            "avg": ranked["avg"],       # average similarity across references (0..1)
+            "n_reference": ranked["n"],
+        }
+
+    def _evaluate_theoretical(self, commit: Dict, corpus: List[Dict],
+                              novelty: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
+        """Evaluate theoretical originality factors.
+
+        `novelty` carries the literature-grounded nearest/avg similarity from
+        _build_novelty_context. When no reference material exists we fall back to
+        honest neutral values instead of the old hardcoded 75/90.
+        """
+        novelty = novelty or {"has_reference": False}
+        has_ref = novelty.get("has_reference", False)
+
+        # Hypothesis novelty — grounded in nearest prior art.
+        # Far from the closest existing work => high novelty; near-duplicate => low.
+        if has_ref and commit.get("hypothesis"):
+            hypothesis_novelty = max(20.0, min(98.0, 100.0 - novelty["nearest"] * 100.0))
+        elif has_ref:
+            # Has references but no hypothesis stated — mild discount, still grounded.
+            hypothesis_novelty = max(20.0, min(90.0, 100.0 - novelty["nearest"] * 100.0) - 15.0)
+        else:
+            hypothesis_novelty = NEUTRAL_NOVELTY_SCORE  # honest "unscored"
+
+        # Interdisciplinary connections (self-declared, capped conservatively).
         connections = commit.get("adhoc_connections", [])
         if isinstance(connections, str):
             try:
                 connections = json.loads(connections)
             except (json.JSONDecodeError, TypeError):
                 connections = []
-        interdisciplinary = min(100.0, 40.0 + len(connections) * 15.0)
+        interdisciplinary = min(90.0, 35.0 + len(connections) * 12.0)
 
-        # Ad hoc content richness
+        # Ad hoc content richness (self-declared; length is a weak signal, capped).
         adhoc = commit.get("adhoc_summary", "")
-        adhoc_score = min(100.0, 30.0 + len(adhoc.split()) * 0.5) if adhoc else 25.0
+        adhoc_score = min(85.0, 30.0 + len(adhoc.split()) * 0.4) if adhoc else 25.0
 
-        # Corpus divergence
-        if corpus_size == 0:
-            divergence = 90.0  # First in the field = high divergence
+        # Corpus divergence — average distance from prior art.
+        if has_ref:
+            divergence = max(5.0, min(98.0, 100.0 - novelty["avg"] * 100.0))
         else:
-            similarities = []
-            for c in corpus:
-                sim = self._commit_similarity(commit, c)
-                similarities.append(sim)
-            avg_sim = sum(similarities) / len(similarities)
-            divergence = max(10.0, 100.0 - avg_sim)
+            divergence = NEUTRAL_DIVERGENCE_SCORE  # honest "unknown", not 90
 
         return {
             "hypothesis_novelty": round(hypothesis_novelty, 1),
@@ -974,10 +1088,12 @@ class ReputationEngine:
         if self.datastore:
             user = await self.datastore.get_user_running_averages(user_id)
         else:
-            user = self.db.execute(
+            row = self.db.execute(
                 "SELECT running_honesty, running_quality, running_effort FROM users WHERE id = ?",
                 (user_id,)
             ).fetchone()
+            # sqlite3.Row has no .get(); normalise to a plain dict so both backends match.
+            user = dict(row) if row else None
 
         alpha = REPUTATION_ALPHA
 
@@ -1506,9 +1622,9 @@ class DeepSearchInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
     repo_url: str = Field(..., description="GitHub repository URL to analyze", min_length=10, max_length=300)
-    include_mcp_analysis: bool = Field(True, description="Include MCP framework/tool extraction (Layer 2)")
-    include_comparison: bool = Field(True, description="Include gap analysis vs Research Match (Layer 3)")
-    include_scoring: bool = Field(False, description="Include originality scoring via OT/OFC (Layer 4, heavier)")
+    include_mcp_analysis: bool = Field(True, description="Reserved — MCP framework extraction is not yet available in the hosted API-based analysis (no-op).")
+    include_comparison: bool = Field(True, description="Reserved — gap analysis is not yet available in the hosted API-based analysis (no-op).")
+    include_scoring: bool = Field(False, description="Estimate originality (OT/OFC) from the repo's description, README and topics, with novelty grounded in real published literature via OpenAlex.")
 
     @field_validator("repo_url")
     @classmethod
@@ -1840,7 +1956,9 @@ async def app_lifespan(app):
         user_email_hash = hashlib.sha256(user_email.lower().strip().encode()).hexdigest()
 
     embeddings = EmbeddingEngine()
-    evaluator = OriginalityEvaluator(db=db, embeddings=embeddings, datastore=datastore)
+    literature = OpenAlexClient(mailto=user_email or None)
+    evaluator = OriginalityEvaluator(db=db, embeddings=embeddings, datastore=datastore,
+                                     literature=literature)
     matcher = MatchingEngine(db=db, embeddings=embeddings, datastore=datastore)
     reputation = ReputationEngine(db=db, datastore=datastore)
 
@@ -2027,20 +2145,36 @@ async def _get_or_create_user(db: Optional[sqlite3.Connection], email: str,
 async def _get_current_user(db: Optional[sqlite3.Connection],
                              datastore: Optional[DataStore] = None,
                              user_email_hash: str = "") -> Optional[Dict]:
-    """Get the current user.
+    """Resolve the caller's identity — fail closed.
 
-    Multi-user mode (Firestore): looks up user by email hash from env var.
-    Single-user mode (SQLite): returns most recently created user.
+    Identity is established ONLY from a verified email hash (RESEARCH_MATCH_USER_EMAIL
+    in local-first mode, or a per-session binding set at register time). We never guess:
+    an unidentified request on a shared backend returns None rather than another user's
+    account. The old "most recently created user" fallback was an account-takeover hole
+    on the multi-user Firestore/Cloud Run deployment and is gone.
+
+    Local-first convenience: when running against a private local SQLite database and no
+    email hash is set, a database that contains exactly one user is unambiguously that
+    user's own data, so we return it. Zero or multiple users with no identity → None.
     """
-    if datastore and user_email_hash:
-        rec = await datastore.find_user_by_email_hash(user_email_hash)
-        return rec
+    if user_email_hash:
+        if datastore:
+            return await datastore.find_user_by_email_hash(user_email_hash)
+        row = db.execute(
+            "SELECT * FROM users WHERE email_hash = ?", (user_email_hash,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    # No identity resolved.
     if datastore:
-        rec = await datastore.get_most_recent_user()
-        return rec
-    # SQLite fallback
-    row = db.execute("SELECT * FROM users ORDER BY created_at DESC LIMIT 1").fetchone()
-    return dict(row) if row else None
+        # Shared/multi-user backend: refuse to guess. Fail closed.
+        return None
+
+    # Local single-user SQLite: safe only when the DB holds exactly one user.
+    rows = db.execute("SELECT * FROM users LIMIT 2").fetchall()
+    if len(rows) == 1:
+        return dict(rows[0])
+    return None
 
 def _hash_content(data: Dict) -> str:
     """Create integrity hash of commit content."""
@@ -4145,7 +4279,12 @@ logger = logging.getLogger("research_match")
 async def _cold_search_internal(db: Optional[sqlite3.Connection], query: str, limit: int,
                                  datastore: Optional[DataStore] = None) -> List[Dict]:
     """Search the internal database for public research commits matching a query.
-    Returns basic info only: domain, subdomain, problem, hypothesis, solidity."""
+
+    Returns basic public info ONLY: pseudonym, domain, subdomain, problem, solidity.
+    The full hypothesis text is intentionally NOT returned — it is gated behind
+    bilateral reveal (progressive disclosure), so cold search cannot be used to scrape
+    other researchers' unpublished hypotheses.
+    """
     keywords = query.lower().split()
     if not keywords:
         return []
@@ -4160,7 +4299,6 @@ async def _cold_search_internal(db: Optional[sqlite3.Connection], query: str, li
                 "domain": r.get("domain", ""),
                 "subdomain": r.get("subdomain", ""),
                 "problem": r.get("problem", ""),
-                "hypothesis": r.get("hypothesis", ""),
                 "solidity": r.get("overall_solidity", "unknown"),
                 "date": r.get("created_at", ""),
             }
@@ -4180,8 +4318,9 @@ async def _cold_search_internal(db: Optional[sqlite3.Connection], query: str, li
 
     where_clause = " AND ".join(conditions)
 
+    # NOTE: hypothesis IS searched (WHERE clause) but never returned — see docstring.
     rows = db.execute(f"""
-        SELECT rc.domain, rc.subdomain, rc.problem, rc.hypothesis,
+        SELECT rc.domain, rc.subdomain, rc.problem,
                rc.overall_solidity, rc.created_at,
                u.pseudonym
         FROM research_commits rc
@@ -4200,7 +4339,6 @@ async def _cold_search_internal(db: Optional[sqlite3.Connection], query: str, li
             "domain": row["domain"],
             "subdomain": row.get("subdomain", ""),
             "problem": row.get("problem", ""),
-            "hypothesis": row.get("hypothesis", ""),
             "solidity": row.get("overall_solidity", "unknown"),
             "date": row.get("created_at", ""),
         })
@@ -4288,12 +4426,12 @@ async def research_match_cold_search(params: ColdSearchInput, ctx: Context = Non
     name="research_match_deep_search",
     description=(
         "FREE deep analysis — NO REGISTRATION REQUIRED. "
-        "Given a GitHub repository URL (from cold_search results), clones and analyzes: "
-        "Layer 1: Git metadata, file tree, LOC by language, dependencies. "
-        "Layer 2: MCP framework/tool extraction (Python + JS/TS). "
-        "Layer 3: Gap analysis comparing target vs Research Match. "
-        "Layer 4 (optional): Originality scoring via OT/OFC evaluator. "
-        "Returns structured JSON. Use after cold_search to evaluate a repo deeply. "
+        "Given a public GitHub repository URL, uses the GitHub API (no clone) to report: "
+        "repo metadata (stars, forks, license, topics), languages/LOC breakdown, "
+        "recent commits, top-level file tree, README preview, and dependency files. "
+        "Set include_scoring=true for an originality estimate (Theoretical + Formal-Computational), "
+        "where novelty is grounded in real published literature via OpenAlex. "
+        "Returns structured JSON. Use after cold_search to evaluate a repo. "
         "Example: repo_url='https://github.com/owner/repo', include_scoring=true."
     ),
     annotations={
@@ -4416,14 +4554,56 @@ async def research_match_deep_search(params: DeepSearchInput, ctx: Context = Non
 
         layers_executed = {"generic": True, "mcp": False, "comparison": False, "scoring": False}
 
-        return json.dumps({
+        # Layer 4 (optional): real originality estimate grounded in published literature.
+        originality = None
+        if params.include_scoring:
+            try:
+                description = repo_data.get("description") or ""
+                topics = repo_data.get("topics", []) or []
+                repo_commit = {
+                    "domain": (topics[0] if topics else (repo_data.get("language") or "software")),
+                    "subdomain": "",
+                    "problem": description,
+                    "hypothesis": description,  # repos have no hypothesis; the description is the claim
+                    "theoretical_framework": readme_preview,
+                    "adhoc_connections": topics[:5],
+                    "adhoc_summary": description,
+                    "demo_types": ["code"],
+                    "code_languages": list(languages.keys())[:8],
+                    "demonstrations_summary": readme_preview,
+                    "overall_solidity": "functional",
+                }
+                evaluator = _get_evaluator(ctx)
+                scores = await evaluator.evaluate_commit(repo_commit, user_id="deep_search")
+                originality = {
+                    "ot_score": scores["ot_score"],
+                    "ofc_score": scores["ofc_score"],
+                    "novelty_grounding": scores.get("novelty_grounding"),
+                    "reference_works": scores.get("reference_works"),
+                    "similarity_method": scores.get("similarity_method"),
+                    "scoring_version": scores.get("scoring_version"),
+                    "disclaimer": (
+                        "Estimate from public repo metadata (description/README/topics). "
+                        "OT novelty is grounded in real literature; OFC is inferred from "
+                        "declared languages only and is a rough lower bound."
+                    ),
+                }
+                layers_executed["scoring"] = True
+            except Exception as e:  # noqa: BLE001 — scoring must never break metadata analysis
+                logger.warning("deep_search scoring failed for %s: %s", repo_url, e)
+                originality = {"error": f"scoring unavailable: {e}"}
+
+        result = {
             "status": "ok",
             "repo_url": repo_url,
             "repo_size_mb": size_mb,
             "layers_executed": layers_executed,
             "analysis": analysis,
-            "note": "API-based analysis (no clone). For full clone-based analysis with MCP extraction and scoring, use the CLI version.",
-        }, indent=2, default=str)
+            "note": "API-based analysis (no clone). Set include_scoring=true for a literature-grounded originality estimate.",
+        }
+        if originality is not None:
+            result["originality"] = originality
+        return json.dumps(result, indent=2, default=str)
 
     except Exception as e:
         logger.error(f"Deep search failed for {repo_url}: {e}")
@@ -6983,12 +7163,27 @@ def main():
         # Cloud Run: PORT env var set automatically, bind to 0.0.0.0
         from mcp.server.transport_security import TransportSecuritySettings
 
+        # Re-enable DNS-rebinding protection with an explicit allow-list. Hosts can be
+        # overridden via RESEARCH_MATCH_ALLOWED_HOSTS (comma-separated) for other deployments.
+        allowed_hosts = [
+            h.strip() for h in os.environ.get(
+                "RESEARCH_MATCH_ALLOWED_HOSTS",
+                "research-match-77626397872.us-central1.run.app,*.run.app,localhost,127.0.0.1",
+            ).split(",") if h.strip()
+        ]
         mcp.settings.host = "0.0.0.0"
         mcp.settings.port = int(port_env)
         mcp.settings.transport_security = TransportSecuritySettings(
-            enable_dns_rebinding_protection=False,
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=allowed_hosts,
+            allowed_origins=["https://*", "http://localhost:*", "http://127.0.0.1:*"],
         )
-        _logger.info("Starting streamable-http on 0.0.0.0:%s (Cloud Run)", port_env)
+        _logger.warning(
+            "Starting streamable-http on 0.0.0.0:%s (remote mode). NOTE: this endpoint has "
+            "NO user authentication yet — identity is self-asserted. Do NOT use the shared "
+            "multi-user backend for sensitive data until OAuth is added. Local-first (stdio + "
+            "SQLite) is the recommended, private mode.", port_env,
+        )
         mcp.run(transport="streamable-http")
     else:
         mcp.run()

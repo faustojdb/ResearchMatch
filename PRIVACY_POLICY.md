@@ -5,17 +5,17 @@
 
 ## Overview
 
-Research Match is an MCP server that connects researchers via AI-powered originality scoring and bilateral matching. This privacy policy explains how we collect, use, and protect your data.
+Research Match is an MCP server that connects researchers via literature-grounded originality scoring and bilateral matching. This privacy policy explains how we collect, use, and protect your data.
 
 ## Data We Collect
 
 ### Registration Data
-- **Email address**: Immediately SHA-256 hashed on the server. The plain-text email is **never stored** in any database, log, or backup. Only the irreversible hash is retained for identity purposes.
+- **Email address**: Immediately SHA-256 hashed on the server. The application stores **only the SHA-256 hash** — the plain-text email is not written to the app's database. Note that hosting infrastructure (e.g., Google Cloud) may log request metadata such as IP addresses outside the application's control. In local-first mode, all data stays on your machine and nothing is transmitted. Only the irreversible hash is retained for identity purposes.
 - **Pseudonym**: A display name you choose (or auto-generated). This is the only human-readable identifier visible to other users.
 
 ### Research Commits
 - Structured descriptions of your research work (domain, hypothesis, methodology).
-- AI-generated originality scores (Theoretical Originality and Formal-Computational Originality).
+- Literature-grounded originality scores (Theoretical Originality and Formal-Computational Originality).
 - These are stored to enable matching and collaboration features.
 
 ### Collaboration Data
@@ -42,7 +42,7 @@ Research Match is an MCP server that connects researchers via AI-powered origina
 
 ## How We Use Your Data
 
-- **Matching**: Research commits are compared using AI embeddings to find complementary collaborators.
+- **Matching**: Research commits are compared using semantic (sentence) embeddings to find complementary collaborators.
 - **Scoring**: Originality scores are computed from your structured research descriptions.
 - **Collaboration**: Team data enables bilateral workflows (reveal, licensing, contracts).
 - **Bug tracking**: Bug reports help us improve the service during beta testing.
@@ -87,4 +87,4 @@ We may update this policy as the service evolves. Material changes will be noted
 - **Developer**: Fausto Jose Di Bacco
 - **GitHub**: [github.com/faustojdb](https://github.com/faustojdb)
 - **Issues**: [github.com/faustojdb/ResearchMatch/issues](https://github.com/faustojdb/ResearchMatch/issues)
-- **Email**: faustojdb@users.noreply.github.com
+- **Email**: faustojdb@gmail.com

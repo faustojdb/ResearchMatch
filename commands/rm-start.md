@@ -40,8 +40,8 @@ Then call `research_match_submit_commit` with the data.
 ## Step 3 result
 
 Show the user their originality scores:
-- **OT** (Originality Threshold): How novel is this vs existing work?
-- **OFC** (Originality Frontier Contribution): How much does this push the field forward?
+- **OT** (Theoretical Originality): How novel is this vs real published literature and existing registered work?
+- **OFC** (Formal-Computational Originality): How strong is the formal/computational demonstration (code, data, validation)?
 - **Semaphore**: Overall readiness indicator
 
 Tell them: "You're registered! Use `/rm-match` to find collaborators, or `/rm-profile` to see your profile."

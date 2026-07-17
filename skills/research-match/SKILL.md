@@ -1,20 +1,20 @@
 ---
 name: research-match
-description: Research Match connects isolated researchers via AI originality scoring and bilateral matching. Use when users mention research matching, originality scoring, find collaborators, research collaboration, OT/OFC scores, bilateral matching, research privacy, or academic networking.
+description: Research Match connects isolated researchers via literature-grounded originality scoring and bilateral matching. Use when users mention research matching, originality scoring, find collaborators, research collaboration, OT/OFC scores, bilateral matching, research privacy, or academic networking.
 user-invocable: false
 allowed-tools: "mcp__research-match__research_match_register, mcp__research-match__research_match_analyze_work, mcp__research-match__research_match_submit_commit, mcp__research-match__research_match_my_profile, mcp__research-match__research_match_find_collaborators, mcp__research-match__research_match_send_request, mcp__research-match__research_match_inbox, mcp__research-match__research_match_respond_request, mcp__research-match__research_match_rate_user, mcp__research-match__research_match_cold_search, mcp__research-match__research_match_deep_search, mcp__research-match__research_match_prepare_commit, mcp__research-match__research_match_needs_create, mcp__research-match__research_match_needs_list, mcp__research-match__research_match_needs_resolve, mcp__research-match__research_match_reveal_request, mcp__research-match__research_match_reveal_respond, mcp__research-match__research_match_reveal_status, mcp__research-match__research_match_team_license, mcp__research-match__research_match_share_file, mcp__research-match__research_match_shared_files, mcp__research-match__research_match_audit_log, mcp__research-match__research_match_export_contract, mcp__research-match__research_match_confirm_contract, mcp__research-match__research_match_connect_github, mcp__research-match__research_match_disconnect_github, mcp__research-match__research_match_report_bug"
 ---
 
-# Research Match — AI-Powered Research Collaboration
+# Research Match — Literature-Grounded Research Collaboration
 
-Research Match is an MCP server with 27 tools that connects isolated researchers through AI originality scoring, bilateral matching, GitHub App integration, and privacy-first collaboration.
+Research Match is an MCP server with 27 tools that connects isolated researchers through literature-grounded originality scoring, bilateral matching, GitHub App integration, and privacy-first collaboration.
 
 ## Core Concepts
 
 ### Originality Scoring (OT/OFC)
 Every research commit is evaluated on two axes:
-- **OT (Originality Threshold)**: How novel is this work compared to existing research? Measures uniqueness of approach, methodology, and results.
-- **OFC (Originality Frontier Contribution)**: How much does this work push the boundary of the field? Measures potential impact and advancement.
+- **OT (Theoretical Originality)**: How novel are the hypotheses, interdisciplinary connections, and ad-hoc reasoning compared to real published literature and other registered work.
+- **OFC (Formal-Computational Originality)**: How strong is the formal/computational demonstration — code, data, validation, technical sophistication (structured self-assessment).
 
 Scores are 0-100%, with solidity multipliers applied based on evidence quality (theory, demos, ad-hoc).
 

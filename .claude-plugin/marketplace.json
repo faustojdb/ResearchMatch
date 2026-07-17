@@ -2,18 +2,18 @@
   "name": "research-match-marketplace",
   "owner": {
     "name": "faustojdb",
-    "email": "faustojdb@users.noreply.github.com"
+    "email": "faustojdb@gmail.com"
   },
   "metadata": {
-    "description": "Research Match — AI-powered research collaboration tools",
+    "description": "Research Match — literature-grounded research collaboration tools",
     "version": "1.0.0"
   },
   "plugins": [
     {
       "name": "research-match",
       "source": "./",
-      "description": "MCP server with 27 tools for AI-powered research collaboration via originality scoring, bilateral matching, and privacy-first knowledge sharing.",
-      "version": "3.2.0",
+      "description": "MCP server with 27 tools for literature-grounded research collaboration via originality scoring, bilateral matching, and privacy-first knowledge sharing.",
+      "version": "3.3.0",
       "author": {
         "name": "faustojdb"
       },

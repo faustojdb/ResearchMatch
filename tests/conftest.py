@@ -8,6 +8,7 @@ Requires Firestore Emulator running on localhost:8080:
 from __future__ import annotations
 
 import os
+import socket
 import asyncio
 from typing import AsyncGenerator
 
@@ -22,6 +23,58 @@ os.environ.pop("ALGOLIA_APP_ID", None)
 os.environ.pop("ALGOLIA_API_KEY", None)
 
 from src.firestore_datastore import FirestoreDataStore  # noqa: E402
+
+
+# =====================================================================
+# EMULATOR REACHABILITY GUARD
+# =====================================================================
+# The emulator-backed suites (test_firestore_datastore.py, test_flows_integration.py)
+# open a real gRPC connection to FIRESTORE_EMULATOR_HOST. When the emulator is NOT
+# running, the SDK retries for ~60s per operation before failing, which makes an
+# offline `pytest` run hang for minutes. To keep offline runs fast, we probe the
+# emulator port once at collection time and, if it is not accepting TCP connections,
+# SKIP the emulator-dependent test modules with a clear message. The offline unit
+# suites (test_engines.py, test_openalex.py) are never touched by this guard.
+
+_EMULATOR_DEPENDENT_MODULES = (
+    "test_firestore_datastore.py",
+    "test_flows_integration.py",
+)
+
+
+def _emulator_reachable(timeout: float = 1.0) -> bool:
+    """Return True if FIRESTORE_EMULATOR_HOST accepts a TCP connection."""
+    host_port = os.environ.get("FIRESTORE_EMULATOR_HOST", "")
+    if ":" not in host_port:
+        return False
+    host, _, port = host_port.rpartition(":")
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except (OSError, ValueError):
+        return False
+
+
+def pytest_collection_modifyitems(config, items):
+    """Skip emulator-dependent tests when the Firestore emulator is unreachable.
+
+    Runs after collection. If the emulator port is open we do nothing (the existing
+    suite runs exactly as before). If it is closed, every test whose file is an
+    emulator-dependent module is marked skipped so the run does not hang.
+    """
+    if _emulator_reachable():
+        return
+    skip_emulator = pytest.mark.skip(
+        reason=(
+            "Firestore emulator not reachable at "
+            f"FIRESTORE_EMULATOR_HOST={os.environ.get('FIRESTORE_EMULATOR_HOST', '<unset>')}. "
+            "Start it with `firebase emulators:start --only firestore` to run these tests."
+        )
+    )
+    for item in items:
+        filename = os.path.basename(str(getattr(item, "fspath", "")))
+        if filename in _EMULATOR_DEPENDENT_MODULES:
+            item.add_marker(skip_emulator)
 
 
 @pytest.fixture(scope="session")

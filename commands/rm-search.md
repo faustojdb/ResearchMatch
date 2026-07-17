@@ -22,4 +22,4 @@ Search the global research database for projects matching: **$ARGUMENTS**
 ## Notes
 - This is a read-only search — no account needed
 - Results show anonymized researcher IDs (not real names)
-- Originality scores: OT = Originality Threshold, OFC = Originality Frontier Contribution
+- Originality scores: OT = Theoretical Originality, OFC = Formal-Computational Originality

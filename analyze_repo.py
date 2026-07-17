@@ -976,10 +976,18 @@ def score_originality(commit_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     # In-memory DB with schema
     try:
+        import asyncio as _asyncio
+        try:
+            from research_match_server import OpenAlexClient
+            _literature = OpenAlexClient()
+        except Exception:
+            _literature = None
         db = init_database(":memory:")
         embeddings = EmbeddingEngine()
-        evaluator = OriginalityEvaluator(db, embeddings)
-        result = evaluator.evaluate_commit(commit_data, user_id="analyzer")
+        evaluator = OriginalityEvaluator(db, embeddings, literature=_literature)
+        # evaluate_commit is async — run it to completion (it was previously left as an
+        # un-awaited coroutine, which silently produced a broken report).
+        result = _asyncio.run(evaluator.evaluate_commit(commit_data, user_id="analyzer"))
         db.close()
         return result
     except Exception as e:

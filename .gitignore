@@ -46,3 +46,4 @@ test_deep_search_real.py
 firebase-credentials.json
 *.pem
 .env
+!.env.example

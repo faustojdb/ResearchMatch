@@ -1,0 +1,16 @@
+#!/bin/sh
+# Research Match secret guard. Enable with: git config core.hooksPath .githooks
+# Blocks committing credentials, private keys, databases and debug logs even if a
+# .gitignore rule is missing or bypassed.
+
+blocked=$(git diff --cached --name-only | grep -E '(^|/)\.env$|\.pem$|credentials.*\.json$|\.db$|\.db-(shm|wal)$|-debug\.log$')
+
+if [ -n "$blocked" ]; then
+    echo "BLOCKED: refusing to commit files that look like secrets or local artifacts:"
+    echo "$blocked" | sed 's/^/  - /'
+    echo
+    echo "If this is a false positive, commit with:  git commit --no-verify"
+    exit 1
+fi
+
+exit 0

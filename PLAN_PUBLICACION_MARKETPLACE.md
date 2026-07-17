@@ -100,7 +100,7 @@ Antes de enviar al marketplace, verificar en:
 
 ### Informacion a preparar para el formulario:
 1. **Nombre**: Research Match
-2. **Descripcion corta**: MCP server that connects isolated researchers via AI originality scoring and bilateral matching
+2. **Descripcion corta**: MCP server that connects isolated researchers via literature-grounded originality scoring and bilateral matching
 3. **Repositorio**: https://github.com/faustojdb/ResearchMatch
 4. **Archivo .mcpb**: URL de la release o upload directo
 5. **Icono**: `assets/icon.png` (ya existe)
