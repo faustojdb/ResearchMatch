@@ -197,7 +197,7 @@ Once connected, start by saying: *"Register me on Research Match"* — Claude wi
   "status": "reported",
   "report_id": "a1b2c3d4-...",
   "severity": "medium",
-  "server_version": "3.2.0",
+  "server_version": "3.3.0",
   "reporter": "anonymous",
   "message": "Bug report received (severity: medium). Report ID: a1b2c3d4-.... Thank you for helping improve Research Match!"
 }
@@ -210,6 +210,13 @@ register -> submit_commit -> find_collaborators -> send_request -> inbox
     -> respond_request -> reveal_request -> reveal_respond -> team_license
     -> share_file -> export_contract -> confirm_contract -> connect_github
 ```
+
+## Why register?
+
+Research Match is a two-sided network — `find_collaborators` and part of the
+originality scoring only get better as real, honest work gets registered. See
+[ROADMAP.md](ROADMAP.md) for exactly what your registration unlocks and what
+happens next as real usage grows.
 
 ## Requirements
 
