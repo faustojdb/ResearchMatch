@@ -41,8 +41,9 @@ research_refs/
 test_whatsapp_*.py
 test_deep_search_real.py
 
-# Production credentials (NEVER commit)
-firebase-credentials.json
+# Production credentials (NEVER commit) — broad glob, not just the exact filename,
+# so accidental duplicates/backups (e.g. "firebase-credentials1.json") are also caught
+*credential*.json
 *.pem
 .env
 !.env.example
