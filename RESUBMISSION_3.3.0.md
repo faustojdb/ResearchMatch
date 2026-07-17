@@ -125,7 +125,7 @@ exactly these fields — answers for the v3.3.0 resubmission:
 | Is this an update to an existing extension? | **Yes** |
 | Primary Contact Name | Fausto Jose Di Bacco |
 | Primary Contact Email | faustojdb@gmail.com |
-| MCP Server Description (50 words max) | MCP server with 27 tools connecting researchers via literature-grounded originality scoring (novelty grounded in real published works via OpenAlex — no LLM). Bilateral matching, progressive disclosure, and git-verifiable contracts protect IP. Runs local-first (private SQLite, no API key required). *(37 words)* |
+| MCP Server Description (50 words max) | MCP server with 27 tools connecting isolated researchers through originality scoring grounded in real published literature (via OpenAlex) and bilateral matching. Protects IP with pseudonymous identities, progressive disclosure, and git-verifiable contracts including automatic GitHub repo escrow. Local-first — private SQLite, no API key, works offline. *(45 words)* |
 | Desktop Extension GitHub Link | https://github.com/faustojdb/ResearchMatch |
 | Primary Party Confirmation (do you work for the company this connects to?) | No |
 | Attach your .mcpb file | `research-match-3.3.0.mcpb` |
