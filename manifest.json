@@ -23,7 +23,13 @@
     "entry_point": "src/research_match_server.py",
     "mcp_config": {
       "command": "uv",
-      "args": ["run", "--directory", "${__dirname}", "research-match"],
+      "args": [
+        "run",
+        "--frozen",
+        "--directory",
+        "${__dirname}",
+        "research-match"
+      ],
       "env": {
         "RESEARCH_MATCH_DB": "${user_config.database_path}",
         "RESEARCH_MATCH_BACKEND": "${user_config.backend}"
@@ -41,9 +47,9 @@
     "database_path": {
       "type": "string",
       "title": "Database Path",
-      "description": "Path to the SQLite database file (only used with sqlite backend). Leave empty to use the default.",
+      "description": "Path to the SQLite database file (only used with the sqlite backend). Defaults to a .research-match folder in your home directory so it survives extension updates.",
       "required": false,
-      "default": ""
+      "default": "${HOME}/.research-match/research_match.db"
     }
   },
   "tools": [
@@ -168,7 +174,11 @@
     "licensing"
   ],
   "compatibility": {
-    "platforms": ["win32", "linux", "darwin"],
+    "platforms": [
+      "win32",
+      "linux",
+      "darwin"
+    ],
     "runtimes": {
       "python": ">=3.12"
     }
