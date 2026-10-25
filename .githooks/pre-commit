@@ -1,12 +1,19 @@
 #!/bin/sh
 # Research Match secret guard. Enable with: git config core.hooksPath .githooks
 # Blocks committing credentials, private keys, databases and debug logs even if a
-# .gitignore rule is missing or bypassed. Written as a plain pipeline (no command
-# substitution) so static checks can read exactly what it does.
+# .gitignore rule is missing or bypassed. Written as a plain, static pipeline with
+# whole-line patterns (grep -x) and no shell expansion, so checks can read what it does.
 
 if git diff --cached --name-only \
-    | grep -E '(^|/)\.env$|\.pem$|credentials.*\.json$|\.db$|\.db-(shm|wal)$|-debug\.log$' \
-    | sed 's/^/  - /' \
+    | grep -E -x \
+        -e '(.*/)?\.env' \
+        -e '(.*/)?\.env\.[A-Za-z0-9_.-]+' \
+        -e '.*\.pem' \
+        -e '.*credentials[^/]*\.json' \
+        -e '.*\.db' \
+        -e '.*\.db-(shm|wal)' \
+        -e '.*-debug\.log' \
+    | grep -v -E -x -e '(.*/)?\.env\.example' \
     | grep . ; then
     echo "BLOCKED: refusing to commit the files listed above (they look like secrets or local artifacts)."
     echo "If this is a false positive, commit with:  git commit --no-verify"

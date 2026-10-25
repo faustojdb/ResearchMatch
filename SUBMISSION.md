@@ -54,7 +54,7 @@ hold (`LAUNCHER_PACKAGE_REVIEW`), and the first validation (2026-10-25, v3.4.0) 
 `src/research_match_server.py` and `uv.lock` for size, the credential env vars the server
 reads (`GITHUB_APP_PRIVATE_KEY`, `GOOGLE_APPLICATION_CREDENTIALS` — vendor hosts, a
 reviewer confirms) and, until they were removed, a shell script and planning notes that
-named `assets/icon.png`; a hold means an Anthropic reviewer reads the version before it goes live. Make the
+mentioned the listing icon by its path; a hold means an Anthropic reviewer reads the version before it goes live. Make the
 reviewer's job easy: the README section *"What this plugin runs, sends and fetches"*
 declares every process, file write and network destination (OpenAlex, GitHub API,
 Hugging Face model download, PyPI, optional Firestore). An undisclosed destination is what

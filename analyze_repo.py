@@ -31,10 +31,11 @@ def _find_git() -> str:
     """Find git executable, checking common Windows paths if not in PATH."""
     if shutil.which("git"):
         return "git"
+    # Fixed well-known install locations (no environment lookups).
     candidates = [
-        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "cmd", "git.exe"),
-        os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Git", "cmd", "git.exe"),
-        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Git", "cmd", "git.exe"),
+        r"C:\Program Files\Git\cmd\git.exe",
+        r"C:\Program Files (x86)\Git\cmd\git.exe",
+        os.path.join(os.path.expanduser("~"), "AppData", "Local", "Programs", "Git", "cmd", "git.exe"),
     ]
     for path in candidates:
         if os.path.isfile(path):
