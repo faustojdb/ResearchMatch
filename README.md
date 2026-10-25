@@ -76,7 +76,7 @@ claude mcp add research-match -- uv run --directory /path/to/ResearchMatch --fro
 
 ### Option 3 — Claude Desktop extension (.mcpb, manual install)
 
-A desktop-extension bundle can still be built with `mcpb pack` (or `./build_alpha.sh`) and installed by hand in Claude Desktop under **Settings > Extensions > Advanced settings > Install Extension…**. Note that Anthropic no longer lists desktop extensions in its directory, so this is a side channel, not the main distribution path.
+A desktop-extension bundle can still be built with `mcpb pack` (the `.mcpbignore` file keeps development files out of it) and installed by hand in Claude Desktop under **Settings > Extensions > Advanced settings > Install Extension…**. Note that Anthropic no longer lists desktop extensions in its directory, so this is a side channel, not the main distribution path.
 
 ### Option 4 — Experimental remote connector
 
@@ -111,7 +111,7 @@ Once installed, say: *"Register me on Research Match"* — Claude will ask for t
 
 Everything the plugin does is in this repository's readable source. In summary:
 
-- **Runs**: `uv run --frozen research-match` from the plugin folder — a Python stdio MCP server (`src/research_match_server.py`). Dependencies are pinned in `uv.lock`.
+- **Runs**: `uv run --frozen python research_match_mcp.py` from the plugin folder — a three-line launcher that starts the Python stdio MCP server in `src/research_match_server.py`. Dependencies are pinned in `uv.lock`.
 - **Writes locally**: one SQLite database (see *Where your data lives*) and uv's dependency cache. No other files are written.
 - **Network calls, local mode**:
   - `api.openalex.org` — originality scoring sends only your domain/topic search terms to find related published works. Disable with `RESEARCH_MATCH_DISABLE_OPENALEX=1`.
@@ -217,7 +217,7 @@ All tool names are prefixed `research_match_` on the wire (e.g. `research_match_
   "status": "reported",
   "report_id": "a1b2c3d4-...",
   "severity": "medium",
-  "server_version": "3.4.0",
+  "server_version": "3.4.1",
   "reporter": "anonymous",
   "message": "Bug report received (severity: medium). Report ID: a1b2c3d4-.... Thank you for helping improve Research Match!"
 }
@@ -248,7 +248,7 @@ happens next as real usage grows.
 - **Embeddings**: sentence-transformers (all-MiniLM-L6-v2) with Jaccard fallback
 - **GitHub Integration**: GitHub App for bilateral repo access (PyJWT + httpx)
 - **Hosting (optional)**: Google Cloud Run (streamable-http transport)
-- **Plugin layout**: `.claude-plugin/plugin.json` (manifest), `.mcp.json` (local server), `skills/research-match/SKILL.md`, `commands/*.md`
+- **Plugin layout**: `.claude-plugin/plugin.json` (manifest), `.mcp.json` (local server), `research_match_mcp.py` (launcher), `skills/research-match/SKILL.md`, `commands/*.md`
 
 ## Development
 

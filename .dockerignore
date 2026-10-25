@@ -7,7 +7,6 @@ __pycache__/
 .git/
 .claude/
 research_refs/
-sessions/
 tests/
 *.dxt
 *.zip
@@ -22,7 +21,5 @@ firestore-debug.log
 ui-debug.log
 *-debug.log
 .pytest_cache/
-build_alpha.sh
-PLAN_MANANA.md
 analyze_repo.py
 test_simulation.py

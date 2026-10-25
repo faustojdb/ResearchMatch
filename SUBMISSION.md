@@ -41,22 +41,26 @@ Status of this repository against the automated checks (as of v3.4.0):
 | Every tool has `title` + `readOnlyHint`/`destructiveHint` | OK (cold_search was missing them until 3.4.0) |
 | `.mcp.json` valid, local server declared with `command`/`args` | OK |
 | `uv run` **must** use `--locked` or `--frozen` (otherwise **Blocks**) | OK — `--frozen`, `uv.lock` committed |
+| Server command names a readable file in the plugin | OK — `python ${CLAUDE_PLUGIN_ROOT}/research_match_mcp.py` (since 3.4.1) |
 | No package-manager config that sets an index/registry (`uv.toml`, `.npmrc`) | OK |
 | No real credentials anywhere | OK — `.env`, `*.pem`, `*credentials*.json` are gitignored and never committed |
 | No `.DS_Store` / `Thumbs.db` | OK |
 | Repository < 50 MiB archived, < 10,000 files | OK (about 60 tracked files, < 3 MiB) |
 | Files ≤ 256 KiB (non-image) | **Hold for reviewer**: `uv.lock` (~450 KiB) and `src/research_match_server.py` (~310 KiB) exceed it |
 | Package launcher (`uv run`) even when frozen | **Hold for reviewer** ("Runs a pinned … package" — dependencies resolve at install time) |
-| Local server started through a package script rather than `node file.js` | **Hold for reviewer** ("MCP server command wasn't read") |
 
 **Expect a reviewer hold, not a rejection.** A Python/uv server cannot avoid the launcher
-hold; a hold means an Anthropic reviewer reads the version before it goes live. Make the
+hold (`LAUNCHER_PACKAGE_REVIEW`), and the first validation (2026-10-25, v3.4.0) also held
+`src/research_match_server.py` and `uv.lock` for size, the credential env vars the server
+reads (`GITHUB_APP_PRIVATE_KEY`, `GOOGLE_APPLICATION_CREDENTIALS` — vendor hosts, a
+reviewer confirms) and, until they were removed, a shell script and planning notes that
+named `assets/icon.png`; a hold means an Anthropic reviewer reads the version before it goes live. Make the
 reviewer's job easy: the README section *"What this plugin runs, sends and fetches"*
 declares every process, file write and network destination (OpenAlex, GitHub API,
 Hugging Face model download, PyPI, optional Firestore). An undisclosed destination is what
 fails the **security scan**, and a first submission that fails the scan is rejected.
 
-Optional, to remove two of the three holds later (ROADMAP Stage 5): split
+Optional, to remove the size holds later (ROADMAP Stage 5): split
 `src/research_match_server.py` into modules under 256 KiB, and trim `uv.lock` by making the
 heavy embedding stack an optional extra.
 

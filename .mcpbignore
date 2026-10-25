@@ -22,7 +22,6 @@ firebase-credentials.json
 
 # Project-specific (not needed in bundle)
 research_refs/
-sessions/
 tests/
 PLAN_*.md
 Dockerfile
@@ -41,7 +40,6 @@ firestore.rules
 # Test files
 test_*.py
 analyze_repo.py
-build_alpha.sh
 
 # Lock files
 uv.lock

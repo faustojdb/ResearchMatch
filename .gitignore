@@ -29,7 +29,7 @@ firestore-debug.log
 ui-debug.log
 *-debug.log
 
-# Build artifacts (build_alpha.sh itself is tracked — it produces these, not one of them)
+# Build artifacts (produced by `mcpb pack`)
 *.dxt
 *.mcpb
 *.zip

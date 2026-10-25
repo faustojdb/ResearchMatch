@@ -7,7 +7,8 @@
         "${CLAUDE_PLUGIN_ROOT}",
         "run",
         "--frozen",
-        "research-match"
+        "python",
+        "${CLAUDE_PLUGIN_ROOT}/research_match_mcp.py"
       ],
       "env": {
         "RESEARCH_MATCH_DB": "${CLAUDE_PLUGIN_DATA}/research_match.db"
