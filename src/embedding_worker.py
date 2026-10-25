@@ -35,6 +35,7 @@ import json
 import os
 import sys
 import time
+import traceback
 from typing import List, Sequence
 
 # Keep ML libraries quiet: progress bars and chatter would only end up in the host's log.
@@ -142,6 +143,7 @@ def main() -> int:
         backend = load_backend(model_name)
     except Exception as e:  # noqa: BLE001 — report and exit; the server falls back to Jaccard
         print(f"[embedding-worker] failed to load model {model_name!r}: {e!r}", file=sys.stderr, flush=True)
+        traceback.print_exc(file=sys.stderr)
         send({"id": None, "ok": False, "fatal": True, "error": f"{type(e).__name__}: {e}"})
         return 1
     print(f"[embedding-worker] ready: backend={backend.name} model={model_name} "

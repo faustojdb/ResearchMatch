@@ -1906,7 +1906,7 @@ wheels = [
 
 [[package]]
 name = "research-match"
-version = "3.4.2"
+version = "3.4.3"
 source = { editable = "." }
 dependencies = [
     { name = "algoliasearch" },

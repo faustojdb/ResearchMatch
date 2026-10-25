@@ -90,6 +90,21 @@ Claude Code:
 claude mcp add research-match --transport http https://research-match-77626397872.us-central1.run.app/mcp/
 ```
 
+### If scores say `jaccard-fallback`
+
+That means the embedding worker could not load the model and the server fell back to
+word-overlap similarity. The usual cause is an environment that was interrupted while
+installing (Claude Desktop, for example, kills a first start that takes too long). Repair it
+from a terminal and the next scoring call picks it up without restarting Claude:
+
+```bash
+uv sync --frozen --reinstall --directory "<path to the plugin or extension folder>"
+```
+
+For the desktop extension add `UV_PROJECT_ENVIRONMENT=~/.research-match/venv` and
+`UV_CACHE_DIR=~/.research-match/uv-cache` to that command, since that is where its
+environment lives.
+
 ### Where your data lives
 
 In plugin mode the SQLite database is stored in the plugin's persistent data directory (`${CLAUDE_PLUGIN_DATA}/research_match.db`, which survives plugin updates). Set `RESEARCH_MATCH_DB` to use another path. Databases created by releases before 3.4.0 (which lived inside the plugin folder) are migrated automatically on first start.
@@ -217,7 +232,7 @@ All tool names are prefixed `research_match_` on the wire (e.g. `research_match_
   "status": "reported",
   "report_id": "a1b2c3d4-...",
   "severity": "medium",
-  "server_version": "3.4.2",
+  "server_version": "3.4.3",
   "reporter": "anonymous",
   "message": "Bug report received (severity: medium). Report ID: a1b2c3d4-.... Thank you for helping improve Research Match!"
 }

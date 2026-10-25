@@ -358,3 +358,27 @@ class TestMatchingSemaphore:
         eng = self._engine()
         assert eng._calculate_semaphore(5.0, 5.0)["rule"] == "red"
         assert eng._calculate_semaphore(30.0, 30.0)["rule"] == "green_mutual"
+
+
+# =====================================================================
+# _resolve_db_path — host defaults and unexpanded placeholders
+# =====================================================================
+
+class TestResolveDbPath:
+    def test_primary_wins(self, monkeypatch):
+        from src import research_match_server as s
+        monkeypatch.setenv("RESEARCH_MATCH_DB", "C:/data/primary.db")
+        monkeypatch.setenv("RESEARCH_MATCH_DB_DEFAULT", "C:/data/default.db")
+        assert s._resolve_db_path() == "C:/data/primary.db"
+
+    def test_unexpanded_primary_falls_to_host_default(self, monkeypatch):
+        from src import research_match_server as s
+        monkeypatch.setenv("RESEARCH_MATCH_DB", "${user_config.database_path}")
+        monkeypatch.setenv("RESEARCH_MATCH_DB_DEFAULT", "C:/data/default.db")
+        assert s._resolve_db_path() == "C:/data/default.db"
+
+    def test_empty_everything_is_relative(self, monkeypatch):
+        from src import research_match_server as s
+        monkeypatch.setenv("RESEARCH_MATCH_DB", "")
+        monkeypatch.setenv("RESEARCH_MATCH_DB_DEFAULT", "${HOME}/never-expanded.db")
+        assert s._resolve_db_path() == "research_match.db"

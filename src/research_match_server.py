@@ -129,15 +129,18 @@ def _log_tool_call(func):
 def _resolve_db_path() -> str:
     """Resolve the SQLite database path.
 
-    Falls back to the default relative path when RESEARCH_MATCH_DB is unset *or* still
-    contains an unexpanded ``${VAR}`` placeholder — e.g. ``${CLAUDE_PLUGIN_DATA}`` on a
-    plugin host that does not substitute that variable yet. Without this guard sqlite
-    would create a literal ``${CLAUDE_PLUGIN_DATA}`` directory.
+    RESEARCH_MATCH_DB wins; RESEARCH_MATCH_DB_DEFAULT is a host-provided fallback (the
+    desktop-extension manifest sets it to ``${HOME}/.research-match/research_match.db``
+    because Claude Desktop expands ``${HOME}`` in ``env`` but not inside a user_config
+    default). A value that is empty or still contains an unexpanded ``${VAR}``
+    placeholder is ignored — without this guard sqlite would create a literal
+    ``${CLAUDE_PLUGIN_DATA}`` directory — and the last resort is a relative path.
     """
-    raw = os.environ.get("RESEARCH_MATCH_DB", "").strip()
-    if not raw or "${" in raw:
-        return "research_match.db"
-    return os.path.expanduser(raw)
+    for var in ("RESEARCH_MATCH_DB", "RESEARCH_MATCH_DB_DEFAULT"):
+        raw = os.environ.get(var, "").strip()
+        if raw and "${" not in raw:
+            return os.path.expanduser(raw)
+    return "research_match.db"
 
 
 DB_PATH = _resolve_db_path()
@@ -174,7 +177,7 @@ def _migrate_legacy_db(new_path: str) -> None:
         _logger.info("Migrated legacy database %s -> %s", _LEGACY_DB_PATH, new_path)
     except Exception as exc:  # never block startup on a failed migration
         _logger.warning("Legacy database migration skipped: %s", exc)
-SERVER_VERSION = "3.4.2"
+SERVER_VERSION = "3.4.3"
 
 # Scoring weights for Theoretical Originality (OT)
 OT_WEIGHTS = {
