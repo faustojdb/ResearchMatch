@@ -12,14 +12,16 @@
     {
       "name": "research-match",
       "source": "./",
-      "description": "MCP server with 27 tools for literature-grounded research collaboration via originality scoring, bilateral matching, and privacy-first knowledge sharing.",
-      "version": "3.3.0",
+      "description": "Find complementary research collaborators while protecting unpublished work: literature-grounded originality scoring (OpenAlex), bilateral matching, consent-based reveals, git-verifiable contracts.",
+      "version": "3.4.0",
       "author": {
-        "name": "faustojdb"
+        "name": "Fausto Jose Di Bacco",
+        "email": "faustojdb@gmail.com",
+        "url": "https://github.com/faustojdb"
       },
       "homepage": "https://github.com/faustojdb/ResearchMatch",
       "repository": "https://github.com/faustojdb/ResearchMatch",
-      "license": "BSL-1.1",
+      "license": "BUSL-1.1",
       "keywords": ["research", "collaboration", "matching", "originality", "mcp", "ai"],
       "category": "research",
       "tags": ["research", "collaboration", "academic", "originality-scoring", "bilateral-matching"]

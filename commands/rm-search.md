@@ -1,25 +1,30 @@
 ---
 name: rm-search
-description: Search for research projects and researchers globally without needing an account. Use when users want to explore what research exists in a field.
+description: Search registered research projects and public GitHub repositories by topic without needing an account. Use when users want to explore what research exists in a field.
 argument-hint: "[search query]"
 disable-model-invocation: true
-allowed-tools: "mcp__research-match__research_match_cold_search"
+allowed-tools: "mcp__plugin_research-match_research-match__research_match_cold_search"
 ---
 
 # Research Match — Cold Search
 
-Search the global research database for projects matching: **$ARGUMENTS**
+Search for research matching: **$ARGUMENTS**
 
 ## Instructions
 
-1. Call `research_match_cold_search` with the query `$ARGUMENTS`
-2. Present results clearly:
-   - For each result show: title, research area, originality scores (OT/OFC), and semaphore color
-   - Highlight what makes each project original
-   - If no results found, suggest refining the query
-3. Remind the user: to connect with any researcher, they need to register first with `/rm-start`
+1. Call `research_match_cold_search` with `query` = `$ARGUMENTS` (2–200 characters).
+   Optionally set `max_results` (1–25, default 10).
+2. Present the two result groups separately:
+   - **Registered researchers** (`internal_results`): pseudonym, domain, subdomain, problem,
+     solidity level and date. Cold search deliberately returns no originality scores, no
+     hypothesis text and no contact details — those are gated behind registration and
+     bilateral reveal.
+   - **GitHub repositories** (`github_results`): name, description, URL, language, stars.
+3. If nothing matches, suggest broader keywords (a domain name or a technology works best).
+4. Remind the user: to connect with a registered researcher they need to register first
+   with `/research-match:rm-start`.
 
 ## Notes
-- This is a read-only search — no account needed
-- Results show anonymized researcher IDs (not real names)
-- Originality scores: OT = Theoretical Originality, OFC = Formal-Computational Originality
+- Read-only and free — no account needed.
+- Only pseudonyms are shown, never real names or emails.
+- The internal database grows as more researchers register, so early results may be sparse.

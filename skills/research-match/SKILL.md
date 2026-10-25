@@ -2,7 +2,7 @@
 name: research-match
 description: Research Match connects isolated researchers via literature-grounded originality scoring and bilateral matching. Use when users mention research matching, originality scoring, find collaborators, research collaboration, OT/OFC scores, bilateral matching, research privacy, or academic networking.
 user-invocable: false
-allowed-tools: "mcp__research-match__research_match_register, mcp__research-match__research_match_analyze_work, mcp__research-match__research_match_submit_commit, mcp__research-match__research_match_my_profile, mcp__research-match__research_match_find_collaborators, mcp__research-match__research_match_send_request, mcp__research-match__research_match_inbox, mcp__research-match__research_match_respond_request, mcp__research-match__research_match_rate_user, mcp__research-match__research_match_cold_search, mcp__research-match__research_match_deep_search, mcp__research-match__research_match_prepare_commit, mcp__research-match__research_match_needs_create, mcp__research-match__research_match_needs_list, mcp__research-match__research_match_needs_resolve, mcp__research-match__research_match_reveal_request, mcp__research-match__research_match_reveal_respond, mcp__research-match__research_match_reveal_status, mcp__research-match__research_match_team_license, mcp__research-match__research_match_share_file, mcp__research-match__research_match_shared_files, mcp__research-match__research_match_audit_log, mcp__research-match__research_match_export_contract, mcp__research-match__research_match_confirm_contract, mcp__research-match__research_match_connect_github, mcp__research-match__research_match_disconnect_github, mcp__research-match__research_match_report_bug"
+allowed-tools: "mcp__plugin_research-match_research-match__research_match_register, mcp__plugin_research-match_research-match__research_match_analyze_work, mcp__plugin_research-match_research-match__research_match_submit_commit, mcp__plugin_research-match_research-match__research_match_my_profile, mcp__plugin_research-match_research-match__research_match_find_collaborators, mcp__plugin_research-match_research-match__research_match_send_request, mcp__plugin_research-match_research-match__research_match_inbox, mcp__plugin_research-match_research-match__research_match_respond_request, mcp__plugin_research-match_research-match__research_match_rate_user, mcp__plugin_research-match_research-match__research_match_cold_search, mcp__plugin_research-match_research-match__research_match_deep_search, mcp__plugin_research-match_research-match__research_match_prepare_commit, mcp__plugin_research-match_research-match__research_match_needs_create, mcp__plugin_research-match_research-match__research_match_needs_list, mcp__plugin_research-match_research-match__research_match_needs_resolve, mcp__plugin_research-match_research-match__research_match_reveal_request, mcp__plugin_research-match_research-match__research_match_reveal_respond, mcp__plugin_research-match_research-match__research_match_reveal_status, mcp__plugin_research-match_research-match__research_match_team_license, mcp__plugin_research-match_research-match__research_match_share_file, mcp__plugin_research-match_research-match__research_match_shared_files, mcp__plugin_research-match_research-match__research_match_audit_log, mcp__plugin_research-match_research-match__research_match_export_contract, mcp__plugin_research-match_research-match__research_match_confirm_contract, mcp__plugin_research-match_research-match__research_match_connect_github, mcp__plugin_research-match_research-match__research_match_disconnect_github, mcp__plugin_research-match_research-match__research_match_report_bug"
 ---
 
 # Research Match — Literature-Grounded Research Collaboration
@@ -20,14 +20,14 @@ Scores are 0-100%, with solidity multipliers applied based on evidence quality (
 
 ### Bilateral Matching (Semaphore System)
 When finding collaborators, each pair gets a semaphore:
-- **GREEN**: High mutual gain — both researchers benefit significantly from collaboration
-- **YELLOW**: Moderate gain — some complementary strengths exist
-- **RED**: Low gain — limited collaboration potential
+- **GREEN**: High mutual gain — both researchers benefit significantly from collaboration — or a strong peer pair (both ≥ 70% on OT and OFC, similar profiles)
+- **YELLOW**: Moderate or asymmetric gain — some complementary strengths exist — or a solid peer pair
+- **RED**: Low gain and no shared strength — limited collaboration potential
 
-The system uses a 5-rule calibration to ensure fair matching based on complementary strengths and weaknesses.
+The system uses a 7-rule calibration: four complementarity rules first (what each side gains from the other's strengths), then two peer rules for strong, similar profiles, then RED. Each match reports the rule that fired (`match_rule`).
 
 ### Privacy Model (Levels 1-4)
-1. **Level 1**: Registration — only name, area, keywords visible
+1. **Level 1**: Registration — only your pseudonym is visible (email is stored as a SHA-256 hash)
 2. **Level 2**: Matching — originality scores visible to matches
 3. **Level 3**: Reveals — bilateral consent to view commit content
 4. **Level 4**: File sharing — only after mutual Level 3 consent
@@ -72,13 +72,14 @@ The system uses a 5-rule calibration to ensure fair matching based on complement
 - `report_bug` — Report a bug or issue with Research Match, works anonymously
 
 ## Slash Commands
-Users can also use these slash commands for guided workflows:
-- `/rm-search [query]` — Search for research projects
-- `/rm-start [name]` — Register and submit first commit
-- `/rm-match [user ID]` — Find collaborators and manage requests
-- `/rm-profile [user ID]` — View profile and rate collaborators
-- `/rm-team [team ID]` — Full team management hub
-- `/rm-analyze [GitHub URL]` — Deep analysis and proforma
+Users can also use these slash commands for guided workflows (plugin commands are
+namespaced, so they are typed as `/research-match:<command>`):
+- `/research-match:rm-search [query]` — Search for research projects
+- `/research-match:rm-start [pseudonym]` — Register and submit first commit
+- `/research-match:rm-match` — Find collaborators and manage requests
+- `/research-match:rm-profile` — View profile and rate collaborators
+- `/research-match:rm-team [team ID]` — Full team management hub
+- `/research-match:rm-analyze [GitHub URL]` — Deep analysis and proforma
 
 ## When to Use Research Match
 Activate this skill when users:

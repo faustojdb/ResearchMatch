@@ -18,11 +18,14 @@ import pytest
 from src.research_match_server import (
     OriginalityEvaluator,
     EmbeddingEngine,
+    MatchingEngine,
     ReputationEngine,
     init_database,
     _get_current_user,
     NEUTRAL_NOVELTY_SCORE,
     NEUTRAL_DIVERGENCE_SCORE,
+    PEER_GREEN_FLOOR,
+    PEER_YELLOW_FLOOR,
 )
 
 
@@ -248,3 +251,110 @@ class TestEmbeddingEngineJaccard:
         assert eng.similarity("same text", "same text") == pytest.approx(1.0)
         # Empty input → 0.0.
         assert eng.similarity("", "anything") == 0.0
+
+
+# =====================================================================
+# MatchingEngine — bilateral semaphore, including the peer-match rules
+# =====================================================================
+
+def _match_commit(uid: str, ot: float | None, ofc: float | None, **overrides):
+    """A commit row as `_calculate_match` sees it (same domain → base similarity >= 40)."""
+    base = {
+        "user_id": uid,
+        "pseudonym": f"p-{uid}",
+        "domain": "computer_science",
+        "subdomain": "machine_learning",
+        "problem": "Detecting anomalies in streaming sensor data efficiently.",
+        "ot_score": ot,
+        "ofc_score": ofc,
+        "overall_solidity": "functional",
+    }
+    base.update(overrides)
+    return base
+
+
+class TestMatchingSemaphore:
+    """`_calculate_gain` rewards the OTHER side's strength in MY weakness, so similar
+    profiles always gain ~0 by complementarity. Rules 5-6 of `_calculate_semaphore`
+    must separate strong similar pairs (peers) from weak similar pairs (RED)."""
+
+    def _engine(self):
+        return MatchingEngine(db=None, embeddings=_jaccard_embeddings())
+
+    def _semaphore(self, a_ot, a_ofc, b_ot, b_ofc):
+        eng = self._engine()
+        m = eng._calculate_match(_match_commit("a", a_ot, a_ofc), _match_commit("b", b_ot, b_ofc))
+        assert m is not None, "same domain/problem must pass the base-similarity gate"
+        return m
+
+    def test_complementary_pair_is_green_mutual(self):
+        """A strong theorist + a strong engineer: each covers the other's weakness."""
+        m = self._semaphore(85, 30, 30, 85)
+        assert m["semaphore"] == "green"
+        assert m["semaphore_rule"] == "green_mutual"
+        assert m["a_gains_from_b"] >= 20 and m["b_gains_from_a"] >= 20
+
+    def test_strong_similar_pair_is_a_peer_match_not_red(self):
+        """ROADMAP Stage 1: two equally strong profiles used to fall through to RED."""
+        m = self._semaphore(80, 75, 80, 75)
+        assert m["semaphore"] == "green"
+        assert m["semaphore_rule"] == "green_peer"
+        assert m["peer_strength"] == 75
+        # The reason must be honest about the low complementarity numbers.
+        assert "Par fuerte" in m["semaphore_reason"]
+        assert m["a_gains_from_b"] < 20  # complementarity really is low here
+
+    def test_solid_similar_pair_is_yellow_peer(self):
+        """Both above the YELLOW floor but below the GREEN floor on one axis."""
+        m = self._semaphore(72, 66, 70, 68)
+        assert m["semaphore"] == "yellow"
+        assert m["semaphore_rule"] == "yellow_peer"
+        assert PEER_YELLOW_FLOOR <= m["peer_strength"] < PEER_GREEN_FLOOR
+
+    def test_shared_strength_one_axis_is_yellow_peer(self):
+        """Two strong theorists who are both weak-ish on OFC: a peer, not a RED."""
+        m = self._semaphore(90, 55, 88, 58)
+        assert m["semaphore"] == "yellow"
+        assert m["semaphore_rule"] == "yellow_peer"
+        assert "OFC" in m["semaphore_reason"]  # names the uncovered weakness
+
+    def test_weak_similar_pair_stays_red(self):
+        """Similar AND weak: nobody gains and there is no shared strength → RED."""
+        m = self._semaphore(25, 20, 25, 20)
+        assert m["semaphore"] == "red"
+        assert m["semaphore_rule"] == "red"
+
+    def test_missing_scores_default_to_50_and_stay_red(self):
+        """Commits without scores default to 50/50; the peer floors must not fire on defaults."""
+        m = self._semaphore(None, None, None, None)
+        assert m["semaphore"] == "red"
+        assert m["peer_strength"] == 50
+
+    def test_asymmetric_pair_is_yellow(self):
+        """One side gains a lot, the other almost nothing → YELLOW asimétrico."""
+        m = self._semaphore(40, 40, 85, 80)
+        assert m["semaphore"] == "yellow"
+        assert m["semaphore_rule"] == "yellow_asymmetric"
+        assert m["a_gains_from_b"] > m["b_gains_from_a"]
+
+    def test_complementarity_rules_win_over_peer_rules(self):
+        """Strong peers with a real complementarity gap are still ranked by that gap."""
+        m = self._semaphore(70, 70, 95, 95)
+        # Both >= 70 on both axes, but B gains ~1% from A: asymmetric YELLOW, not green_peer.
+        assert m["semaphore"] == "yellow"
+        assert m["semaphore_rule"] == "yellow_asymmetric"
+
+    def test_semaphore_is_symmetric(self):
+        eng = self._engine()
+        for a, b in [((80, 75), (80, 75)), ((85, 30), (30, 85)), ((40, 40), (85, 80)), ((90, 55), (88, 58))]:
+            ab = eng._calculate_match(_match_commit("a", *a), _match_commit("b", *b))
+            ba = eng._calculate_match(_match_commit("b", *b), _match_commit("a", *a))
+            assert ab["semaphore"] == ba["semaphore"]
+            assert ab["semaphore_rule"] == ba["semaphore_rule"]
+            assert ab["a_gains_from_b"] == ba["b_gains_from_a"]
+
+    def test_semaphore_without_shared_strengths_keeps_old_behaviour(self):
+        """Callers that pass only gains (defaults 0) never trigger the peer rules."""
+        eng = self._engine()
+        assert eng._calculate_semaphore(5.0, 5.0)["rule"] == "red"
+        assert eng._calculate_semaphore(30.0, 30.0)["rule"] == "green_mutual"

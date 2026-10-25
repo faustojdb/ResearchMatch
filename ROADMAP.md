@@ -35,7 +35,7 @@ make truthful, modest self-assessment the winning strategy over inflation.
 
 ## Roadmap stages (trigger-based, not dated)
 
-### Stage 0 — Today (v3.3.0): local-first, single-player value
+### Stage 0 — Today (v3.4.0): local-first, single-player value
 **Status: shipped.** `deep_search` and `submit_commit` work with zero other
 registered users — novelty is grounded in real literature via OpenAlex, and the
 result is honest even with an empty local corpus (a neutral, clearly-labelled score
@@ -46,15 +46,21 @@ reason to try it before it can ask you to seed it.
 **Trigger:** a handful of genuine (non-test) commits registered across a few domains.
 **Unlocks:** `find_collaborators` starts returning real candidates instead of empty
 results; intra-corpus novelty grounding activates alongside OpenAlex.
-**Known engineering debt to fix before/as this happens:** the matching-gain formula
+**Engineering debt paid in 3.4.0 — peer matches:** the matching-gain formula
 (`_calculate_gain`, `src/research_match_server.py`) computes gain from the *positive
-difference* between two profiles' scores (`max(0, their_score - my_score)`). Two
-researchers with **equally strong, similar profiles** produce a difference near zero on
-both sides, which the semaphore (`_calculate_semaphore`) currently reads as low mutual
-benefit — falling through to RED instead of recognizing a strong peer match. Early
-adopters are disproportionately likely to be exactly this kind of strong, similar
-profile, so this needs fixing before real trust is on the line — not after someone gets
-a RED against an obviously great match and writes the product off.
+difference* between two profiles' scores (`max(0, their_score - my_score)`), so two
+researchers with **equally strong, similar profiles** produce near-zero gain on both
+sides. Until 3.3.0 the semaphore (`_calculate_semaphore`) read that as low mutual benefit
+and fell through to RED. Since 3.4.0 the semaphore also receives the strength both
+researchers *share* on each axis (the lower of the two scores) and, only when no
+complementarity rule fires, applies two peer rules: both ≥ `PEER_GREEN_FLOOR` (70) on OT
+and OFC → GREEN "par fuerte"; both ≥ `PEER_YELLOW_FLOOR` (60) on both axes, or a shared
+axis ≥ 70 with the other ≥ `PEER_WEAK_AXIS_FLOOR` (45) → YELLOW "par sólido". Similar
+*and* weak pairs stay RED, and commits with no scores (defaulted to 50) never trigger the
+peer rules. Ranking is still by complementarity; every match now reports the rule that
+fired (`match_rule`). Covered by `tests/test_engines.py::TestMatchingSemaphore`. What is
+still open: tuning the floors against the first real cohort — they were set by reasoning
+about the solidity multipliers (a `speculative` commit caps near 60), not by data.
 
 ### Stage 2 — Search needs real ranking
 **Trigger:** `cold_search` on common queries returns enough results that plain keyword

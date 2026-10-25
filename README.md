@@ -1,6 +1,6 @@
 # Research Match
 
-**MCP server that connects isolated researchers via literature-grounded originality scoring and bilateral matching.**
+**A Claude plugin and MCP server that connects isolated researchers via literature-grounded originality scoring and bilateral matching.**
 
 Research Match helps researchers, scientists, developers, and independent theorists find complementary collaborators while protecting intellectual property. It scores originality on two independent axes — grounding novelty in real published literature (via the free OpenAlex API) using semantic-embedding similarity, combined with a transparent structured self-assessment — and pairs it with bilateral matching via a semaphore system that shows each researcher what they gain from a potential collaboration.
 
@@ -9,7 +9,7 @@ Research Match helps researchers, scientists, developers, and independent theori
 1. **Register** with a pseudonymous identity (email is SHA-256 hashed, never stored in plain text)
 2. **Submit a Research Commit** describing your work — originality is scored on two axes:
    - **Theoretical Originality (OT)**: novelty of hypotheses, interdisciplinary connections, ad-hoc content
-   - **Formal-Computational Originality (OFC)**: code quality, validation power, technical sophistication
+   - **Formal-Computational Originality (OFC)**: code quality, validation power, technical sophistication (self-declared)
 3. **Find Collaborators** — the matching engine identifies researchers with complementary strengths and assigns a bilateral semaphore (GREEN/YELLOW/RED)
 4. **Collaborate** — accept requests, reveal work progressively, share files, generate contracts
 
@@ -20,7 +20,7 @@ Research Match helps researchers, scientists, developers, and independent theori
 - **Bilateral Matching** with perspective-aware reasoning — each side sees gains from their viewpoint
 - **Privacy by Design** — pseudonymous identities, SHA-256 hashed emails, progressive disclosure
 - **Reputation System** — anti-retaliation ratings, exponential smoothing, honesty-weighted
-- **Collaboration Tickets** — structured need_help/question/bug/suggestion system
+- **Collaboration Tickets** — structured need_help/can_offer/warning/question system
 - **Bilateral Reveal System** — consent-based progressive disclosure of research content
 - **Automatic Licensing** — 5-rule system (joint-equal, advisory-only, joint-weighted, time-limited)
 - **File Sharing Registry** — metadata-only sharing with MAD re-sharing detection
@@ -34,43 +34,55 @@ Research Match helps researchers, scientists, developers, and independent theori
 
 ## Installation
 
-Research Match is **local-first**. The recommended path runs the server on your own machine with SQLite storage — it works offline, keeps all data private on your device, and requires no account or API key. A shared remote connector is also available as an optional, experimental convenience.
+Research Match is **local-first**: the server runs on your own machine over stdio with SQLite storage, works offline, keeps all data private on your device, and needs no account or API key. It is packaged as a **Claude plugin** (skill + slash commands + the local MCP server). A shared remote connector exists as an optional, experimental demo.
 
-### For Claude Desktop (Recommended: local)
+### Requirements
 
-The desktop extension runs Research Match locally via UV (Python). Requires [Python 3.12+](https://www.python.org/) and [uv](https://github.com/astral-sh/uv).
+- [uv](https://github.com/astral-sh/uv) on your `PATH`. uv fetches Python 3.12 automatically if you don't have it.
+- A surface that runs local MCP servers: **Claude Code** (terminal, IDE extensions, or the desktop app's Code tab) or **Cowork** in the Claude desktop app. In claude.ai web chat the skill loads but the local server does not start, so the tools are unavailable there.
+- Disk space and a few minutes on first start: `uv` installs the Python dependencies (several hundred MB, including PyTorch for the embedding model). Later starts are instant.
 
-1. Install the Research Match desktop extension (the `.mcpb` bundle) in Claude Desktop
-2. Claude Desktop launches the server locally on demand — all data is stored in a local SQLite database on your machine, and nothing is transmitted to any server
-3. Restart Claude Desktop — you should see 27 Research Match tools available
+### Option 1 — Install the plugin in Claude Code (recommended)
 
-Prefer to run it yourself from source:
+From your shell:
+
+```bash
+claude plugin install research-match --marketplace faustojdb/ResearchMatch
+```
+
+Or inside a Claude Code session:
+
+```
+/plugin install research-match --marketplace faustojdb/ResearchMatch
+```
+
+This adds the repository as a marketplace and installs the `research-match` plugin from it. Update later with `claude plugin update research-match@research-match-marketplace`.
+
+Once the plugin is listed in [Anthropic's directory](https://claude.ai/directory), you will also be able to add it from **Customize > Plugins > Discover** on claude.ai; a plugin added there syncs to Cowork and to your Claude Code sessions.
+
+### Option 2 — Run from source
 
 ```bash
 git clone https://github.com/faustojdb/ResearchMatch.git
 cd ResearchMatch
-uv run research-match
+claude --plugin-dir .            # load the checkout as a plugin for one session
 ```
 
-This starts the server in stdio mode with local SQLite storage. Set `RESEARCH_MATCH_DB` to customize the database path.
-
-### For Claude Code (CLI, local)
+or register only the MCP server, without the skill and slash commands:
 
 ```bash
-git clone https://github.com/faustojdb/ResearchMatch.git
-cd ResearchMatch
-claude mcp add research-match -- uv run --directory . research-match
+claude mcp add research-match -- uv run --directory /path/to/ResearchMatch --frozen research-match
 ```
 
-### Optional: Experimental remote connector
+### Option 3 — Claude Desktop extension (.mcpb, manual install)
 
-> **Experimental.** A shared hosted instance runs on Google Cloud Run for quick trials without a local Python setup. This shared remote mode currently has **no authentication** — until OAuth lands, do **not** put sensitive or unpublished research into the hosted instance. Use local mode for anything private.
+A desktop-extension bundle can still be built with `mcpb pack` (or `./build_alpha.sh`) and installed by hand in Claude Desktop under **Settings > Extensions > Advanced settings > Install Extension…**. Note that Anthropic no longer lists desktop extensions in its directory, so this is a side channel, not the main distribution path.
 
-Claude Desktop — go to **Settings > Connectors** and add the URL:
+### Option 4 — Experimental remote connector
 
-```
-https://research-match-77626397872.us-central1.run.app/mcp/
-```
+> **Experimental — demo only.** A shared hosted instance runs on Google Cloud Run so you can try the tools without a local Python setup. It has **no authentication** (identity is a self-asserted email hash) and it is **not kept in lockstep with releases** — check `/health` for the version it is serving. Do **not** put sensitive or unpublished research into the hosted instance; use local mode for anything private.
+
+Claude Desktop: **Settings > Connectors**, add `https://research-match-77626397872.us-central1.run.app/mcp/`.
 
 Claude Code:
 
@@ -78,30 +90,36 @@ Claude Code:
 claude mcp add research-match --transport http https://research-match-77626397872.us-central1.run.app/mcp/
 ```
 
-If your Claude Desktop version lacks the Connectors option, bridge with `mcp-remote` (requires [Node.js](https://nodejs.org/)) by adding this to `claude_desktop_config.json`:
+### Where your data lives
 
-| OS | Config file path |
-|----|------------------|
-| macOS | `~/Library/Application Support/Claude/claude_desktop_config.json` |
-| Windows | `%APPDATA%\Claude\claude_desktop_config.json` |
-
-```json
-{
-  "mcpServers": {
-    "research-match": {
-      "command": "npx",
-      "args": [
-        "mcp-remote",
-        "https://research-match-77626397872.us-central1.run.app/mcp/"
-      ]
-    }
-  }
-}
-```
+In plugin mode the SQLite database is stored in the plugin's persistent data directory (`${CLAUDE_PLUGIN_DATA}/research_match.db`, which survives plugin updates). Set `RESEARCH_MATCH_DB` to use another path. Databases created by releases before 3.4.0 (which lived inside the plugin folder) are migrated automatically on first start.
 
 ### Getting Started
 
-Once connected, start by saying: *"Register me on Research Match"* — Claude will call the register tool and guide you through the flow.
+Once installed, say: *"Register me on Research Match"* — Claude will ask for the email you want to register with (only its hash is stored) and guide you through the flow. Slash commands are namespaced under the plugin name:
+
+| Command | Purpose |
+|---------|---------|
+| `/research-match:rm-search <query>` | Cold search — no account needed |
+| `/research-match:rm-start [pseudonym]` | Register and submit a first Research Commit |
+| `/research-match:rm-analyze <GitHub URL>` | Deep repository analysis or proforma workflow |
+| `/research-match:rm-match` | Find collaborators, send and answer requests |
+| `/research-match:rm-profile` | Profile, inbox, rate collaborators |
+| `/research-match:rm-team <team ID>` | Tickets, reveals, license, files, audit log, contracts |
+
+## What this plugin runs, sends and fetches
+
+Everything the plugin does is in this repository's readable source. In summary:
+
+- **Runs**: `uv run --frozen research-match` from the plugin folder — a Python stdio MCP server (`src/research_match_server.py`). Dependencies are pinned in `uv.lock`.
+- **Writes locally**: one SQLite database (see *Where your data lives*) and uv's dependency cache. No other files are written.
+- **Network calls, local mode**:
+  - `api.openalex.org` — originality scoring sends only your domain/topic search terms to find related published works. Disable with `RESEARCH_MATCH_DISABLE_OPENALEX=1`.
+  - `api.github.com` — `cold_search` repository search, `deep_search` repository metadata, and the GitHub App calls behind `connect_github` (only if a GitHub App is configured by the operator).
+  - `huggingface.co` — one-time download of the `all-MiniLM-L6-v2` sentence-embedding model on first scoring, cached locally afterwards. If the download fails the server falls back to word-overlap (Jaccard) similarity.
+  - PyPI (via uv) — dependency installation on first start.
+- **Network calls, hosted mode only**: Google Cloud Firestore for storage. Algolia is referenced in the code but is not configured.
+- **Never**: no telemetry, no analytics, no conversation content, no raw email addresses (only SHA-256 hashes).
 
 ## Tools
 
@@ -135,6 +153,8 @@ Once connected, start by saying: *"Register me on Research Match"* — Claude wi
 | 26 | `disconnect_github` | Disconnect GitHub and revoke repo access |
 | 27 | `report_bug` | Report a bug — works without registration |
 
+All tool names are prefixed `research_match_` on the wire (e.g. `research_match_register`).
+
 ## Examples
 
 ### Example 1: Register and Submit Research
@@ -167,7 +187,7 @@ Once connected, start by saying: *"Register me on Research Match"* — Claude wi
 
 **User prompt**: *"Search Research Match for anyone working on quantum error correction."*
 
-**What happens**: Claude calls `cold_search` with keywords `["quantum", "error", "correction"]`. This tool requires no registration — anyone can search. Cold search returns basic public info only — no scores, and NOT the full hypothesis text (the hypothesis is gated behind bilateral reveal / progressive disclosure).
+**What happens**: Claude calls `cold_search` with the query `quantum error correction`. This tool requires no registration — anyone can search. Cold search returns basic public info only — no scores, and NOT the full hypothesis text (the hypothesis is gated behind bilateral reveal / progressive disclosure).
 
 **Expected output** (from `cold_search`):
 ```json
@@ -197,7 +217,7 @@ Once connected, start by saying: *"Register me on Research Match"* — Claude wi
   "status": "reported",
   "report_id": "a1b2c3d4-...",
   "severity": "medium",
-  "server_version": "3.3.0",
+  "server_version": "3.4.0",
   "reporter": "anonymous",
   "message": "Bug report received (severity: medium). Report ID: a1b2c3d4-.... Thank you for helping improve Research Match!"
 }
@@ -218,42 +238,52 @@ originality scoring only get better as real, honest work gets registered. See
 [ROADMAP.md](ROADMAP.md) for exactly what your registration unlocks and what
 happens next as real usage grows.
 
-## Requirements
-
-- **Claude Desktop** or **Claude Code** (for MCP client)
-- No local dependencies needed when using the Cloud Run server
-- For local development: Python 3.12+, [uv](https://github.com/astral-sh/uv)
-
 ## Architecture
 
-- **Backend**: Python + [FastMCP](https://github.com/jlowin/fastmcp) framework
-- **Database**: Firebase Firestore (production) / SQLite (local development)
-- **Search**: keyword matching over Firestore/SQLite. Algolia full-text indexing is an
+- **Backend**: Python + [FastMCP](https://github.com/jlowin/fastmcp) framework (`mcp` SDK)
+- **Database**: SQLite (local-first default) / Firebase Firestore (hosted, experimental)
+- **Search**: keyword matching over SQLite/Firestore. Algolia full-text indexing is an
   optional, currently-unconfigured enhancement — `cold_search` works fully without it.
 - **Novelty grounding**: OpenAlex (free, no key) for literature-grounded originality scoring
 - **Embeddings**: sentence-transformers (all-MiniLM-L6-v2) with Jaccard fallback
 - **GitHub Integration**: GitHub App for bilateral repo access (PyJWT + httpx)
-- **Hosting**: Google Cloud Run (streamable-http transport)
+- **Hosting (optional)**: Google Cloud Run (streamable-http transport)
+- **Plugin layout**: `.claude-plugin/plugin.json` (manifest), `.mcp.json` (local server), `skills/research-match/SKILL.md`, `commands/*.md`
+
+## Development
+
+```bash
+git clone https://github.com/faustojdb/ResearchMatch.git
+cd ResearchMatch
+uv sync --extra dev
+RESEARCH_MATCH_DISABLE_OPENALEX=1 uv run pytest -q      # offline unit tests (emulator tests auto-skip)
+claude plugin validate .                                 # manifest / component checks
+claude --plugin-dir .                                    # try the plugin in a session
+git config core.hooksPath .githooks                      # enable the secret-guard pre-commit hook
+```
+
+See [SUBMISSION.md](SUBMISSION.md) for the directory submission checklist, [SECURITY.md](SECURITY.md) for the threat model and secret handling, and [ROADMAP.md](ROADMAP.md) for what comes next.
 
 ## Privacy Policy
 
 See [PRIVACY_POLICY.md](PRIVACY_POLICY.md) for the full privacy policy.
 
-**Summary**: Research Match hashes your email with SHA-256 (never stores plain text), uses pseudonymous identities, and shares research data only through bilateral consent. No advertising, no data sales, no tracking. Data is stored in Google Cloud Firestore (encrypted at rest and in transit). See the full policy for details on data collection, usage, retention, and your rights.
+**Summary**: Research Match hashes your email with SHA-256 (never stores plain text), uses pseudonymous identities, and shares research data only through bilateral consent. No advertising, no data sales, no tracking. In local mode all data stays in a SQLite file on your machine; the optional hosted instance stores data in Google Cloud Firestore (encrypted at rest and in transit). See the full policy for details on data collection, usage, retention, and your rights.
 
 ## Support
 
 - **Issues**: [github.com/faustojdb/ResearchMatch/issues](https://github.com/faustojdb/ResearchMatch/issues)
-- **Bug reports**: Use the built-in `report_bug` tool directly from Claude Desktop or Claude Code
-- **Developer**: [github.com/faustojdb](https://github.com/faustojdb)
+- **Bug reports**: Use the built-in `report_bug` tool directly from Claude
+- **Security**: see [SECURITY.md](SECURITY.md)
+- **Developer**: Fausto Jose Di Bacco — [github.com/faustojdb](https://github.com/faustojdb) — faustojdb@gmail.com
 
 ## License
 
-This project is licensed under the [Business Source License 1.1](LICENSE).
+This project is licensed under the [Business Source License 1.1](LICENSE) (SPDX: `BUSL-1.1`).
 
 - **Licensor**: Fausto Jose Di Bacco
 - **Licensed Work**: ResearchMatch
-- **Additional Use Grant**: You may use and redistribute the Licensed Work for any non-commercial purpose, including non-commercial production use and distribution through application directories and marketplaces (such as the Anthropic MCP directory). You may NOT use it for a commercial purpose, which includes selling or leasing it, or offering it to third parties as a paid hosted or managed service (SaaS).
+- **Additional Use Grant**: You may use and redistribute the Licensed Work for any non-commercial purpose, including non-commercial production use and distribution through application directories and marketplaces (such as the Anthropic directory). You may NOT use it for a commercial purpose, which includes selling or leasing it, or offering it to third parties as a paid hosted or managed service (SaaS).
 - **Change Date**: February 18, 2031
 - **Change License**: Apache License, Version 2.0
 

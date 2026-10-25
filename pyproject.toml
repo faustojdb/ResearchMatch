@@ -1,12 +1,12 @@
 [project]
 name = "research-match"
-version = "3.3.0"
+version = "3.4.0"
 description = "MCP server that connects isolated researchers via literature-grounded originality scoring and bilateral matching."
 authors = [
     { name = "faustojdb", email = "faustojdb@gmail.com" }
 ]
 readme = "README.md"
-license = { text = "BSL-1.1" }
+license = { text = "BUSL-1.1" }
 urls = { homepage = "https://github.com/faustojdb/ResearchMatch" }
 keywords = ["research", "mcp", "ai", "matching", "originality", "collaboration"]
 requires-python = ">=3.12"

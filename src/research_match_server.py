@@ -125,8 +125,55 @@ def _log_tool_call(func):
 # CONSTANTS
 # =============================================================================
 
-DB_PATH = os.environ.get("RESEARCH_MATCH_DB") or "research_match.db"
-SERVER_VERSION = "3.3.0"
+def _resolve_db_path() -> str:
+    """Resolve the SQLite database path.
+
+    Falls back to the default relative path when RESEARCH_MATCH_DB is unset *or* still
+    contains an unexpanded ``${VAR}`` placeholder — e.g. ``${CLAUDE_PLUGIN_DATA}`` on a
+    plugin host that does not substitute that variable yet. Without this guard sqlite
+    would create a literal ``${CLAUDE_PLUGIN_DATA}`` directory.
+    """
+    raw = os.environ.get("RESEARCH_MATCH_DB", "").strip()
+    if not raw or "${" in raw:
+        return "research_match.db"
+    return os.path.expanduser(raw)
+
+
+DB_PATH = _resolve_db_path()
+
+_LEGACY_DB_PATH = "research_match.db"
+
+
+def _migrate_legacy_db(new_path: str) -> None:
+    """One-time copy of a pre-3.4 database into the new plugin data location.
+
+    Releases before 3.4.0 wrote ``research_match.db`` into the plugin install folder
+    (the process cwd). That folder is replaced on every plugin update, so 3.4.0 moved
+    the database to ``${CLAUDE_PLUGIN_DATA}``. If the new path does not exist yet but a
+    legacy file is sitting in the cwd, copy it with sqlite's online backup API (which
+    also captures un-checkpointed WAL pages) so users keep their registrations.
+    """
+    try:
+        if os.path.abspath(new_path) == os.path.abspath(_LEGACY_DB_PATH):
+            return
+        if os.path.exists(new_path) or not os.path.exists(_LEGACY_DB_PATH):
+            return
+        parent = os.path.dirname(os.path.abspath(new_path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        src = sqlite3.connect(_LEGACY_DB_PATH)
+        try:
+            dst = sqlite3.connect(new_path)
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+        finally:
+            src.close()
+        _logger.info("Migrated legacy database %s -> %s", _LEGACY_DB_PATH, new_path)
+    except Exception as exc:  # never block startup on a failed migration
+        _logger.warning("Legacy database migration skipped: %s", exc)
+SERVER_VERSION = "3.4.0"
 
 # Scoring weights for Theoretical Originality (OT)
 OT_WEIGHTS = {
@@ -164,6 +211,14 @@ YELLOW_MAX_GAIN_THRESHOLD = 25   # Max >= 25 para YELLOW
 YELLOW_MIN_GAIN_MODERATE = 5     # Min >= 5 para YELLOW moderado
 YELLOW_AVG_THRESHOLD = 12        # Avg >= 12 para YELLOW moderado
 WEAKNESS_BONUS_COEFFICIENT = 0.15
+# Peer-match floors (3.4.0). Gains are computed from the POSITIVE DIFFERENCE between two
+# profiles, so two researchers who are both strong on both axes gain almost nothing "by
+# complementarity" in either direction and, before 3.4.0, fell through to RED. When no
+# complementarity rule fires, these floors recognise a strong peer pair instead
+# (ROADMAP Stage 1). "Shared" strength on an axis = the lower of the two scores.
+PEER_GREEN_FLOOR = 70        # Both >= 70 on OT AND on OFC → GREEN (par fuerte)
+PEER_YELLOW_FLOOR = 60       # Both >= 60 on OT AND on OFC → YELLOW (par sólido)
+PEER_WEAK_AXIS_FLOOR = 45    # Shared >= PEER_GREEN_FLOOR on one axis and >= 45 on the other → YELLOW
 
 # Rating constants
 RATING_MIN = 1
@@ -350,6 +405,11 @@ class EmbeddingEngine:
 
 def init_database(db_path: str) -> sqlite3.Connection:
     """Initialize SQLite database with Research Match schema."""
+    # The plugin stores its database under ${CLAUDE_PLUGIN_DATA}, which may not exist
+    # yet on first run — create the parent directory so sqlite can open the file.
+    parent = os.path.dirname(os.path.abspath(db_path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
@@ -1356,8 +1416,14 @@ class MatchingEngine:
 
         complementarity = (a_gains + b_gains) / 2
 
+        # Peer strength: what BOTH researchers bring on each axis (the lower of the two).
+        # Lets the semaphore recognise strong, similar profiles whose gains are ~0.
+        shared_ot = min(user_ot, cand_ot)
+        shared_ofc = min(user_ofc, cand_ofc)
+
         # Phase 3: Semaphore
-        semaphore = self._calculate_semaphore(a_gains, b_gains)
+        semaphore = self._calculate_semaphore(
+            a_gains, b_gains, shared_ot=shared_ot, shared_ofc=shared_ofc)
 
         return {
             "candidate_pseudonym": candidate_commit.get("pseudonym", "Unknown"),
@@ -1365,6 +1431,8 @@ class MatchingEngine:
             "base_similarity": round(base_sim, 1),
             "complementarity_score": round(complementarity, 1),
             "semaphore": semaphore["color"],
+            "semaphore_rule": semaphore.get("rule", ""),
+            "peer_strength": round(min(shared_ot, shared_ofc), 1),
             "semaphore_reason": semaphore["reason_for_a"],
             "semaphore_reason_for_candidate": semaphore["reason_for_b"],
             "semaphore_summary": semaphore["summary"],
@@ -1411,24 +1479,43 @@ class MatchingEngine:
         total = ot_gain + ofc_gain + weakness_bonus_ot + weakness_bonus_ofc
         return min(100.0, total)
 
-    def _calculate_semaphore(self, a_gains: float, b_gains: float) -> Dict[str, str]:
+    def _calculate_semaphore(self, a_gains: float, b_gains: float,
+                             shared_ot: float = 0.0, shared_ofc: float = 0.0) -> Dict[str, str]:
         """Calculate the bilateral convenience semaphore with reasoning.
 
-        Rules (evaluated in order):
+        ``a_gains`` / ``b_gains`` come from ``_calculate_gain`` (complementarity: what each
+        side gains from the other's strengths in its own weaknesses). ``shared_ot`` /
+        ``shared_ofc`` are the strength BOTH researchers have on each axis — the lower of
+        the two scores. They default to 0 so a caller that only knows the gains keeps the
+        pre-3.4 behaviour (rules 5-6 never fire).
+
+        Rules (evaluated in order; the first that fires wins):
         1. GREEN fuerte: min_gain >= 20 (ambos ganan mucho)
-        2. GREEN complementario: max >= 40, avg >= 20, min >= 3
+        2. GREEN complementario: max >= 40, avg >= 20, min >= 4
         3. YELLOW: max >= 25 (al menos uno gana bien, sub-niveles por min_gain)
-        4. YELLOW moderado: avg >= 12, min >= 3 (ganancia moderada bilateral)
-        5. RED: todo lo demas
+        4. YELLOW moderado: avg >= 12, min >= 4 (ganancia moderada bilateral)
+        5. GREEN par fuerte: ambos >= PEER_GREEN_FLOOR en OT y en OFC
+        6. YELLOW par sólido: ambos >= PEER_YELLOW_FLOOR en los dos ejes, o comparten un
+           eje >= PEER_GREEN_FLOOR y el otro >= PEER_WEAK_AXIS_FLOOR
+        7. RED: todo lo demás
+
+        Rules 5-6 exist because gains are computed from the positive difference between
+        profiles: two equally strong, similar researchers gain little "by complementarity"
+        and used to fall through to RED (ROADMAP Stage 1). Complementarity rules 1-4 are
+        evaluated first, so the ranking signal (``complementarity_score``) is unchanged.
+        Every result carries a ``rule`` key naming the rule that fired.
         """
         min_gain = min(a_gains, b_gains)
         max_gain = max(a_gains, b_gains)
         avg_gain = (a_gains + b_gains) / 2
+        peer_strength = min(shared_ot, shared_ofc)   # weakest shared axis
+        peer_best_axis = max(shared_ot, shared_ofc)  # strongest shared axis
 
         # Rule 1: GREEN fuerte — ambos ganan mucho
         if min_gain >= GREEN_MUTUAL_THRESHOLD:
             return {
                 "color": "green",
+                "rule": "green_mutual",
                 "reason_for_a": f"Alta conveniencia mutua. Ganás {a_gains:.0f}% y aportás {b_gains:.0f}%. Colaboración equilibrada.",
                 "reason_for_b": f"Alta conveniencia mutua. Ganás {b_gains:.0f}% y aportás {a_gains:.0f}%. Colaboración equilibrada.",
                 "summary": "Ambos se benefician significativamente. Match recomendado."
@@ -1439,6 +1526,7 @@ class MatchingEngine:
             weak_side = "a" if a_gains < b_gains else "b"
             return {
                 "color": "green",
+                "rule": "green_complementary",
                 "reason_for_a": (
                     f"Alta complementariedad. Ganás {a_gains:.0f}% y aportás {b_gains:.0f}%. "
                     f"{'Tu aporte compensa con tu especialización única.' if weak_side == 'a' else 'Gran beneficio de la complementariedad del otro.'}"
@@ -1454,12 +1542,15 @@ class MatchingEngine:
         if max_gain >= YELLOW_MAX_GAIN_THRESHOLD:
             if min_gain >= YELLOW_MIN_GAIN_MODERATE:
                 sub = "moderado"
+                rule = "yellow_moderate"
                 detail = "Ambos obtienen beneficio, aunque asimétrico."
             else:
                 sub = "asimétrico"
+                rule = "yellow_asymmetric"
                 detail = "Un lado se beneficia mucho más. Considerar negociación de términos."
             return {
                 "color": "yellow",
+                "rule": rule,
                 "reason_for_a": f"Match {sub}. Ganás {a_gains:.0f}% y aportás {b_gains:.0f}%. {detail}",
                 "reason_for_b": f"Match {sub}. Ganás {b_gains:.0f}% y aportás {a_gains:.0f}%. {detail}",
                 "summary": f"Match {sub} (max {max_gain:.0f}%, min {min_gain:.0f}%). Funcional con negociación."
@@ -1469,19 +1560,57 @@ class MatchingEngine:
         if avg_gain >= YELLOW_AVG_THRESHOLD and min_gain >= GREEN_MIN_GAIN_FLOOR:
             return {
                 "color": "yellow",
+                "rule": "yellow_bilateral",
                 "reason_for_a": f"Conveniencia moderada. Ganás {a_gains:.0f}% y aportás {b_gains:.0f}%. Beneficio modesto pero bilateral.",
                 "reason_for_b": f"Conveniencia moderada. Ganás {b_gains:.0f}% y aportás {a_gains:.0f}%. Beneficio modesto pero bilateral.",
                 "summary": f"Ganancia moderada bilateral (avg {avg_gain:.0f}%). Viable con interés mutuo."
             }
 
-        # Rule 5: RED — beneficio insuficiente
+        # Rule 5: GREEN par fuerte — perfiles parecidos y ambos fuertes en los dos ejes.
+        # La complementariedad es baja por construcción (diferencias ~0), no por debilidad.
+        if peer_strength >= PEER_GREEN_FLOOR:
+            peer_note = (
+                f"Ambos superan {PEER_GREEN_FLOOR:.0f}% en OT y en OFC. La ganancia por "
+                f"complementariedad es baja porque sus perfiles se parecen, no porque falte nivel."
+            )
+            return {
+                "color": "green",
+                "rule": "green_peer",
+                "reason_for_a": f"Par fuerte. {peer_note} Ganás {a_gains:.0f}% y aportás {b_gains:.0f}% por complementariedad; el valor está en trabajar entre pares del mismo nivel.",
+                "reason_for_b": f"Par fuerte. {peer_note} Ganás {b_gains:.0f}% y aportás {a_gains:.0f}% por complementariedad; el valor está en trabajar entre pares del mismo nivel.",
+                "summary": f"Par fuerte (ambos ≥ {PEER_GREEN_FLOOR:.0f}% en los dos ejes). Match recomendado entre pares."
+            }
+
+        # Rule 6: YELLOW par sólido — ambos sólidos en los dos ejes, o una fortaleza en
+        # común sin que ninguno cubra la debilidad del otro.
+        if peer_strength >= PEER_YELLOW_FLOOR or (
+            peer_best_axis >= PEER_GREEN_FLOOR and peer_strength >= PEER_WEAK_AXIS_FLOOR
+        ):
+            if peer_strength >= PEER_YELLOW_FLOOR:
+                peer_note = f"Ambos superan {PEER_YELLOW_FLOOR:.0f}% en OT y en OFC."
+            else:
+                strong_axis = "OT" if shared_ot >= shared_ofc else "OFC"
+                weak_axis = "OFC" if strong_axis == "OT" else "OT"
+                peer_note = (
+                    f"Comparten una fortaleza en {strong_axis} (ambos ≥ {PEER_GREEN_FLOOR:.0f}%), "
+                    f"pero ninguno cubre la debilidad del otro en {weak_axis}."
+                )
+            return {
+                "color": "yellow",
+                "rule": "yellow_peer",
+                "reason_for_a": f"Par sólido. {peer_note} Ganás {a_gains:.0f}% y aportás {b_gains:.0f}% por complementariedad. Viable como colaboración entre pares.",
+                "reason_for_b": f"Par sólido. {peer_note} Ganás {b_gains:.0f}% y aportás {a_gains:.0f}% por complementariedad. Viable como colaboración entre pares.",
+                "summary": f"Par sólido. {peer_note} Complementariedad baja; viable con interés mutuo."
+            }
+
+        # Rule 7: RED — beneficio insuficiente
         return {
             "color": "red",
+            "rule": "red",
             "reason_for_a": f"Baja conveniencia. Ganás {a_gains:.0f}% y aportás {b_gains:.0f}%. Insuficiente para justificar colaboración.",
             "reason_for_b": f"Baja conveniencia. Ganás {b_gains:.0f}% y aportás {a_gains:.0f}%. Insuficiente para justificar colaboración.",
             "summary": "Beneficio insuficiente para ambas partes."
         }
-
 
 # =============================================================================
 # PYDANTIC INPUT MODELS
@@ -3319,7 +3448,7 @@ async def research_match_register(params: RegisterInput, ctx: Context = None) ->
 @mcp.tool(
     name="research_match_submit_commit",
     description=(
-        "STEP 2 — Submit a structured Research Commit for AI originality evaluation. "
+        "STEP 2 — Submit a structured Research Commit for literature-grounded originality scoring. "
         "IMPORTANT: Call research_match_analyze_work FIRST to get the template, then fill it with the user's work context. "
         "The commit is evaluated on two independent axes: "
         "Theoretical Originality (OT) — novelty of hypotheses, interdisciplinary connections, ad hoc content; "
@@ -3340,7 +3469,7 @@ async def research_match_register(params: RegisterInput, ctx: Context = None) ->
 )
 @_log_tool_call
 async def research_match_submit_commit(params: SubmitCommitInput, ctx: Context = None) -> str:
-    """Submit a Research Commit for AI evaluation.
+    """Submit a Research Commit for literature-grounded originality scoring.
 
     Args:
         params (SubmitCommitInput): Structured research commit with:
@@ -3592,7 +3721,7 @@ async def research_match_my_profile(ctx: Context = None) -> str:
         "STEP 3 — Find researchers with COMPLEMENTARY skills in the same domain. "
         "Requires at least one submitted commit (call research_match_submit_commit first). "
         "Returns candidates ranked by complementarity score, each with: "
-        "bilateral semaphore (GREEN=high mutual benefit, YELLOW=asymmetric, RED=low benefit), "
+        "bilateral semaphore (GREEN=high mutual benefit or strong peers, YELLOW=asymmetric, moderate or solid peers, RED=low benefit), "
         "what YOU gain from them and what THEY gain from you (percentage), "
         "their OT/OFC scores, reputation badge, and solidity level. "
         "The semaphore reason explains WHY the match is convenient or not FROM EACH PERSPECTIVE. "
@@ -3694,6 +3823,7 @@ async def research_match_find_collaborators(params: FindCollaboratorsInput, ctx:
             "semaphore": f"{_semaphore_emoji(m['semaphore'])} {m['semaphore'].upper()}",
             "semaphore_reason": m.get("semaphore_reason", ""),
             "semaphore_summary": m.get("semaphore_summary", ""),
+            "match_rule": m.get("semaphore_rule", ""),
             "base_similarity": f"{m['base_similarity']}%",
             "complementarity": f"{m['complementarity_score']}%",
             "you_gain": f"{m['a_gains_from_b']}%",
@@ -4388,6 +4518,13 @@ def _cold_search_github(query: str, limit: int) -> List[Dict]:
         "technologies ('rust compiler'), or broad fields ('quantum computing'). "
         "If no results, try broader keywords. Internal DB grows as more researchers join."
     ),
+    annotations={
+        "title": "Cold Search (No Registration)",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
 )
 @_log_tool_call
 async def research_match_cold_search(params: ColdSearchInput, ctx: Context = None) -> str:
@@ -7145,6 +7282,7 @@ def main():
 
     if not use_firestore:
         # SQLite mode: ensure DB schema exists before server starts
+        _migrate_legacy_db(DB_PATH)
         _boot_db = init_database(DB_PATH)
         _boot_db.close()
         _logger.info("Database initialized at %s", DB_PATH)

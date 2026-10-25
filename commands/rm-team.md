@@ -1,47 +1,60 @@
 ---
 name: rm-team
-description: Manage your research collaboration team. Access tickets, reveals, licensing, file sharing, audit logs, and contracts. Use after accepting a collaboration request.
+description: Manage a research collaboration team — tickets, consent-based reveals, automatic licensing, file-sharing registry, audit log, git-verifiable contracts and GitHub repo access. Use after a collaboration request is accepted.
 argument-hint: "[team ID]"
 disable-model-invocation: true
-allowed-tools: "mcp__research-match__research_match_needs_create, mcp__research-match__research_match_needs_list, mcp__research-match__research_match_needs_resolve, mcp__research-match__research_match_reveal_request, mcp__research-match__research_match_reveal_respond, mcp__research-match__research_match_reveal_status, mcp__research-match__research_match_team_license, mcp__research-match__research_match_share_file, mcp__research-match__research_match_shared_files, mcp__research-match__research_match_audit_log, mcp__research-match__research_match_export_contract, mcp__research-match__research_match_confirm_contract"
+allowed-tools: "mcp__plugin_research-match_research-match__research_match_needs_create, mcp__plugin_research-match_research-match__research_match_needs_list, mcp__plugin_research-match_research-match__research_match_needs_resolve, mcp__plugin_research-match_research-match__research_match_reveal_request, mcp__plugin_research-match_research-match__research_match_reveal_respond, mcp__plugin_research-match_research-match__research_match_reveal_status, mcp__plugin_research-match_research-match__research_match_team_license, mcp__plugin_research-match_research-match__research_match_share_file, mcp__plugin_research-match_research-match__research_match_shared_files, mcp__plugin_research-match_research-match__research_match_audit_log, mcp__plugin_research-match_research-match__research_match_export_contract, mcp__plugin_research-match_research-match__research_match_confirm_contract, mcp__plugin_research-match_research-match__research_match_connect_github, mcp__plugin_research-match_research-match__research_match_disconnect_github"
 ---
 
-# Research Match — Team Management Hub
+# Research Match — Team Hub
 
-Team ID: **$ARGUMENTS**
+Team ID: **$ARGUMENTS** (ask for it if missing; it comes from the accepted request or
+`research_match_my_profile`). Ask what the user needs, then run the matching flow with the
+exact field values below.
 
-## Available Actions
+### 1. Tickets
+- **Create**: `research_match_needs_create` — `team_id`, `type` (need_help, can_offer,
+  warning, question), `area` (theory, code, data, review, infrastructure), `title`,
+  `description`, `priority` (critical, important, nice_to_have).
+- **List**: `research_match_needs_list` — `team_id`, optional `status` (open, in_progress,
+  resolved, wont_fix), `area`, `type`.
+- **Resolve**: `research_match_needs_resolve` — `ticket_id`, `resolution` (resolved or
+  wont_fix), optional `resolution_note`. Resolving a teammate's ticket boosts effort reputation.
 
-Ask the user what they need, then execute the appropriate flow:
+### 2. Reveals (consent-based disclosure of Research Commit content)
+- **Request**: `research_match_reveal_request` — `team_id`, `target_user_id`.
+- **Respond**: `research_match_reveal_respond` — `consent_id`, `approve` (true/false).
+  Approval triggers a license recalculation.
+- **Status**: `research_match_reveal_status` — `team_id`. Shows the consent matrix and any
+  content already approved for the user.
+- Nothing is shown until the owner approves.
 
-### 1. Tickets (needs_create, needs_list, needs_resolve)
-- **Create ticket**: Ask for type (need_help, question, bug_report, feature_request) and description
-- **List tickets**: Show all open tickets for the team
-- **Resolve ticket**: Mark a ticket as resolved with a resolution message
+### 3. License
+- `research_match_team_license` — `team_id`. Shows (and recalculates) the automatic license:
+  joint-equal, advisory-only, joint-weighted or time-limited, with contribution percentages.
 
-### 2. Reveals (reveal_request, reveal_respond, reveal_status)
-- **Request reveal**: Ask to see a teammate's commit content (bilateral consent required)
-- **Respond to reveal**: Accept or decline a reveal request from teammate
-- **Reveal status**: Show the reveal matrix — who has consented to share what
-- Both parties must consent before any content is shown (privacy-first)
+### 4. File sharing (metadata only)
+- **Share**: `research_match_share_file` — `team_id`, `file_path`, optional `file_hash`
+  (SHA-256) and `description`. Requires bilateral reveals first. Re-sharing another
+  member's file is detected and penalises honesty reputation.
+- **List**: `research_match_shared_files` — `team_id`.
 
-### 3. License (team_license)
-- View the automatically computed license for the collaboration
-- License types: joint-equal, advisory-only, joint-weighted, time-limited
-- Contribution percentages are calculated from commits, reveals, and resolved tickets
+### 5. Audit log
+- `research_match_audit_log` — `team_id`, optional `action_filter` (e.g. file_shared,
+  violation_detected, license_generated) and `limit` (1–200).
 
-### 4. File Sharing (share_file, shared_files)
-- **Share a file**: Register file metadata (path, description, hash) — requires bilateral Level 3 reveals
-- **List shared files**: See all files shared in the team
-- Re-sharing detection (MAD): sharing another user's file tanks your honesty score
+### 6. Contracts
+- **Export**: `research_match_export_contract` — `team_id`. Returns a markdown contract with
+  parties, scores, license terms and verification instructions. The user commits it to git.
+- **Confirm**: `research_match_confirm_contract` — `team_id`, `contract_id`,
+  `git_commit_hash` (40-character lowercase hex), optional `repo_url`. Both members must
+  confirm. When both have connected GitHub, read-only repo access is granted bilaterally.
 
-### 5. Audit Log (audit_log)
-- View the immutable audit trail for the team
-- Filter by action type: license_generated, reveal_approved, violation_detected, etc.
+### 7. GitHub access
+- **Connect**: `research_match_connect_github` — `github_username`. Returns the GitHub App
+  installation link if needed.
+- **Disconnect**: `research_match_disconnect_github` — `confirm` must be true; revokes all
+  access granted through Research Match.
 
-### 6. Contracts (export_contract, confirm_contract)
-- **Export contract**: Generate a markdown collaboration contract with scores, license, and verification instructions
-- **Confirm contract**: Confirm a contract with a git commit hash (bilateral — both parties must confirm)
-
-## Collaboration Flow
-The typical progression is: Tickets → Reveals → File Sharing → License Review → Contract
+## Typical progression
+Tickets → Reveals → License review → File sharing → Contract → GitHub access
