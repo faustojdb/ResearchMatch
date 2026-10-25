@@ -167,12 +167,23 @@ def _resolve_db_path() -> str:
     because Claude Desktop expands ``${HOME}`` in ``env`` but not inside a user_config
     default). A value that is empty or still contains an unexpanded ``${VAR}``
     placeholder is ignored — without this guard sqlite would create a literal
-    ``${CLAUDE_PLUGIN_DATA}`` directory — and the last resort is a relative path.
+    ``${CLAUDE_PLUGIN_DATA}`` directory.
+
+    If a host passed a placeholder it could not expand (the Claude Desktop plugin bridge
+    leaves ``${CLAUDE_PLUGIN_DATA}`` as is), the working directory is the plugin folder,
+    which is replaced on every update and would take the database with it. The database
+    then goes to ``~/.research-match/research_match.db``, the same file the desktop
+    extension uses. With nothing configured at all the last resort is a relative path.
     """
+    saw_unexpanded = False
     for var in ("RESEARCH_MATCH_DB", "RESEARCH_MATCH_DB_DEFAULT"):
         raw = os.environ.get(var, "").strip()
         if raw and "${" not in raw:
             return os.path.expanduser(raw)
+        if raw:
+            saw_unexpanded = True
+    if saw_unexpanded:
+        return os.path.join(os.path.expanduser("~"), ".research-match", "research_match.db")
     return "research_match.db"
 
 

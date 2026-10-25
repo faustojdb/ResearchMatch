@@ -107,7 +107,7 @@ environment lives.
 
 ### Where your data lives
 
-In plugin mode the SQLite database is stored in the plugin's persistent data directory (`${CLAUDE_PLUGIN_DATA}/research_match.db`, which survives plugin updates). Set `RESEARCH_MATCH_DB` to use another path. Databases created by releases before 3.4.0 (which lived inside the plugin folder) are migrated automatically on first start.
+In plugin mode the SQLite database is stored in the plugin's persistent data directory (`${CLAUDE_PLUGIN_DATA}/research_match.db`, which survives plugin updates). If a host cannot expand `${CLAUDE_PLUGIN_DATA}` (the Claude Desktop plugin bridge leaves it as is), the database is kept in `~/.research-match/research_match.db` instead, the same file the desktop extension uses, so it is never stored in the plugin folder. Set `RESEARCH_MATCH_DB` to use another path. Databases created by releases before 3.4.0 (which lived inside the plugin folder) are migrated automatically on first start.
 
 ### Getting Started
 
