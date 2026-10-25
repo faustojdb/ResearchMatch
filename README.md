@@ -232,7 +232,7 @@ All tool names are prefixed `research_match_` on the wire (e.g. `research_match_
   "status": "reported",
   "report_id": "a1b2c3d4-...",
   "severity": "medium",
-  "server_version": "3.4.3",
+  "server_version": "3.4.4",
   "reporter": "anonymous",
   "message": "Bug report received (severity: medium). Report ID: a1b2c3d4-.... Thank you for helping improve Research Match!"
 }
@@ -260,7 +260,7 @@ happens next as real usage grows.
 - **Search**: keyword matching over SQLite/Firestore. Algolia full-text indexing is an
   optional, currently-unconfigured enhancement — `cold_search` works fully without it.
 - **Novelty grounding**: OpenAlex (free, no key) for literature-grounded originality scoring
-- **Embeddings**: sentence-transformers (all-MiniLM-L6-v2) in a separate worker process (`src/embedding_worker.py`); Jaccard word-overlap fallback whenever the worker is unavailable, reported in `similarity_method`
+- **Embeddings**: sentence-transformers (all-MiniLM-L6-v2) in a separate worker process (`src/embedding_worker.py`); Jaccard word-overlap fallback whenever the worker is unavailable, reported in `similarity_method`. The model loads in the background when the server starts (about a minute on the first run); a scoring call that arrives while it is still loading answers `status: "warming_up"` with `retry_after_seconds` instead of timing out, keeps any repository metadata, and saves nothing. Tunables: `RESEARCH_MATCH_EMBEDDINGS_WARMUP=0` disables the background load, `RESEARCH_MATCH_EMBEDDINGS_CALL_WAIT` (seconds a call waits for the model, default 30) and `RESEARCH_MATCH_EMBEDDINGS_IDLE_SECONDS` (worker stops after this much inactivity, default 3600)
 - **GitHub Integration**: GitHub App for bilateral repo access (PyJWT + httpx)
 - **Hosting (optional)**: Google Cloud Run (streamable-http transport)
 - **Plugin layout**: `.claude-plugin/plugin.json` (manifest), `.mcp.json` (local server), `research_match_mcp.py` (launcher), `skills/research-match/SKILL.md`, `commands/*.md`
