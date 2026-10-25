@@ -13,7 +13,7 @@
       "name": "research-match",
       "source": "./",
       "description": "Find complementary research collaborators while protecting unpublished work: literature-grounded originality scoring (OpenAlex), bilateral matching, consent-based reveals, git-verifiable contracts.",
-      "version": "3.4.1",
+      "version": "3.4.2",
       "author": {
         "name": "Fausto Jose Di Bacco",
         "email": "faustojdb@gmail.com",

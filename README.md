@@ -111,7 +111,7 @@ Once installed, say: *"Register me on Research Match"* — Claude will ask for t
 
 Everything the plugin does is in this repository's readable source. In summary:
 
-- **Runs**: `uv run --frozen python research_match_mcp.py` from the plugin folder — a three-line launcher that starts the Python stdio MCP server in `src/research_match_server.py`. Dependencies are pinned in `uv.lock`.
+- **Runs**: `uv run --frozen python research_match_mcp.py` from the plugin folder — a three-line launcher that starts the Python stdio MCP server in `src/research_match_server.py`. Dependencies are pinned in `uv.lock`. The first originality scoring also starts a second process with the same interpreter, `src/embedding_worker.py`, which loads the embedding model, answers the server over pipes, and exits after 15 minutes without requests (the server never imports PyTorch itself).
 - **Writes locally**: one SQLite database (see *Where your data lives*) and uv's dependency cache. No other files are written.
 - **Network calls, local mode**:
   - `api.openalex.org` — originality scoring sends only your domain/topic search terms to find related published works. Disable with `RESEARCH_MATCH_DISABLE_OPENALEX=1`.
@@ -217,7 +217,7 @@ All tool names are prefixed `research_match_` on the wire (e.g. `research_match_
   "status": "reported",
   "report_id": "a1b2c3d4-...",
   "severity": "medium",
-  "server_version": "3.4.1",
+  "server_version": "3.4.2",
   "reporter": "anonymous",
   "message": "Bug report received (severity: medium). Report ID: a1b2c3d4-.... Thank you for helping improve Research Match!"
 }
@@ -245,7 +245,7 @@ happens next as real usage grows.
 - **Search**: keyword matching over SQLite/Firestore. Algolia full-text indexing is an
   optional, currently-unconfigured enhancement — `cold_search` works fully without it.
 - **Novelty grounding**: OpenAlex (free, no key) for literature-grounded originality scoring
-- **Embeddings**: sentence-transformers (all-MiniLM-L6-v2) with Jaccard fallback
+- **Embeddings**: sentence-transformers (all-MiniLM-L6-v2) in a separate worker process (`src/embedding_worker.py`); Jaccard word-overlap fallback whenever the worker is unavailable, reported in `similarity_method`
 - **GitHub Integration**: GitHub App for bilateral repo access (PyJWT + httpx)
 - **Hosting (optional)**: Google Cloud Run (streamable-http transport)
 - **Plugin layout**: `.claude-plugin/plugin.json` (manifest), `.mcp.json` (local server), `research_match_mcp.py` (launcher), `skills/research-match/SKILL.md`, `commands/*.md`

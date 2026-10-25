@@ -33,6 +33,7 @@ import logging
 import tempfile
 import shutil
 import subprocess
+import queue
 
 import numpy as np
 from mcp.server.fastmcp import FastMCP, Context
@@ -173,7 +174,7 @@ def _migrate_legacy_db(new_path: str) -> None:
         _logger.info("Migrated legacy database %s -> %s", _LEGACY_DB_PATH, new_path)
     except Exception as exc:  # never block startup on a failed migration
         _logger.warning("Legacy database migration skipped: %s", exc)
-SERVER_VERSION = "3.4.1"
+SERVER_VERSION = "3.4.2"
 
 # Scoring weights for Theoretical Originality (OT)
 OT_WEIGHTS = {
@@ -307,61 +308,220 @@ NEUTRAL_DIVERGENCE_SCORE = 50.0       # honest "unknown divergence" when no refe
 # =============================================================================
 
 class EmbeddingEngine:
-    """Provides semantic similarity via sentence-transformers.
+    """Semantic similarity via sentence-transformers running in a *separate process*.
 
-    The model is lazy-loaded on first use to avoid blocking server startup.
-    Thread-safe: uses a lock for model loading.
-    Falls back to Jaccard similarity if the model fails to load.
+    The MCP server process never imports torch / sentence-transformers. Importing that
+    stack inside an already-running MCP server freezes on Windows (a compiled-module load
+    in scipy.special never returns, whether the import happens in the tool call or in a
+    background thread), while a fresh process imports it fine. So the heavy work lives in
+    ``src/embedding_worker.py``: started lazily on first use with the same interpreter,
+    spoken to over stdin/stdout JSON lines, kept alive between calls, and stopped after a
+    period of inactivity or at shutdown.
+
+    Falls back to Jaccard word-overlap similarity whenever the worker cannot be started,
+    does not become ready in time, or dies; ``method`` reports which one is in use so
+    scores stay honest about how they were produced. Tests force the fallback by setting
+    ``_load_failed = True``; the special model names ``__test__`` / ``__slow__`` run the
+    worker without any ML dependency.
     """
 
-    def __init__(self, model_name: str = EMBEDDING_MODEL_NAME):
+    WORKER_FILENAME = "embedding_worker.py"
+
+    def __init__(self, model_name: str = EMBEDDING_MODEL_NAME, *,
+                 python: Optional[str] = None, worker_path: Optional[str] = None,
+                 ready_timeout: Optional[float] = None, request_timeout: Optional[float] = None,
+                 idle_seconds: Optional[float] = None, idle_poll_seconds: float = 15.0):
         self._model_name = model_name
-        self._model = None
-        self._lock = threading.Lock()
-        self._load_failed = False
+        self._python = python or sys.executable
+        self._worker_path = worker_path or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), self.WORKER_FILENAME)
+        self._ready_timeout = float(ready_timeout if ready_timeout is not None else
+                                    os.environ.get("RESEARCH_MATCH_EMBEDDINGS_READY_TIMEOUT", "300"))
+        self._request_timeout = float(request_timeout if request_timeout is not None else
+                                      os.environ.get("RESEARCH_MATCH_EMBEDDINGS_REQUEST_TIMEOUT", "120"))
+        self._idle_seconds = float(idle_seconds if idle_seconds is not None else
+                                   os.environ.get("RESEARCH_MATCH_EMBEDDINGS_IDLE_SECONDS", "900"))
+        self._idle_poll_seconds = idle_poll_seconds
+        self._lock = threading.RLock()
+        self._load_failed = False      # set when the worker cannot be used at all (sticky)
+        self._proc: Optional[subprocess.Popen] = None
+        self._queue: Optional[queue.Queue] = None
+        self._reader: Optional[threading.Thread] = None
+        self._backend = ""
+        self._next_id = 0
+        self._last_used = 0.0
+        self._idle_thread: Optional[threading.Thread] = None
         self._logger = logging.getLogger("research_match.embeddings")
 
+    # ---- worker lifecycle ---------------------------------------------------------
+
+    def _alive(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
     def _ensure_model(self) -> bool:
-        """Lazy-load the embedding model. Returns True if model is available."""
-        if self._model is not None:
-            return True
+        """Start the worker on first use. Returns True when it is ready to answer."""
         if self._load_failed:
             return False
-
         with self._lock:
-            if self._model is not None:
+            if self._alive() and self._backend:
                 return True
             if self._load_failed:
                 return False
             try:
-                from sentence_transformers import SentenceTransformer
-                self._logger.info("Loading embedding model '%s'...", self._model_name)
-                self._model = SentenceTransformer(self._model_name)
-                self._logger.info("Embedding model loaded successfully.")
+                self._spawn()
+                reply = self._request({"op": "ping"}, timeout=self._ready_timeout)
+                if not reply.get("ok"):
+                    raise RuntimeError(reply.get("error") or "worker did not answer ping")
+                self._backend = str(reply.get("backend") or "sentence-transformers")
+                self._logger.info("Embedding worker ready (pid %s, backend %s, model %s).",
+                                  reply.get("pid"), self._backend, self._model_name)
+                self._start_idle_watch()
                 return True
-            except Exception as e:
-                self._logger.warning("Failed to load embedding model: %s. Using Jaccard fallback.", e)
+            except Exception as e:  # noqa: BLE001 — degrade to Jaccard, never crash a tool
+                self._logger.warning("Embedding worker unavailable (%s). Using Jaccard fallback.", e)
                 self._load_failed = True
+                self._stop_worker()
                 return False
 
-    def similarity(self, text_a: str, text_b: str) -> float:
-        """Compute semantic similarity between two texts (0.0 to 1.0).
+    def _spawn(self) -> None:
+        if not os.path.isfile(self._worker_path):
+            raise FileNotFoundError(self._worker_path)
+        env = dict(os.environ)
+        env.update({
+            "PYTHONIOENCODING": "utf-8",
+            "PYTHONUNBUFFERED": "1",
+            "HF_HUB_DISABLE_PROGRESS_BARS": "1",
+            "HF_HUB_DISABLE_SYMLINKS_WARNING": "1",
+            "TRANSFORMERS_VERBOSITY": "error",
+            "TOKENIZERS_PARALLELISM": "false",
+            "TQDM_DISABLE": "1",
+        })
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        self._logger.info("Starting embedding worker: %s %s %s", self._python, self._worker_path, self._model_name)
+        self._proc = subprocess.Popen(
+            [self._python, self._worker_path, self._model_name],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None,  # stderr -> host log
+            text=True, encoding="utf-8", errors="replace", bufsize=1,
+            cwd=os.path.dirname(self._worker_path), env=env, creationflags=creationflags,
+        )
+        self._queue = queue.Queue()
+        self._reader = threading.Thread(target=self._read_loop, args=(self._proc, self._queue),
+                                        name="embedding-worker-reader", daemon=True)
+        self._reader.start()
+        self._backend = ""
 
-        Uses cosine similarity of sentence embeddings if model is available,
-        otherwise falls back to Jaccard word-overlap similarity.
-        """
+    @staticmethod
+    def _read_loop(proc: subprocess.Popen, q: "queue.Queue") -> None:
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    q.put(json.loads(line))
+                except ValueError:
+                    q.put({"id": None, "ok": False, "error": f"unparseable worker output: {line[:120]}"})
+        except Exception as e:  # noqa: BLE001
+            q.put({"id": None, "ok": False, "error": f"worker stream closed: {e}"})
+        q.put({"id": None, "ok": False, "error": "worker exited", "exited": True})
+
+    def _request(self, payload: Dict[str, Any], timeout: Optional[float] = None) -> Dict[str, Any]:
+        """Send one request and wait for its reply. Raises on timeout or dead worker."""
+        if not self._alive() or self._queue is None:
+            raise RuntimeError("embedding worker is not running")
+        self._next_id += 1
+        rid = self._next_id
+        payload = dict(payload, id=rid)
+        deadline = time.monotonic() + (timeout if timeout is not None else self._request_timeout)
+        try:
+            self._proc.stdin.write(json.dumps(payload, ensure_ascii=True) + "\n")
+            self._proc.stdin.flush()
+        except (OSError, ValueError) as e:
+            raise RuntimeError(f"cannot write to embedding worker: {e}") from e
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"embedding worker did not answer within {timeout or self._request_timeout:.0f}s")
+            try:
+                reply = self._queue.get(timeout=remaining)
+            except queue.Empty:
+                continue
+            if reply.get("exited") or reply.get("fatal"):
+                raise RuntimeError(reply.get("error") or "embedding worker exited")
+            if reply.get("id") == rid:
+                self._last_used = time.monotonic()
+                return reply
+            # A stale reply for an earlier (timed-out) request: skip it.
+
+    def _stop_worker(self) -> None:
+        proc, self._proc, self._backend = self._proc, None, ""
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                try:
+                    proc.stdin.write(json.dumps({"id": 0, "op": "shutdown"}) + "\n")
+                    proc.stdin.flush()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            for stream in (proc.stdin, proc.stdout):
+                try:
+                    stream.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _start_idle_watch(self) -> None:
+        if self._idle_seconds <= 0 or (self._idle_thread is not None and self._idle_thread.is_alive()):
+            return
+        self._last_used = time.monotonic()
+
+        def watch():
+            while True:
+                time.sleep(self._idle_poll_seconds)
+                with self._lock:
+                    if not self._alive():
+                        return
+                    if time.monotonic() - self._last_used >= self._idle_seconds:
+                        self._logger.info("Embedding worker idle for %.0fs; stopping it (restarts on demand).",
+                                          self._idle_seconds)
+                        self._stop_worker()
+                        return
+
+        self._idle_thread = threading.Thread(target=watch, name="embedding-worker-idle", daemon=True)
+        self._idle_thread.start()
+
+    def warm_up(self) -> None:
+        """Start the worker in the background so the first scoring call is fast."""
+        threading.Thread(target=self._ensure_model, name="embedding-worker-warmup", daemon=True).start()
+
+    def close(self) -> None:
+        with self._lock:
+            self._stop_worker()
+
+    # ---- similarity API (unchanged for callers) -----------------------------------
+
+    def similarity(self, text_a: str, text_b: str) -> float:
+        """Semantic similarity (0.0 to 1.0); Jaccard word overlap when the worker is unavailable."""
         if not text_a or not text_b:
             return 0.0
-
         if self._ensure_model():
-            return self._cosine_similarity(text_a, text_b)
+            try:
+                with self._lock:
+                    reply = self._request({"op": "similarity", "a": text_a, "b": text_b})
+                if reply.get("ok"):
+                    return max(0.0, min(1.0, float(reply.get("value", 0.0))))
+                self._logger.warning("Embedding worker error: %s", reply.get("error"))
+            except Exception as e:  # noqa: BLE001
+                self._on_worker_failure(e)
         return self._jaccard_similarity(text_a, text_b)
-
-    def _cosine_similarity(self, text_a: str, text_b: str) -> float:
-        """Cosine similarity using sentence embeddings."""
-        embeddings = self._model.encode([text_a, text_b], normalize_embeddings=True)
-        score = float(np.dot(embeddings[0], embeddings[1]))
-        return max(0.0, min(1.0, score))
 
     @staticmethod
     def _jaccard_similarity(text_a: str, text_b: str) -> float:
@@ -373,30 +533,35 @@ class EmbeddingEngine:
         return len(words_a & words_b) / len(words_a | words_b)
 
     def rank_similarity(self, query: str, candidates: List[str]) -> Dict[str, float]:
-        """Similarity of `query` against many `candidates` in one shot.
-
-        Encodes the query once and returns the max (nearest neighbour) and mean
-        similarity plus the count of candidates compared. Used to ground novelty
-        against a set of prior works. Falls back to Jaccard like similarity().
-        """
+        """Similarity of `query` against many `candidates`: max (nearest), mean and count."""
         cands = [c for c in candidates if c]
         if not query or not cands:
             return {"max": 0.0, "avg": 0.0, "n": 0}
         if self._ensure_model():
-            q = self._model.encode([query], normalize_embeddings=True)[0]
-            embs = self._model.encode(cands, normalize_embeddings=True)
-            sims = [max(0.0, min(1.0, float(np.dot(q, e)))) for e in embs]
-        else:
-            sims = [self._jaccard_similarity(query, c) for c in cands]
+            try:
+                with self._lock:
+                    reply = self._request({"op": "rank", "query": query, "candidates": cands})
+                if reply.get("ok"):
+                    return {"max": float(reply["max"]), "avg": float(reply["avg"]), "n": int(reply["n"])}
+                self._logger.warning("Embedding worker error: %s", reply.get("error"))
+            except Exception as e:  # noqa: BLE001
+                self._on_worker_failure(e)
+        sims = [self._jaccard_similarity(query, c) for c in cands]
         return {"max": max(sims), "avg": sum(sims) / len(sims), "n": len(sims)}
+
+    def _on_worker_failure(self, exc: Exception) -> None:
+        self._logger.warning("Embedding worker failed (%s). Using Jaccard fallback from now on.", exc)
+        with self._lock:
+            self._load_failed = True
+            self._stop_worker()
 
     @property
     def is_loaded(self) -> bool:
-        return self._model is not None
+        return bool(self._backend) and self._alive()
 
     @property
     def method(self) -> str:
-        return "sentence-transformers" if self._model is not None else "jaccard-fallback"
+        return self._backend if (self._backend and self._alive() and not self._load_failed) else "jaccard-fallback"
 
 
 # =============================================================================
@@ -2085,6 +2250,8 @@ async def app_lifespan(app):
         user_email_hash = hashlib.sha256(user_email.lower().strip().encode()).hexdigest()
 
     embeddings = EmbeddingEngine()
+    if os.environ.get("RESEARCH_MATCH_EMBEDDINGS_WARMUP", "").lower() in ("1", "true", "yes"):
+        embeddings.warm_up()
     literature = OpenAlexClient(mailto=user_email or None)
     evaluator = OriginalityEvaluator(db=db, embeddings=embeddings, datastore=datastore,
                                      literature=literature)
@@ -2102,6 +2269,7 @@ async def app_lifespan(app):
         "github_client": github_client,
     }
     github_client.close()
+    embeddings.close()
     if db:
         db.close()
     if datastore:
@@ -2157,7 +2325,7 @@ def _health_stats() -> Dict[str, Any]:
             "version": SERVER_VERSION,
             "started_at": _server_start_time,
             "database": DB_PATH,
-            "similarity_method": "sentence-transformers (lazy-load on first use)",
+            "similarity_method": "sentence-transformers in a worker process (started on first use)",
             "embedding_model": EMBEDDING_MODEL_NAME,
             "stats": {
                 "users": users,

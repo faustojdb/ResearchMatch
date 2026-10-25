@@ -57,7 +57,8 @@ reviewer confirms) and, until they were removed, a shell script and planning not
 mentioned the listing icon by its path; a hold means an Anthropic reviewer reads the version before it goes live. Make the
 reviewer's job easy: the README section *"What this plugin runs, sends and fetches"*
 declares every process, file write and network destination (OpenAlex, GitHub API,
-Hugging Face model download, PyPI, optional Firestore). An undisclosed destination is what
+Hugging Face model download, PyPI, optional Firestore), including the embedding worker
+process the server starts with the same interpreter (`src/embedding_worker.py`). An undisclosed destination is what
 fails the **security scan**, and a first submission that fails the scan is rejected.
 
 Optional, to remove the size holds later (ROADMAP Stage 5): split
