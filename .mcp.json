@@ -11,7 +11,9 @@
         "${CLAUDE_PLUGIN_ROOT}/research_match_mcp.py"
       ],
       "env": {
-        "RESEARCH_MATCH_DB": "${CLAUDE_PLUGIN_DATA}/research_match.db"
+        "RESEARCH_MATCH_DB": "${CLAUDE_PLUGIN_DATA}/research_match.db",
+        "UV_PROJECT_ENVIRONMENT": "${CLAUDE_PLUGIN_DATA}/venv",
+        "UV_CACHE_DIR": "${CLAUDE_PLUGIN_DATA}/uv-cache"
       }
     }
   }

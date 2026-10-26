@@ -1906,8 +1906,8 @@ wheels = [
 
 [[package]]
 name = "research-match"
-version = "3.4.4"
-source = { editable = "." }
+version = "3.4.5"
+source = { virtual = "." }
 dependencies = [
     { name = "algoliasearch" },
     { name = "cryptography" },
