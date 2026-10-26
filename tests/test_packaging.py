@@ -124,3 +124,24 @@ def test_launcher_delegates_to_the_server_main():
 def test_mcp_dependency_is_pinned_below_2(pyproject):
     deps = [d for d in pyproject["project"]["dependencies"] if d.startswith("mcp")]
     assert deps and all("<2" in d for d in deps)
+
+
+# =====================================================================
+# torch: CPU build on Linux (PyPI's Linux wheels are the CUDA build, ~6 GB)
+# =====================================================================
+
+def test_torch_is_a_direct_dependency_routed_to_the_cpu_index_on_linux(pyproject):
+    deps = pyproject["project"]["dependencies"]
+    assert any(d.split()[0].startswith("torch") for d in deps), "sources only apply to direct dependencies"
+    indexes = {i["name"]: i for i in pyproject["tool"]["uv"]["index"]}
+    assert indexes["pytorch-cpu"]["url"] == "https://download.pytorch.org/whl/cpu"
+    assert indexes["pytorch-cpu"]["explicit"] is True
+    sources = pyproject["tool"]["uv"]["sources"]["torch"]
+    assert any(s.get("index") == "pytorch-cpu" and "sys_platform == 'linux'" in s.get("marker", "") for s in sources)
+
+
+def test_lock_has_no_cuda_packages_and_a_cpu_torch_for_linux():
+    lock = _read("uv.lock")
+    assert not re.search(r'^name = "(nvidia-|triton|cuda-)', lock, re.M), "CUDA companions crept back into uv.lock"
+    assert 'source = { registry = "https://download.pytorch.org/whl/cpu" }' in lock
+    assert re.search(r'^name = "torch"\nversion = "[0-9.]+\+cpu"', lock, re.M)

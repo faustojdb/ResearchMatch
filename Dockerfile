@@ -11,13 +11,15 @@ COPY pyproject.toml uv.lock README.md ./
 
 # Install the exact versions from uv.lock — the ones the test-suite runs against — instead
 # of whatever PyPI serves on build day: an unpinned install once pulled mcp 2.x, whose
-# renamed FastMCP import kept the container from starting. torch and its CUDA companions
-# (nvidia-*, triton, cuda-*) are dropped from the list and replaced by the CPU-only build of the same locked torch
-# version (~200MB instead of ~3GB).
+# renamed FastMCP import kept the container from starting. The lock already routes torch on
+# Linux to PyTorch's CPU index (pyproject [tool.uv.sources]), but `uv export` writes a
+# universal list with one torch line per platform and no index URL, so torch is installed
+# on its own from that index first; any CUDA companion that might reappear is dropped.
 RUN uv export --frozen --no-dev --no-emit-project --no-hashes -o /tmp/requirements.txt \
  && grep -v -E '^(torch==|nvidia-|triton==|cuda-)' /tmp/requirements.txt > /tmp/requirements-cpu.txt \
- && TORCH_VERSION="$(sed -n 's/^torch==\([^ ;]*\).*/\1/p' /tmp/requirements.txt)" \
- && echo "torch ${TORCH_VERSION} (cpu build)" \
+ && TORCH_VERSION="$(grep -E "^torch==.*sys_platform == 'linux'" /tmp/requirements.txt | sed 's/^torch==\([^ ;]*\).*/\1/')" \
+ && test -n "${TORCH_VERSION}" \
+ && echo "torch ${TORCH_VERSION} from the PyTorch CPU index" \
  && uv pip install --system --no-cache "torch==${TORCH_VERSION}" --index-url https://download.pytorch.org/whl/cpu \
  && uv pip install --system --no-cache -r /tmp/requirements-cpu.txt
 

@@ -40,7 +40,7 @@ Research Match is **local-first**: the server runs on your own machine over stdi
 
 - [uv](https://github.com/astral-sh/uv) on your `PATH`. uv fetches Python 3.12 automatically if you don't have it.
 - A surface that runs local MCP servers: **Claude Code** (terminal, IDE extensions, or the desktop app's Code tab) or **Cowork** in the Claude desktop app. In claude.ai web chat the skill loads but the local server does not start, so the tools are unavailable there.
-- Disk space and a minute or two on first start: `uv` installs the Python dependencies (about 800 MB, including PyTorch for the embedding model) into the plugin's data directory, where they survive plugin updates. Claude Code only waits 30 s for a server to start, so the very first session after installing may list `research-match` as failed to connect while the install finishes in the background; the next session (or `/mcp` → reconnect) connects in a few seconds.
+- Disk space and a minute or two on first start: `uv` installs the Python dependencies (about 1 GB, including the CPU build of PyTorch for the embedding model) into the plugin's data directory, where they survive plugin updates. Claude Code only waits 30 s for a server to start, so the very first session after installing may list `research-match` as failed to connect while the install finishes in the background; the next session (or `/mcp` → reconnect) connects in a few seconds.
 
 ### Option 1 — Install the plugin in Claude Code (recommended)
 
