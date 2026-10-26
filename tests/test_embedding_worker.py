@@ -25,7 +25,7 @@ import time
 
 import pytest
 
-from src.research_match_server import EmbeddingEngine
+from src.research_match_server import EmbeddingEngine, EmbeddingsWarmingUp, _warmup_enabled
 
 WORKER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "embedding_worker.py")
 
@@ -130,6 +130,7 @@ class TestEmbeddingEngineClient:
         assert eng.method == "jaccard-fallback"
 
     def test_slow_worker_falls_back_within_ready_timeout(self, monkeypatch):
+        """A worker that never becomes ready within ready_timeout is a real failure: Jaccard, sticky."""
         monkeypatch.setenv("RESEARCH_MATCH_EMBEDDING_SLOW_SECONDS", "20")
         eng = _engine("__slow__", ready_timeout=1.5)
         t0 = time.time()
@@ -137,6 +138,82 @@ class TestEmbeddingEngineClient:
         assert time.time() - t0 < 10
         assert value == pytest.approx(1 / 3)
         assert eng._load_failed is True and eng._proc is None
+
+    def test_loading_worker_is_reported_as_warming_up_not_failed(self, monkeypatch):
+        """Within ready_timeout but past call_wait: the call must not block, and must not degrade."""
+        monkeypatch.setenv("RESEARCH_MATCH_EMBEDDING_SLOW_SECONDS", "3")
+        eng = _engine("__slow__", ready_timeout=60, call_wait=0.4)
+        try:
+            t0 = time.time()
+            with pytest.raises(EmbeddingsWarmingUp) as info:
+                eng.similarity("alpha beta", "alpha gamma")
+            assert time.time() - t0 < 2.5          # bounded by call_wait, not by the model load
+            assert info.value.retry_after >= 10
+            assert eng._load_failed is False       # transient: nothing sticky
+            assert eng.method == "jaccard-fallback"  # honest while it is still loading
+            # The startup thread keeps going; once it finishes the next call uses embeddings.
+            assert eng._ready.wait(timeout=30)
+            assert eng.similarity("alpha beta", "alpha gamma") == pytest.approx(0.5)
+            assert eng.method == "test-hash"
+        finally:
+            eng.close()
+
+    def test_call_waits_for_a_worker_that_is_ready_within_call_wait(self, monkeypatch):
+        monkeypatch.setenv("RESEARCH_MATCH_EMBEDDING_SLOW_SECONDS", "1")
+        eng = _engine("__slow__", call_wait=30)
+        try:
+            assert eng.similarity("alpha beta", "alpha gamma") == pytest.approx(0.5)
+            assert eng.method == "test-hash"
+        finally:
+            eng.close()
+
+    def test_warm_up_does_not_block_and_loads_the_worker(self, monkeypatch):
+        monkeypatch.setenv("RESEARCH_MATCH_EMBEDDING_SLOW_SECONDS", "2")
+        eng = _engine("__slow__")
+        try:
+            t0 = time.time()
+            eng.warm_up()
+            assert time.time() - t0 < 1.0
+            assert eng._ready.wait(timeout=30)
+            assert eng.is_loaded and eng.method == "test-hash"
+            eng.warm_up()                           # already warm: a no-op
+            assert eng.is_loaded
+        finally:
+            eng.close()
+
+    def test_rank_similarity_also_reports_warming_up(self, monkeypatch):
+        monkeypatch.setenv("RESEARCH_MATCH_EMBEDDING_SLOW_SECONDS", "3")
+        eng = _engine("__slow__", ready_timeout=60, call_wait=0.2)
+        try:
+            with pytest.raises(EmbeddingsWarmingUp):
+                eng.rank_similarity("anomaly detection", ["anomaly detection in streams"])
+            assert eng._load_failed is False
+        finally:
+            eng.close()
+
+
+# =====================================================================
+# When the engine warms up on its own
+# =====================================================================
+
+class TestWarmupSwitch:
+    @pytest.mark.parametrize("warmup, port, expected", [
+        (None, None, True),    # local stdio / --http: on by default
+        (None, "8080", False), # Cloud Run: off by default
+        ("0", None, False),
+        ("false", None, False),
+        ("off", None, False),
+        ("1", None, True),
+        ("1", "8080", True),   # explicit setting wins over PORT
+        ("", None, True),
+    ])
+    def test_default_and_overrides(self, monkeypatch, warmup, port, expected):
+        for name, value in (("RESEARCH_MATCH_EMBEDDINGS_WARMUP", warmup), ("PORT", port)):
+            if value is None:
+                monkeypatch.delenv(name, raising=False)
+            else:
+                monkeypatch.setenv(name, value)
+        assert _warmup_enabled() is expected
 
     def test_worker_death_is_recovered_by_restart(self):
         eng = _engine()

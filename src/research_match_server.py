@@ -96,6 +96,31 @@ def _setup_logging() -> logging.Logger:
 _logger = _setup_logging()
 
 
+class EmbeddingsWarmingUp(RuntimeError):
+    """The embedding worker is still loading its model: nothing is wrong, retry shortly.
+
+    Raised instead of blocking past the MCP client's request timeout (about 60 s, after
+    which the host gives up and restarts the server). Tools turn it into a ``warming_up``
+    answer and must not persist anything that was computed without embeddings.
+    """
+
+    def __init__(self, retry_after: int = 30):
+        self.retry_after = int(retry_after)
+        super().__init__(f"the embedding model is still loading; retry in about {self.retry_after}s")
+
+
+def _warming_up_payload(exc: "EmbeddingsWarmingUp") -> Dict[str, Any]:
+    """Machine- and human-readable answer for a call that hit a cold embedding worker."""
+    return {
+        "status": "warming_up",
+        "retry_after_seconds": exc.retry_after,
+        "message": (
+            "The local embedding model is still loading (the first start of a session takes "
+            f"about a minute). Nothing was saved. Call the same tool again in ~{exc.retry_after}s."
+        ),
+    }
+
+
 def _log_tool_call(func):
     """Decorator that logs MCP tool calls with timing."""
 
@@ -112,6 +137,14 @@ def _log_tool_call(func):
                           extra={"tool_name": tool_name, "duration_ms": round(elapsed, 1)}
                           if _LOG_FORMAT == "json" else {})
             return result
+        except EmbeddingsWarmingUp as e:
+            # Not a failure: the embedding model is still loading. Answer within the MCP
+            # client's request timeout instead of letting the call hang (the host kills and
+            # restarts a server whose request times out). Nothing was persisted: scoring
+            # always runs before any write.
+            elapsed = (time.monotonic() - start) * 1000
+            _logger.warning("Tool call deferred: %s (%.1fms) — %s", tool_name, elapsed, e)
+            return json.dumps(_warming_up_payload(e), indent=2)
         except Exception as e:
             elapsed = (time.monotonic() - start) * 1000
             _logger.error("Tool call failed: %s (%.1fms) — %s", tool_name, elapsed, e,
@@ -134,12 +167,23 @@ def _resolve_db_path() -> str:
     because Claude Desktop expands ``${HOME}`` in ``env`` but not inside a user_config
     default). A value that is empty or still contains an unexpanded ``${VAR}``
     placeholder is ignored — without this guard sqlite would create a literal
-    ``${CLAUDE_PLUGIN_DATA}`` directory — and the last resort is a relative path.
+    ``${CLAUDE_PLUGIN_DATA}`` directory.
+
+    If a host passed a placeholder it could not expand (the Claude Desktop plugin bridge
+    leaves ``${CLAUDE_PLUGIN_DATA}`` as is), the working directory is the plugin folder,
+    which is replaced on every update and would take the database with it. The database
+    then goes to ``~/.research-match/research_match.db``, the same file the desktop
+    extension uses. With nothing configured at all the last resort is a relative path.
     """
+    saw_unexpanded = False
     for var in ("RESEARCH_MATCH_DB", "RESEARCH_MATCH_DB_DEFAULT"):
         raw = os.environ.get(var, "").strip()
         if raw and "${" not in raw:
             return os.path.expanduser(raw)
+        if raw:
+            saw_unexpanded = True
+    if saw_unexpanded:
+        return os.path.join(os.path.expanduser("~"), ".research-match", "research_match.db")
     return "research_match.db"
 
 
@@ -177,7 +221,7 @@ def _migrate_legacy_db(new_path: str) -> None:
         _logger.info("Migrated legacy database %s -> %s", _LEGACY_DB_PATH, new_path)
     except Exception as exc:  # never block startup on a failed migration
         _logger.warning("Legacy database migration skipped: %s", exc)
-SERVER_VERSION = "3.4.3"
+SERVER_VERSION = "3.4.4"
 
 # Scoring weights for Theoretical Originality (OT)
 OT_WEIGHTS = {
@@ -322,10 +366,16 @@ class EmbeddingEngine:
     period of inactivity or at shutdown.
 
     Falls back to Jaccard word-overlap similarity whenever the worker cannot be started,
-    does not become ready in time, or dies; ``method`` reports which one is in use so
-    scores stay honest about how they were produced. Tests force the fallback by setting
-    ``_load_failed = True``; the special model names ``__test__`` / ``__slow__`` run the
-    worker without any ML dependency.
+    never becomes ready within ``ready_timeout``, or dies; ``method`` reports which one is
+    in use so scores stay honest about how they were produced. Tests force the fallback by
+    setting ``_load_failed = True``; the special model names ``__test__`` / ``__slow__`` run
+    the worker without any ML dependency.
+
+    Loading the model takes 40-60 s on a cold start, longer than an MCP client waits for a
+    single request. So the worker is started on a background thread (``warm_up`` does it at
+    server start) and a call waits at most ``call_wait`` seconds for it; if the model is
+    still loading it raises ``EmbeddingsWarmingUp`` — a transient state, never sticky —
+    which the tools report as ``warming_up`` instead of timing out.
     """
 
     WORKER_FILENAME = "embedding_worker.py"
@@ -333,6 +383,7 @@ class EmbeddingEngine:
     def __init__(self, model_name: str = EMBEDDING_MODEL_NAME, *,
                  python: Optional[str] = None, worker_path: Optional[str] = None,
                  ready_timeout: Optional[float] = None, request_timeout: Optional[float] = None,
+                 call_wait: Optional[float] = None,
                  idle_seconds: Optional[float] = None, idle_poll_seconds: float = 15.0):
         self._model_name = model_name
         self._python = python or sys.executable
@@ -342,10 +393,19 @@ class EmbeddingEngine:
                                     os.environ.get("RESEARCH_MATCH_EMBEDDINGS_READY_TIMEOUT", "300"))
         self._request_timeout = float(request_timeout if request_timeout is not None else
                                       os.environ.get("RESEARCH_MATCH_EMBEDDINGS_REQUEST_TIMEOUT", "120"))
+        # Per-call wait for a worker that is still loading. Well under the MCP client's
+        # request timeout (~60 s) because a tool spends part of that budget before it gets
+        # here (GitHub and OpenAlex lookups can take several seconds).
+        self._call_wait = float(call_wait if call_wait is not None else
+                                os.environ.get("RESEARCH_MATCH_EMBEDDINGS_CALL_WAIT", "30"))
         self._idle_seconds = float(idle_seconds if idle_seconds is not None else
-                                   os.environ.get("RESEARCH_MATCH_EMBEDDINGS_IDLE_SECONDS", "900"))
+                                   os.environ.get("RESEARCH_MATCH_EMBEDDINGS_IDLE_SECONDS", "3600"))
         self._idle_poll_seconds = idle_poll_seconds
         self._lock = threading.RLock()
+        self._start_lock = threading.Lock()   # guards the single background startup thread
+        self._ready = threading.Event()       # set when a startup attempt has finished (either way)
+        self._start_thread: Optional[threading.Thread] = None
+        self._start_began = 0.0
         self._load_failed = False      # set when the worker cannot be used at all (sticky)
         self._proc: Optional[subprocess.Popen] = None
         self._queue: Optional[queue.Queue] = None
@@ -361,30 +421,70 @@ class EmbeddingEngine:
     def _alive(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
-    def _ensure_model(self) -> bool:
-        """Start the worker on first use. Returns True when it is ready to answer."""
-        if self._load_failed:
-            return False
-        with self._lock:
-            if self._alive() and self._backend:
-                return True
+    def _ensure_model(self, wait: Optional[float] = None) -> bool:
+        """Make sure the worker is ready, waiting at most ``wait`` seconds (default: ``call_wait``).
+
+        Returns True when it is ready to answer and False when embeddings are unavailable
+        for good (the caller degrades to Jaccard). Raises ``EmbeddingsWarmingUp`` when the
+        model is still loading after the wait: the caller must not substitute Jaccard for
+        what is only a slow start.
+        """
+        deadline = time.monotonic() + max(0.0, self._call_wait if wait is None else wait)
+        while True:
             if self._load_failed:
                 return False
-            try:
-                self._spawn()
-                reply = self._request({"op": "ping"}, timeout=self._ready_timeout)
-                if not reply.get("ok"):
-                    raise RuntimeError(reply.get("error") or "worker did not answer ping")
-                self._backend = str(reply.get("backend") or "sentence-transformers")
-                self._logger.info("Embedding worker ready (pid %s, backend %s, model %s).",
-                                  reply.get("pid"), self._backend, self._model_name)
-                self._start_idle_watch()
+            if self._alive() and self._backend:
                 return True
-            except Exception as e:  # noqa: BLE001 — degrade to Jaccard, never crash a tool
-                self._logger.warning("Embedding worker unavailable (%s). Using Jaccard fallback.", e)
-                self._load_failed = True
+            self._start_async()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise EmbeddingsWarmingUp(self._retry_hint())
+            if self._ready.is_set():
+                time.sleep(0.01)   # attempt just ended but the state is not usable yet; avoid a hot spin
+            self._ready.wait(timeout=remaining)
+
+    def _start_async(self) -> None:
+        """Make sure one background startup attempt is running; never blocks."""
+        with self._start_lock:
+            if self._load_failed or (self._alive() and self._backend):
+                return
+            if self._start_thread is not None and self._start_thread.is_alive():
+                return
+            self._ready.clear()
+            self._start_began = time.monotonic()
+            self._start_thread = threading.Thread(
+                target=self._startup, name="embedding-worker-startup", daemon=True)
+            self._start_thread.start()
+
+    def _startup(self) -> None:
+        """Background thread: spawn the worker and wait for its ping (the model load)."""
+        try:
+            with self._lock:
+                self._spawn()
+            reply = self._request({"op": "ping"}, timeout=self._ready_timeout)
+            if not reply.get("ok"):
+                raise RuntimeError(reply.get("error") or "worker did not answer ping")
+            self._backend = str(reply.get("backend") or "sentence-transformers")
+            self._logger.info("Embedding worker ready (pid %s, backend %s, model %s) in %.1fs.",
+                              reply.get("pid"), self._backend, self._model_name,
+                              time.monotonic() - self._start_began)
+            self._start_idle_watch()
+        except Exception as e:  # noqa: BLE001 — degrade to Jaccard, never crash a tool
+            self._logger.warning("Embedding worker unavailable (%s). Using Jaccard fallback.", e)
+            self._load_failed = True
+            with self._lock:
                 self._stop_worker()
-                return False
+        finally:
+            self._ready.set()
+
+    def _retry_hint(self) -> int:
+        """Seconds a caller should wait before retrying a call that hit a loading worker.
+
+        A cold load usually finishes within 60-90 s of the start; the retry itself waits
+        for the worker up to ``call_wait``, so a short hint is enough.
+        """
+        elapsed = time.monotonic() - self._start_began if self._start_began else 0.0
+        return int(max(15, min(30, 90 - elapsed)))
 
     def _spawn(self) -> None:
         if not os.path.isfile(self._worker_path):
@@ -503,7 +603,7 @@ class EmbeddingEngine:
 
     def warm_up(self) -> None:
         """Start the worker in the background so the first scoring call is fast."""
-        threading.Thread(target=self._ensure_model, name="embedding-worker-warmup", daemon=True).start()
+        self._start_async()
 
     def close(self) -> None:
         with self._lock:
@@ -1071,7 +1171,9 @@ class OriginalityEvaluator:
             return {"has_reference": False, "source": "none", "nearest": 0.0,
                     "avg": 0.0, "n_reference": 0}
 
-        ranked = self.embeddings.rank_similarity(query, reference_texts)
+        # Off the event loop: this may wait for the embedding worker (up to call_wait) and
+        # must not stall the server's other requests while it does.
+        ranked = await asyncio.to_thread(self.embeddings.rank_similarity, query, reference_texts)
         return {
             "has_reference": True,
             "source": source,
@@ -1546,12 +1648,16 @@ class MatchingEngine:
                 LIMIT ?
             """, (user_id, user_commit["domain"], limit * 3)).fetchall()
 
-        matches = []
-        for candidate in candidates:
-            candidate = dict(candidate)
-            match_data = self._calculate_match(user_commit, candidate)
-            if match_data:
-                matches.append(match_data)
+        def _score_candidates() -> List[Dict[str, Any]]:
+            found = []
+            for candidate in candidates:
+                match_data = self._calculate_match(user_commit, dict(candidate))
+                if match_data:
+                    found.append(match_data)
+            return found
+
+        # Off the event loop: base similarity may wait for the embedding worker.
+        matches = await asyncio.to_thread(_score_candidates)
 
         # Sort by complementarity score descending
         matches.sort(key=lambda m: m["complementarity_score"], reverse=True)
@@ -2225,6 +2331,21 @@ class ReportBugInput(BaseModel):
 _server_start_time: Optional[str] = None
 
 
+def _warmup_enabled() -> bool:
+    """Whether to load the embedding model in the background when the server starts.
+
+    On by default for the local (stdio / --http) modes, where the first scoring call would
+    otherwise pay the 40-60 s model load and run into the MCP client's request timeout.
+    Off by default for the shared Cloud Run deployment (``PORT`` set), which scales to zero
+    and should not load PyTorch for requests that never score. An explicit
+    ``RESEARCH_MATCH_EMBEDDINGS_WARMUP`` always wins (``0``/``false``/``no``/``off`` to disable).
+    """
+    raw = os.environ.get("RESEARCH_MATCH_EMBEDDINGS_WARMUP", "").strip().lower()
+    if raw:
+        return raw in ("1", "true", "yes", "on")
+    return not os.environ.get("PORT")
+
+
 @asynccontextmanager
 async def app_lifespan(app):
     """Initialize database/datastore and engines."""
@@ -2253,7 +2374,7 @@ async def app_lifespan(app):
         user_email_hash = hashlib.sha256(user_email.lower().strip().encode()).hexdigest()
 
     embeddings = EmbeddingEngine()
-    if os.environ.get("RESEARCH_MATCH_EMBEDDINGS_WARMUP", "").lower() in ("1", "true", "yes"):
+    if _warmup_enabled():
         embeddings.warm_up()
     literature = OpenAlexClient(mailto=user_email or None)
     evaluator = OriginalityEvaluator(db=db, embeddings=embeddings, datastore=datastore,
@@ -2328,7 +2449,7 @@ def _health_stats() -> Dict[str, Any]:
             "version": SERVER_VERSION,
             "started_at": _server_start_time,
             "database": DB_PATH,
-            "similarity_method": "sentence-transformers in a worker process (started on first use)",
+            "similarity_method": "sentence-transformers in a worker process (loaded in the background at start in local mode, on first use otherwise)",
             "embedding_model": EMBEDDING_MODEL_NAME,
             "stats": {
                 "users": users,
@@ -4784,18 +4905,41 @@ async def research_match_deep_search(params: DeepSearchInput, ctx: Context = Non
             except Exception:
                 return None
 
-        # Fetch repo metadata
-        repo_data = _gh_api()
+        # Fetch repo metadata (blocking urllib: keep it off the event loop)
+        repo_data = await asyncio.to_thread(_gh_api)
         if not repo_data:
             return json.dumps({"error": f"Cannot access {repo_url}. Check URL and that repo is public."})
 
         size_mb = round(repo_data.get("size", 0) / 1024, 1)
+        default_branch = repo_data.get("default_branch", "main")
+        dep_names = ["requirements.txt", "pyproject.toml", "package.json", "Cargo.toml", "go.mod"]
 
-        # Fetch languages
-        languages = _gh_api("/languages") or {}
+        def _fetch_details() -> Dict[str, Any]:
+            # The remaining lookups are independent, so run them concurrently: one after
+            # another they could add up to ~80 s of urllib timeouts, longer than the MCP
+            # client waits for a single request.
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                f_languages = pool.submit(_gh_api, "/languages")
+                f_commits = pool.submit(_gh_api, "/commits?per_page=5")
+                f_tree = pool.submit(_gh_api, f"/git/trees/{default_branch}")
+                f_readme = pool.submit(_gh_api, "/readme")
+                f_deps = {name: pool.submit(_gh_api, f"/contents/{name}") for name in dep_names}
+                return {
+                    "languages": f_languages.result(),
+                    "commits": f_commits.result(),
+                    "tree": f_tree.result(),
+                    "readme": f_readme.result(),
+                    "deps": {name: fut.result() for name, fut in f_deps.items()},
+                }
 
-        # Fetch recent commits (top 5)
-        commits_data = _gh_api("/commits?per_page=5") or []
+        details = await asyncio.to_thread(_fetch_details)
+
+        # Languages
+        languages = details["languages"] or {}
+
+        # Recent commits (top 5)
+        commits_data = details["commits"] or []
         recent_commits = []
         for c in commits_data:
             if isinstance(c, dict) and "commit" in c:
@@ -4805,17 +4949,16 @@ async def research_match_deep_search(params: DeepSearchInput, ctx: Context = Non
                     "date": c["commit"]["committer"]["date"],
                 })
 
-        # Fetch top-level file tree
-        default_branch = repo_data.get("default_branch", "main")
-        tree_data = _gh_api(f"/git/trees/{default_branch}") or {}
+        # Top-level file tree
+        tree_data = details["tree"] or {}
         top_files = [
             {"path": item["path"], "type": item["type"], "size": item.get("size", 0)}
             for item in tree_data.get("tree", [])
         ]
 
-        # Fetch README preview
+        # README preview
         readme_preview = ""
-        readme_data = _gh_api("/readme")
+        readme_data = details["readme"]
         if readme_data and readme_data.get("content"):
             import base64
             try:
@@ -4826,8 +4969,8 @@ async def research_match_deep_search(params: DeepSearchInput, ctx: Context = Non
 
         # Check for dependency files
         deps_found = {}
-        for dep_file in ["requirements.txt", "pyproject.toml", "package.json", "Cargo.toml", "go.mod"]:
-            dep_data = _gh_api(f"/contents/{dep_file}")
+        for dep_file in dep_names:
+            dep_data = details["deps"][dep_file]
             if dep_data and dep_data.get("content"):
                 import base64
                 try:
@@ -4897,6 +5040,15 @@ async def research_match_deep_search(params: DeepSearchInput, ctx: Context = Non
                     ),
                 }
                 layers_executed["scoring"] = True
+            except EmbeddingsWarmingUp as e:
+                # Keep the GitHub metadata and say plainly that scoring is not ready yet;
+                # layers_executed.scoring stays False.
+                logger.info("deep_search scoring deferred for %s: %s", repo_url, e)
+                originality = _warming_up_payload(e)
+                originality["message"] = (
+                    "The local embedding model is still loading (the first start of a session "
+                    "takes about a minute), so the originality estimate is not ready. The "
+                    f"repository metadata is included; call again in ~{e.retry_after}s for scoring.")
             except Exception as e:  # noqa: BLE001 — scoring must never break metadata analysis
                 logger.warning("deep_search scoring failed for %s: %s", repo_url, e)
                 originality = {"error": f"scoring unavailable: {e}"}
@@ -7440,6 +7592,57 @@ async def research_match_report_bug(params: ReportBugInput, ctx: Context = None)
             f"Report ID: {report_id}. Thank you for helping improve Research Match!"
         ),
     }, indent=2)
+
+
+# =============================================================================
+# TOOL INPUT SCHEMAS
+# =============================================================================
+
+def _resolve_schema_refs(node: Any, defs: Dict[str, Any], stack: tuple = ()) -> Any:
+    """Return ``node`` with every local ``$ref`` replaced by the definition it points to."""
+    if isinstance(node, list):
+        return [_resolve_schema_refs(item, defs, stack) for item in node]
+    if not isinstance(node, dict):
+        return node
+    ref = node.get("$ref")
+    if isinstance(ref, str) and ref.startswith("#/$defs/"):
+        name = ref[len("#/$defs/"):]
+        target = defs.get(name)
+        if target is not None and name not in stack:
+            resolved = _resolve_schema_refs(target, defs, stack + (name,))
+            siblings = {k: _resolve_schema_refs(v, defs, stack) for k, v in node.items() if k != "$ref"}
+            return {**resolved, **siblings}
+    return {k: _resolve_schema_refs(v, defs, stack) for k, v in node.items() if k != "$defs"}
+
+
+def _inline_tool_schemas(server: FastMCP) -> int:
+    """Make every tool's input schema self-contained; returns how many were rewritten.
+
+    FastMCP describes ``params: SomeModel`` as ``{"properties": {"params": {"$ref": ...}},
+    "$defs": {...}}``. Some MCP hosts (the Claude Desktop extension bridge among them) drop
+    ``$defs`` and then show the argument as an empty ``{}``, so the model sees no field
+    names, types or limits. Inlining the definitions fixes that without changing how
+    arguments are validated (FastMCP validates with the pydantic model, not this schema).
+    """
+    try:
+        tools = server._tool_manager.list_tools()
+    except Exception as e:  # noqa: BLE001 — private API; a failure only costs schema detail
+        _logger.warning("Could not inline tool input schemas: %s", e)
+        return 0
+    changed = 0
+    for tool in tools:
+        schema = tool.parameters
+        if "$ref" not in json.dumps(schema):
+            continue
+        inlined = _resolve_schema_refs(schema, schema.get("$defs") or {})
+        if "$ref" in json.dumps(inlined):   # something unresolvable (e.g. recursive): leave it as FastMCP built it
+            continue
+        tool.parameters = inlined
+        changed += 1
+    return changed
+
+
+_inline_tool_schemas(mcp)
 
 
 # =============================================================================

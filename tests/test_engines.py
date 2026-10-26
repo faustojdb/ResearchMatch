@@ -380,5 +380,29 @@ class TestResolveDbPath:
     def test_empty_everything_is_relative(self, monkeypatch):
         from src import research_match_server as s
         monkeypatch.setenv("RESEARCH_MATCH_DB", "")
-        monkeypatch.setenv("RESEARCH_MATCH_DB_DEFAULT", "${HOME}/never-expanded.db")
+        monkeypatch.setenv("RESEARCH_MATCH_DB_DEFAULT", "")
         assert s._resolve_db_path() == "research_match.db"
+
+    def test_unset_everything_is_relative(self, monkeypatch):
+        from src import research_match_server as s
+        monkeypatch.delenv("RESEARCH_MATCH_DB", raising=False)
+        monkeypatch.delenv("RESEARCH_MATCH_DB_DEFAULT", raising=False)
+        assert s._resolve_db_path() == "research_match.db"
+
+    def test_unexpanded_placeholders_fall_to_the_home_folder(self, monkeypatch):
+        """The Claude Desktop plugin bridge leaves ${CLAUDE_PLUGIN_DATA} as is: never use the plugin folder."""
+        import os
+        from src import research_match_server as s
+        expected = os.path.join(os.path.expanduser("~"), ".research-match", "research_match.db")
+        monkeypatch.setenv("RESEARCH_MATCH_DB", "${CLAUDE_PLUGIN_DATA}/research_match.db")
+        monkeypatch.delenv("RESEARCH_MATCH_DB_DEFAULT", raising=False)
+        assert s._resolve_db_path() == expected
+        monkeypatch.setenv("RESEARCH_MATCH_DB", "")
+        monkeypatch.setenv("RESEARCH_MATCH_DB_DEFAULT", "${HOME}/never-expanded.db")
+        assert s._resolve_db_path() == expected
+
+    def test_expanded_value_still_beats_an_unexpanded_one(self, monkeypatch):
+        from src import research_match_server as s
+        monkeypatch.setenv("RESEARCH_MATCH_DB", "${CLAUDE_PLUGIN_DATA}/research_match.db")
+        monkeypatch.setenv("RESEARCH_MATCH_DB_DEFAULT", "C:/data/default.db")
+        assert s._resolve_db_path() == "C:/data/default.db"
