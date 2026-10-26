@@ -34,7 +34,7 @@ Research Match helps researchers, scientists, developers, and independent theori
 
 ## Installation
 
-Research Match is **local-first**: the server runs on your own machine over stdio with SQLite storage, works offline, keeps all data private on your device, and needs no account or API key. It is packaged as a **Claude plugin** (skill + slash commands + the local MCP server). A shared remote connector exists as an optional, experimental demo.
+Research Match is **local-first**: the server runs on your own machine over stdio with SQLite storage, works offline, keeps all data private on your device, and needs no account or API key. It is packaged as a **Claude plugin** (skill + slash commands + the local MCP server). A hosted instance exists for maintainers but is not publicly reachable (see Option 4).
 
 ### Requirements
 
@@ -78,16 +78,14 @@ claude mcp add research-match -- uv run --directory /path/to/ResearchMatch --fro
 
 A desktop-extension bundle can still be built with `mcpb pack` (the `.mcpbignore` file keeps development files out of it) and installed by hand in Claude Desktop under **Settings > Extensions > Advanced settings > Install Extension…**. Note that Anthropic no longer lists desktop extensions in its directory, so this is a side channel, not the main distribution path.
 
-### Option 4 — Experimental remote connector
+### Option 4 — Hosted instance (maintainers only)
 
-> **Experimental — demo only.** A shared hosted instance runs on Google Cloud Run so you can try the tools without a local Python setup. It has **no authentication** (identity is a self-asserted email hash) and it is **not kept in lockstep with releases** — check `/health` for the version it is serving. Do **not** put sensitive or unpublished research into the hosted instance; use local mode for anything private.
+> A hosted instance runs on Google Cloud Run with a Firestore backend, but it is **not publicly reachable**: Cloud Run only accepts requests that carry a Google identity token for an account holding `roles/run.invoker` on the service, so it cannot be added as a Claude Desktop connector or with `claude mcp add`. The server itself still has **no user authentication** (identity is a self-asserted email hash), which is why it stays closed until it gets OAuth 2.0 (see [ROADMAP.md](ROADMAP.md) Stage 4 and [SUBMISSION.md](SUBMISSION.md)). Use local mode for anything private.
 
-Claude Desktop: **Settings > Connectors**, add `https://research-match-77626397872.us-central1.run.app/mcp/`.
-
-Claude Code:
+Maintainers with access can check which version it is serving:
 
 ```bash
-claude mcp add research-match --transport http https://research-match-77626397872.us-central1.run.app/mcp/
+curl -H "Authorization: Bearer $(gcloud auth print-identity-token)" https://research-match-77626397872.us-central1.run.app/health
 ```
 
 ### If scores say `jaccard-fallback`
@@ -126,7 +124,7 @@ Once installed, say: *"Register me on Research Match"* — Claude will ask for t
 
 Everything the plugin does is in this repository's readable source. In summary:
 
-- **Runs**: `uv run --frozen python research_match_mcp.py` from the plugin folder — a three-line launcher that starts the Python stdio MCP server in `src/research_match_server.py`. Dependencies are pinned in `uv.lock`. The first originality scoring also starts a second process with the same interpreter, `src/embedding_worker.py`, which loads the embedding model, answers the server over pipes, and exits after 15 minutes without requests (the server never imports PyTorch itself).
+- **Runs**: `uv run --frozen python research_match_mcp.py` from the plugin folder — a three-line launcher that starts the Python stdio MCP server in `src/research_match_server.py`. Dependencies are pinned in `uv.lock`. In local mode the server also starts a second process with the same interpreter in the background, `src/embedding_worker.py`, which loads the embedding model, answers the server over pipes, and exits after 60 minutes without requests (it restarts on demand; the server never imports PyTorch itself).
 - **Writes locally**: one SQLite database (see *Where your data lives*) and uv's dependency cache. No other files are written.
 - **Network calls, local mode**:
   - `api.openalex.org` — originality scoring sends only your domain/topic search terms to find related published works. Disable with `RESEARCH_MATCH_DISABLE_OPENALEX=1`.
