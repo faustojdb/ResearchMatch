@@ -1,6 +1,6 @@
 [project]
 name = "research-match"
-version = "3.4.4"
+version = "3.4.5"
 description = "MCP server that connects isolated researchers via literature-grounded originality scoring and bilateral matching."
 authors = [
     { name = "faustojdb", email = "faustojdb@gmail.com" }
@@ -16,6 +16,7 @@ dependencies = [
     "httpx>=0.25.0",
     "numpy>=1.24.0",
     "sentence-transformers>=3.0.0",
+    "torch>=2.0",  # direct dependency so [tool.uv.sources] can route it to the CPU index on Linux
     "typing_extensions>=4.0",
     "firebase-admin>=6.0.0",
     "google-cloud-firestore>=2.16.0",
@@ -26,6 +27,27 @@ dependencies = [
 
 [project.scripts]
 research-match = "src.research_match_server:main"
+
+[tool.uv]
+# The server is run in place (`python research_match_mcp.py`, which imports `src`), so uv
+# only needs to sync the dependencies: never build or install this project into the
+# environment. Besides saving ~15 s on every `uv run`, this avoids writing a console-script
+# launcher, the one step that fails with "os error 17" when the plugin folder sits under
+# the folder that Claude Desktop's Microsoft Store build virtualizes.
+package = false
+
+# PyPI's Linux wheels of torch are the CUDA build and drag in ~6 GB of nvidia-* libraries;
+# the embedding model only needs the CPU build (~200 MB). Windows and macOS wheels on PyPI
+# are already CPU-only, so the CPU index is used for Linux alone.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", marker = "sys_platform == 'linux'" },
+]
 
 [build-system]
 requires = ["hatchling"]

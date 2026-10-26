@@ -221,7 +221,7 @@ def _migrate_legacy_db(new_path: str) -> None:
         _logger.info("Migrated legacy database %s -> %s", _LEGACY_DB_PATH, new_path)
     except Exception as exc:  # never block startup on a failed migration
         _logger.warning("Legacy database migration skipped: %s", exc)
-SERVER_VERSION = "3.4.4"
+SERVER_VERSION = "3.4.5"
 
 # Scoring weights for Theoretical Originality (OT)
 OT_WEIGHTS = {

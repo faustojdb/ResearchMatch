@@ -40,7 +40,7 @@ Research Match is **local-first**: the server runs on your own machine over stdi
 
 - [uv](https://github.com/astral-sh/uv) on your `PATH`. uv fetches Python 3.12 automatically if you don't have it.
 - A surface that runs local MCP servers: **Claude Code** (terminal, IDE extensions, or the desktop app's Code tab) or **Cowork** in the Claude desktop app. In claude.ai web chat the skill loads but the local server does not start, so the tools are unavailable there.
-- Disk space and a few minutes on first start: `uv` installs the Python dependencies (several hundred MB, including PyTorch for the embedding model). Later starts are instant.
+- Disk space and a minute or two on first start: `uv` installs the Python dependencies (about 1 GB, including the CPU build of PyTorch for the embedding model) into the plugin's data directory, where they survive plugin updates. Claude Code only waits 30 s for a server to start, so the very first session after installing may list `research-match` as failed to connect while the install finishes in the background; the next session (or `/mcp` → reconnect) connects in a few seconds.
 
 ### Option 1 — Install the plugin in Claude Code (recommended)
 
@@ -71,7 +71,7 @@ claude --plugin-dir .            # load the checkout as a plugin for one session
 or register only the MCP server, without the skill and slash commands:
 
 ```bash
-claude mcp add research-match -- uv run --directory /path/to/ResearchMatch --frozen research-match
+claude mcp add research-match -- uv run --directory /path/to/ResearchMatch --frozen python research_match_mcp.py
 ```
 
 ### Option 3 — Claude Desktop extension (.mcpb, manual install)
@@ -93,10 +93,12 @@ curl -H "Authorization: Bearer $(gcloud auth print-identity-token)" https://rese
 That means the embedding worker could not load the model and the server fell back to
 word-overlap similarity. The usual cause is an environment that was interrupted while
 installing (Claude Desktop, for example, kills a first start that takes too long). Repair it
-from a terminal and the next scoring call picks it up without restarting Claude:
+from a terminal, pointing uv at the environment the host uses — `~/.claude/plugins/data/<plugin id>/venv`
+for the plugin (`${CLAUDE_PLUGIN_DATA}/venv`), `~/.research-match/venv` for the desktop extension —
+and the next scoring call picks it up without restarting Claude:
 
 ```bash
-uv sync --frozen --reinstall --directory "<path to the plugin or extension folder>"
+UV_PROJECT_ENVIRONMENT="<that venv>" uv sync --frozen --reinstall --directory "<path to the plugin or extension folder>"
 ```
 
 For the desktop extension add `UV_PROJECT_ENVIRONMENT=~/.research-match/venv` and
@@ -124,7 +126,7 @@ Once installed, say: *"Register me on Research Match"* — Claude will ask for t
 
 Everything the plugin does is in this repository's readable source. In summary:
 
-- **Runs**: `uv run --frozen python research_match_mcp.py` from the plugin folder — a three-line launcher that starts the Python stdio MCP server in `src/research_match_server.py`. Dependencies are pinned in `uv.lock`. In local mode the server also starts a second process with the same interpreter in the background, `src/embedding_worker.py`, which loads the embedding model, answers the server over pipes, and exits after 60 minutes without requests (it restarts on demand; the server never imports PyTorch itself).
+- **Runs**: `uv run --frozen python research_match_mcp.py` from the plugin folder — a three-line launcher that starts the Python stdio MCP server in `src/research_match_server.py`. Dependencies are pinned in `uv.lock` and installed into `${CLAUDE_PLUGIN_DATA}/venv` (outside the plugin folder, so they survive updates and the folder may be read-only or virtualized); uv only syncs those dependencies, it never installs this project itself. In local mode the server also starts a second process with the same interpreter in the background, `src/embedding_worker.py`, which loads the embedding model, answers the server over pipes, and exits after 60 minutes without requests (it restarts on demand; the server never imports PyTorch itself).
 - **Writes locally**: one SQLite database (see *Where your data lives*) and uv's dependency cache. No other files are written.
 - **Network calls, local mode**:
   - `api.openalex.org` — originality scoring sends only your domain/topic search terms to find related published works. Disable with `RESEARCH_MATCH_DISABLE_OPENALEX=1`.
@@ -230,7 +232,7 @@ All tool names are prefixed `research_match_` on the wire (e.g. `research_match_
   "status": "reported",
   "report_id": "a1b2c3d4-...",
   "severity": "medium",
-  "server_version": "3.4.4",
+  "server_version": "3.4.5",
   "reporter": "anonymous",
   "message": "Bug report received (severity: medium). Report ID: a1b2c3d4-.... Thank you for helping improve Research Match!"
 }
